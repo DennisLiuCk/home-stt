@@ -36,7 +36,7 @@ fi
 sleep 0.25
 
 # Fallback: any orphan python running stt-daemon.py that wasn't already killed.
-ORPHANS=$(pgrep -f 'stt-daemon\.py' 2>/dev/null || true)
+ORPHANS=$(pgrep -f 'python.*stt-daemon\.py' 2>/dev/null || true)
 for pid in $ORPHANS; do
     if [ "$pid" != "$primary_pid" ]; then
         kill "$pid" 2>/dev/null || true

@@ -24,6 +24,7 @@ import ctypes
 import os
 import site
 import subprocess
+import sys
 from ctypes import wintypes
 
 from pynput.keyboard import Key
@@ -139,7 +140,7 @@ class WindowsPasteboard(Pasteboard):
     def register_native_libs(self) -> int:
         return _register_nvidia_dlls()
 
-    def set_text(self, text: str) -> None:
+    def set_text(self, text: str) -> bool:
         """Place text on the Windows clipboard. PowerShell 5.1 reads stdin in
         cp950 on zh-TW locale by default — force UTF-8 or unicode comes out
         as mojibake."""
@@ -151,8 +152,13 @@ class WindowsPasteboard(Pasteboard):
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
         proc.communicate(input=text.encode("utf-8"))
+        if proc.returncode != 0:
+            print(f"[stt] Set-Clipboard failed (rc={proc.returncode})",
+                  file=sys.stderr, flush=True)
+            return False
+        return True
 
-    def paste(self) -> None:
+    def paste(self) -> bool:
         """Send Ctrl+V via raw SendInput. Ctrl is a system modifier and IMEs
         don't intercept Ctrl-combos, so a single Ctrl+V pastes the whole
         clipboard content atomically (no per-character IME interference)."""
@@ -172,4 +178,10 @@ class WindowsPasteboard(Pasteboard):
             inputs.append(inp)
         n = len(inputs)
         arr = (_INPUT * n)(*inputs)
-        _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+        sent = _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+        if sent != n:
+            print(f"[stt] SendInput partial: sent {sent}/{n} events "
+                  f"(text on clipboard, press Ctrl+V manually)",
+                  file=sys.stderr, flush=True)
+            return False
+        return True

@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.2.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.2.1-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -263,11 +263,14 @@ python3 -c "import sys; print(sys.executable)"
 
 打開「系統設定 → 隱私權與安全性」,把上面那個路徑加進這三個項目：
 
-| 項目 | 為什麼 |
-|------|--------|
-| **輸入裝置監控**（Input Monitoring） | pynput 全域 listener 才能聽到 Right Option 被按下 |
-| **輔助使用**（Accessibility） | daemon 才能模擬 Cmd+V 把文字貼出去 |
-| **麥克風**（Microphone） | sounddevice 才能讀麥克風 |
+| 項目 | 授給誰 | 為什麼 |
+|------|--------|--------|
+| **輸入裝置監控**（Input Monitoring） | Python binary | pynput 全域 listener 才能聽到 Right Option 被按下 |
+| **輔助使用**（Accessibility） | Python binary | 走 Quartz CGEvent 模擬 Cmd+V — **繞過 IME**,中文輸入法開著也能貼 |
+| **輔助使用**（Accessibility） | System Events / osascript | Python 沒授權時的 fallback paste 路徑(IME 開啟時可能被攔截) |
+| **麥克風**（Microphone） | Python binary | sounddevice 才能讀麥克風 |
+
+> 💡 **Python 加進輔助使用 = 中文輸入法相容**:v0.2.1 起 macOS paste 走兩條路徑 — Python 有 Accessibility 走 Quartz CGEvent(post-IME tap,中文/日文/韓文 IME 都吞不到);沒授權則 fallback 到 osascript,日常文字能貼但中文 IME 開著時 Cmd+V 可能被攔。**強烈建議把 Python binary 也加進輔助使用**,雙保險。daemon 啟動 log 會印出當前 paste path:`[stt] paste path: Quartz CGEvent ...` 或 `osascript ...`。
 
 每加完一個項目,系統可能要求 daemon 重啟才會吃到新權限。
 
@@ -588,10 +591,10 @@ STT_MODEL   = "large-v3-turbo"      # 兩種 backend 都吃這個短名
   - NVIDIA CUDA 加速、注音 IME 共存、繁中混英文、自動 spacing、雙 trigger key
 - [x] **macOS(Apple Silicon M 系列)** — v0.2.0
   - Clipboard:`subprocess pbcopy`
-  - Paste:pynput Controller Cmd+V(走 Quartz CGEvent)
+  - Paste:`osascript -e 'tell application "System Events" to keystroke "v" using command down'`(Accessibility 權限綁系統 binary,不依賴 pyenv Python 路徑)
   - 觸發鍵:Right Option
   - 加速:`mlx-whisper` backend(原生 Metal)
-  - 系統權限:三個都要 — 「系統設定 → 隱私權與安全性 → 輸入裝置監控 / 輔助使用 / 麥克風」手動加 Python binary
+  - 系統權限:Python 要授 Input Monitoring + Microphone;System Events 要授 Accessibility — 「系統設定 → 隱私權與安全性」逐項加
   - Intel Mac:自動 fallback 到 faster-whisper CPU int8(可用但延遲較高)
 - [ ] **Linux X11**
   - Clipboard：`xclip -selection clipboard`

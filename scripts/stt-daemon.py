@@ -69,7 +69,7 @@ from stt_platform import Pasteboard, build_pasteboard
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,20 @@ def _detect_output_samplerate() -> int:
         return 44100
 
 
-_BEEP_SR = _detect_output_samplerate()
+# Populated lazily by _get_beep_sr() on first beep — keeps PortAudio /
+# CoreAudio out of the import path so the daemon can start on macOS
+# LaunchAgent (pre-login session, audio HAL not yet ready) or other
+# headless contexts without emitting noisy errors before any [stt] log
+# line. By the time the first beep fires (on first key press) the
+# listener / audio stream are already up, so HAL is in a known state.
+_BEEP_SR: int | None = None
+
+
+def _get_beep_sr() -> int:
+    global _BEEP_SR
+    if _BEEP_SR is None:
+        _BEEP_SR = _detect_output_samplerate()
+    return _BEEP_SR
 
 
 def _play_beep(freq_hz: float,
@@ -163,7 +176,7 @@ def _play_beep(freq_hz: float,
     if not BEEPS_ENABLED:
         return
     try:
-        sr = _BEEP_SR
+        sr = _get_beep_sr()
         n = int(sr * duration_ms / 1000)
         if n <= 0:
             return
@@ -296,11 +309,17 @@ class MlxWhisperBackend(STTBackend):
         result = self._mlx_whisper.transcribe(
             samples,
             path_or_hf_repo=self._model_name,
+            # Lock temperature to greedy decoding. mlx_whisper's default
+            # schedule (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) retries up to 6 times
+            # on low-confidence clips (background noise, mumbles, single
+            # English word) — that can push latency from ~0.3s to ~2s.
+            # Matches FasterWhisperBackend's beam_size=1 no-retry behaviour.
+            temperature=0.0,
             condition_on_previous_text=False,
             verbose=None,
         )
-        text = result.get("text", "").strip()
-        language = result.get("language", "") or ""
+        text = (result.get("text") or "").strip()
+        language = result.get("language") or ""
         return text, language
 
     def warmup(self) -> None:
@@ -310,6 +329,7 @@ class MlxWhisperBackend(STTBackend):
         self._mlx_whisper.transcribe(
             warm_audio,
             path_or_hf_repo=self._model_name,
+            temperature=0.0,
             verbose=None,
         )
 
@@ -381,14 +401,28 @@ def _transcribe_and_emit() -> None:
         # Set clipboard, then paste — atomic, no per-char IME drama.
         # Tiny sleep lets the clipboard write settle before the keystroke
         # (otherwise the paste keystroke can race ahead and paste empty/stale
-        # content).
-        _pasteboard.set_text(text)
+        # content). Both set_text and paste return False on failure; we
+        # suppress the success beep + use a different log line so the user
+        # sees one consistent signal of what actually happened.
+        if not _pasteboard.set_text(text):
+            print(f"[stt] {language} {elapsed:.2f}s clipboard write failed — "
+                  f"'{text}' NOT inserted",
+                  file=sys.stderr, flush=True)
+            return
         time.sleep(0.15)
-        _pasteboard.paste()
-        _play_beep(BEEP_END_HZ)
+        paste_ok = _pasteboard.paste()
+        if paste_ok:
+            _play_beep(BEEP_END_HZ)
 
         try:
-            print(f"[stt] {language} {elapsed:.2f}s -> {text}", flush=True)
+            if paste_ok:
+                print(f"[stt] {language} {elapsed:.2f}s -> {text}", flush=True)
+            else:
+                # paste() already printed a user-facing 'paste blocked' line
+                # to the main log; we record the transcript itself so it's
+                # discoverable even when auto-paste didn't fire.
+                print(f"[stt] {language} {elapsed:.2f}s clipboard-only -> {text}",
+                      flush=True)
         except Exception:
             print(f"[stt] inserted ({elapsed:.2f}s); log encoding failed",
                   flush=True)
@@ -442,6 +476,9 @@ def main() -> None:
     print(f"[stt] platform: {sys.platform} ({_host_platform.machine()}) | "
           f"native libs registered: {n_native}", flush=True)
     print(f"[stt] backend: {STT_BACKEND} | model: {STT_MODEL}", flush=True)
+    paste_desc = _pasteboard.describe_paste_path()
+    if paste_desc:
+        print(f"[stt] paste path: {paste_desc}", flush=True)
 
     _backend = build_backend(STT_BACKEND, STT_MODEL)
 

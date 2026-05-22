@@ -33,8 +33,8 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # Fallback scan: someone may have launched the daemon without the PID file.
-if pgrep -fl 'stt-daemon\.py' >/dev/null 2>&1; then
-    EXISTING=$(pgrep -f 'stt-daemon\.py' | head -1)
+if pgrep -fl 'python.*stt-daemon\.py' >/dev/null 2>&1; then
+    EXISTING=$(pgrep -f 'python.*stt-daemon\.py' | head -1)
     echo "STT daemon already running (PID $EXISTING, no PID file)."
     exit 0
 fi

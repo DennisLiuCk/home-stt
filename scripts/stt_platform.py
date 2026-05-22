@@ -29,20 +29,35 @@ class Pasteboard(ABC):
     default_trigger_keys: set  # must be set by subclasses
 
     @abstractmethod
-    def set_text(self, text: str) -> None:
-        """Place `text` on the system clipboard."""
+    def set_text(self, text: str) -> bool:
+        """Place `text` on the system clipboard. Return True iff the write
+        is confirmed successful (subprocess returncode == 0 or equivalent).
+        On False the daemon skips paste() and the success beep, and logs a
+        clipboard-write failure — implementations should print an
+        actionable diagnostic before returning False."""
 
     @abstractmethod
-    def paste(self) -> None:
+    def paste(self) -> bool:
         """Simulate the paste keystroke (Ctrl+V on Win, Cmd+V on Mac) so the
         focused application receives the clipboard contents as if the user
-        had typed it."""
+        had typed it. Return True iff the keystroke was delivered. On False
+        the daemon skips the success beep/log and treats the text as
+        'available on clipboard, user must paste manually' — implementations
+        should print an actionable diagnostic to the main log before
+        returning False (e.g. macOS Accessibility-permission hint)."""
 
     def register_native_libs(self) -> int:
         """Optional: register native libs needed by STT backends (NVIDIA
         cuDNN/cuBLAS DLLs on Windows). Returns the number of paths added.
         Default no-op for platforms without DLL search-path quirks."""
         return 0
+
+    def describe_paste_path(self) -> str:
+        """Optional one-line summary of which paste mechanism is active, for
+        the daemon's startup log. Empty string means "no extra detail" —
+        platforms with multiple paste paths (e.g. macOS Quartz vs.
+        osascript) override this to surface which one was chosen."""
+        return ""
 
 
 def build_pasteboard() -> Pasteboard:
