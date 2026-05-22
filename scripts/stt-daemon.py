@@ -105,6 +105,12 @@ from pynput.keyboard import Key
 
 
 # ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+__version__ = "0.1.0"
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 SAMPLE_RATE      = 16000
@@ -125,6 +131,15 @@ STT_MODEL        = "large-v3-turbo"
 # already recording are ignored.
 TRIGGER_KEYS     = {Key.alt_gr, Key.ctrl_r}
 
+# Audio feedback — short sine-wave tones at trigger-press / paste-done
+# so the user knows when recording starts and when transcription has
+# landed. Cross-platform: relies only on sounddevice (already a dep).
+BEEPS_ENABLED    = True
+BEEP_START_HZ    = 880                 # A5, "bright" — start of recording
+BEEP_END_HZ      = 660                 # E5, "calmer" — paste done
+BEEP_DURATION_MS = 80
+BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
+
 
 # ---------------------------------------------------------------------------
 # Text post-processing (backend-agnostic)
@@ -140,6 +155,32 @@ def post_process(text: str) -> str:
     text = re.sub(f"({_CJK})({_AW})", r"\1 \2", text)
     text = re.sub(f"({_AW})({_CJK})", r"\1 \2", text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Audio feedback (cross-platform — uses sounddevice which we already need
+# for capture). Generates a short sine wave with 10ms fade in/out to avoid
+# click pops, then plays it non-blocking via sd.play().
+# ---------------------------------------------------------------------------
+def _play_beep(freq_hz: float,
+               duration_ms: int = BEEP_DURATION_MS,
+               volume: float = BEEP_VOLUME) -> None:
+    if not BEEPS_ENABLED:
+        return
+    try:
+        n = int(SAMPLE_RATE * duration_ms / 1000)
+        if n <= 0:
+            return
+        t = np.arange(n) / SAMPLE_RATE
+        wave = (volume * np.sin(2 * np.pi * freq_hz * t)).astype(np.float32)
+        fade = min(int(SAMPLE_RATE * 0.01), n // 2)
+        if fade > 0:
+            wave[:fade]  *= np.linspace(0, 1, fade, dtype=np.float32)
+            wave[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+        sd.play(wave, samplerate=SAMPLE_RATE)
+    except Exception as e:
+        # Beep is purely cosmetic — never let it break transcription.
+        print(f"[stt] beep failed: {e}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +441,7 @@ def _transcribe_and_emit() -> None:
         set_clipboard(text)
         time.sleep(0.15)
         paste_clipboard()
+        _play_beep(BEEP_END_HZ)
 
         try:
             print(f"[stt] {language} {elapsed:.2f}s -> {text}", flush=True)
@@ -427,6 +469,7 @@ def _on_press(key) -> None:
         _recording = True
         _buffer.clear()
     print(f"[stt] REC ({key})", flush=True)
+    _play_beep(BEEP_START_HZ)
 
 
 def _on_release(key) -> None:
@@ -448,6 +491,7 @@ def _on_release(key) -> None:
 def main() -> None:
     global _backend
 
+    print(f"[stt] home-stt v{__version__} starting", flush=True)
     print(f"[stt] NVIDIA DLL dirs registered: {_NVIDIA_COUNT}", flush=True)
     print(f"[stt] backend: {STT_BACKEND} | model: {STT_MODEL}", flush=True)
 
