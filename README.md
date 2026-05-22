@@ -37,7 +37,8 @@
 
 ### Windows（目前唯一已實作）
 - **OS**：Windows 10 / 11
-- **GPU（強烈建議）**：NVIDIA 顯卡，延遲 0.2 秒級。沒 GPU 也能跑（CPU 約 5–12 秒）
+- **硬體**：建議 NVIDIA GPU（延遲 0.2 秒級體驗）；沒 GPU 也能跑，CPU 延遲明顯較高
+- **依硬體選模型**：見 [依硬體選擇 Preset](#依硬體選擇-preset) — 預設模型 (`large-v3-turbo`) 要 ~2 GB VRAM 或 ~1.5 GB CPU RAM，低配機器建議先切到較小 preset 再啟動
 
 ### macOS / Linux（規劃中）
 見 [Roadmap](#roadmap)。
@@ -96,6 +97,49 @@ macOS Apple Silicon 之後可能改用 `mlx-whisper`（原生 Metal 加速）；
 
 ---
 
+## 依硬體選擇 Preset
+
+預設用 `large-v3-turbo`（品質最高、需要 GPU 或大量 CPU）。不是每個人都有 RTX 級顯卡，下表四個 preset 涵蓋常見硬體，挑一個適合你的：
+
+| Preset | `STT_MODEL` | Disk | CPU RAM | GPU VRAM | CPU 延遲 | GPU 延遲 | 品質 | 適用硬體 |
+|--------|------------|------|---------|----------|---------|---------|------|---------|
+| **Maximum** ⭐（預設） | `large-v3-turbo` | 1.5 GB | ~1.5 GB | ~2 GB | 5–12 s | **~0.2 s** | 最高 | NVIDIA GPU ≥ 4 GB VRAM（RTX 30/40/50 系列、A 系列） |
+| **Balanced** | `medium` | 800 MB | ~1.2 GB | ~1.5 GB | ~5 s | ~0.15 s | 高 | NVIDIA GPU 2–4 GB VRAM、或新 CPU（i5/Ryzen 5 以上） |
+| **Light** | `small` | 250 MB | ~400 MB | ~600 MB | ~2 s | ~0.1 s | 中等 | 一般筆電 CPU、或無獨顯 |
+| **Mini** | `base` | 75 MB | ~180 MB | ~250 MB | ~0.5 s | <0.1 s | 較低 | 老筆電、極低配硬體、想極省資源 |
+
+### 注意
+
+- **數字是估算範圍**，實際依模型版本、CUDA、量化精度有變動
+- **「品質」是針對中英混合場景**：Maximum / Balanced 兩個都表現極好；**Light 開始會在英文細節犯錯**；Mini 中文還行但英文較弱
+- **首次啟動會下載模型** 到 `~/.cache/huggingface/`，下載完就一直放著；切 preset 也不會刪舊模型，所以**換來換去都很快**
+- **沒 GPU 也能跑** —— daemon 會嘗試 CUDA，失敗自動退到 CPU int8。建議無 GPU 時直接用 Light 或 Mini
+
+### 怎麼切換
+
+編輯 `scripts/stt-daemon.py`，找到 Config 區的這行：
+
+```python
+STT_MODEL = "large-v3-turbo"
+```
+
+改成你選的 preset 的模型名：
+
+```python
+STT_MODEL = "medium"   # 或 "small" / "base" / "large-v3-turbo"
+```
+
+然後 stop + start：
+
+```powershell
+.\scripts\stt-stop.ps1
+.\scripts\stt-start.ps1
+```
+
+啟動 log 會印出 `model: <你選的>`，第一次跑會下載新模型（幾百 MB 到 1.5 GB 不等）。
+
+---
+
 ## 第一次啟用
 
 ### 1. Clone
@@ -114,13 +158,17 @@ scripts/
 └── stt-stop.ps1     # 停止
 ```
 
-### 2. 啟動 daemon
+### 2. （可選）依硬體挑 Preset
+
+預設是 `large-v3-turbo`（1.5 GB 模型，要 NVIDIA GPU 或大量 CPU）。**如果你的硬體不太夠**，先去 [依硬體選擇 Preset](#依硬體選擇-preset) 挑一個合適的，編輯 `scripts/stt-daemon.py` 把 `STT_MODEL` 改掉再啟動。有 RTX 系列顯卡可跳過這步直接 (3)。
+
+### 3. 啟動 daemon
 
 ```powershell
 .\scripts\stt-start.ps1
 ```
 
-第一次跑會自動下載 `large-v3-turbo` 模型（約 1.5 GB）到 `~/.cache/huggingface/`，需要等 1–5 分鐘。後續啟動只要約 15 秒（model load + GPU warmup）。
+第一次跑會自動下載你選的模型（75 MB 到 1.5 GB 不等）到 `~/.cache/huggingface/`，需要等 30 秒到幾分鐘。後續啟動只要約 15 秒（model load + GPU warmup）。
 
 成功會看到：
 ```
@@ -129,17 +177,17 @@ Log: C:\Users\<name>\AppData\Local\Temp\stt-daemon.log
 Allow ~15s for model load + GPU warmup before first trigger key.
 ```
 
-### 3. 使用
+### 4. 使用
 
 1. 把焦點放在任何想輸入文字的視窗
-2. 按住 **Right Alt** 或 **Right Ctrl**（兩者皆可）
+2. 按住 **Right Alt** 或 **Right Ctrl**（兩者皆可）→ 聽到「叮」表示開始錄
 3. 對麥克風講話（中英文都可）
 4. 放開觸發鍵
-5. 約 0.2–1 秒後，文字自動出現
+5. 約 0.2–1 秒後文字自動出現，並聽到「咚」表示完成
 
 > 為什麼兩個鍵都綁？Right Alt 在某些應用（例如 Chrome）會跟既有快捷鍵衝突，Right Ctrl 是備援。**按下哪個就放開哪個**；同時按只有先按下的那個有效。
 
-### 4. 確認狀態
+### 5. 確認狀態
 
 看 log：
 ```powershell
@@ -196,13 +244,7 @@ BEEP_VOLUME      = 0.15                    # 0.0–1.0；太大聲會干擾 mic
 
 改完用 `stt-stop.ps1` + `stt-start.ps1` 重啟。
 
-### 模型大小參考
-
-| 模型 | 大小 | GPU 延遲 | CPU 延遲 | 品質 |
-|------|------|---------|----------|------|
-| `small` | 460 MB | ~0.1s | ~2s | 一般 |
-| `medium` | 1.5 GB | ~0.15s | ~5s | 好 |
-| `large-v3-turbo`（預設） | 1.5 GB | ~0.2s | ~12s | 最好 |
+> 切換模型大小（依硬體）見 [依硬體選擇 Preset](#依硬體選擇-preset)；切換到不同 STT 引擎見 [STT 模型抽象](#stt-模型抽象)。
 
 ### 提示音說明
 
