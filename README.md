@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.1.0-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.2.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -8,13 +8,14 @@
 
 ## 平台支援
 
-| 平台 | 狀態 | 觸發鍵（預設） | GPU 後端 |
+| 平台 | 狀態 | 觸發鍵（預設） | STT 加速 |
 |------|------|--------------|--------|
 | **Windows 10 / 11** | ✅ 已實作、實測 | Right Alt (AltGr) **或** Right Ctrl | NVIDIA CUDA（CTranslate2 + cuDNN） |
-| **macOS（含 Apple Silicon M 系列）** | 🛣️ 規劃中 | 預定 Right Option | Apple MPS / MLX / Metal（換 backend） |
+| **macOS（Apple Silicon M 系列）** | ✅ 已實作（v0.2.0） | Right Option | Apple MLX（Metal 原生） |
+| **macOS（Intel）** | ⚙️ 可跑（自動 CPU fallback） | Right Option | faster-whisper CPU int8 |
 | **Linux（X11 / Wayland）** | 🛣️ 規劃中 | 預定 Right Alt | NVIDIA CUDA（同 Win） |
 
-> 🏗️ **設計上保留跨平台空間**：核心管線（麥克風 → Whisper → 文字後處理）100% 跨平台。需要分平台寫的只有薄薄三層 —— **clipboard 寫入**、**paste 模擬**、**全域熱鍵代號**。詳見 [跨平台設計](#跨平台設計) 段。
+> 🏗️ **核心管線（麥克風 → Whisper → 文字後處理）100% 跨平台**。平台特定的薄薄三層 —— **clipboard 寫入**、**paste 模擬**、**全域熱鍵代號** —— 從 v0.2.0 起抽到 `Pasteboard` 介面實作。詳見 [跨平台設計](#跨平台設計) 段。
 
 ## 體驗
 
@@ -35,12 +36,17 @@
 - **Python**：3.10+（實測 3.12.2）
 - **麥克風**：作業系統認得的任何輸入裝置
 
-### Windows（目前唯一已實作）
+### Windows
 - **OS**：Windows 10 / 11
 - **硬體**：建議 NVIDIA GPU（延遲 0.2 秒級體驗）；沒 GPU 也能跑，CPU 延遲明顯較高
 - **依硬體選模型**：見 [依硬體選擇 Preset](#依硬體選擇-preset) — 預設模型 (`large-v3-turbo`) 要 ~2 GB VRAM 或 ~1.5 GB CPU RAM，低配機器建議先切到較小 preset 再啟動
 
-### macOS / Linux（規劃中）
+### macOS（v0.2.0 起支援）
+- **OS**：macOS 12 Monterey 以上（實測 26.1 Tahoe / Apple Silicon）
+- **硬體**：建議 Apple Silicon（M1 以上，走 Apple MLX 在 Metal 上原生跑 large-v3-turbo，延遲 ~0.3 秒）；Intel Mac 也能跑但自動 fallback 到 faster-whisper CPU int8
+- **權限**：第一次跑要去「系統設定 → 隱私權與安全性」開三個權限（Input Monitoring / Accessibility / 麥克風），詳見 [macOS 第一次啟用](#macos-第一次啟用)
+
+### Linux（規劃中）
 見 [Roadmap](#roadmap)。
 
 ---
@@ -64,7 +70,7 @@
 | `nvidia-cudnn-cu12` | cuDNN 9 動態庫 |
 | `nvidia-cublas-cu12` | cuBLAS 動態庫 |
 
-> ⚠️ 這兩個是 NVIDIA 官方 cuDNN/cuBLAS 的 pip wheel，避免去 Developer 網站註冊下載。**沒 GPU 或非 Windows 就不必裝**（daemon 自動 fallback 到 CPU；macOS 之後會走 Metal/MLX 路徑）。
+> ⚠️ 這兩個是 NVIDIA 官方 cuDNN/cuBLAS 的 pip wheel，避免去 Developer 網站註冊下載。**沒 GPU 或非 Windows 就不必裝**（daemon 自動 fallback 到 CPU；macOS Apple Silicon 走 Metal/MLX 路徑，見下方 macOS 區段）。
 
 ### Windows 一鍵安裝
 
@@ -83,17 +89,37 @@ pip install --user `
 pip install --user numpy
 ```
 
-### macOS / Linux 安裝（規劃）
+### macOS Apple Silicon 加速（**只 Apple Silicon 需要**）
 
-僅裝跨平台核心即可。GPU 加速套件視平台選擇：
+| 套件 | 用途 |
+|------|------|
+| `mlx-whisper` | Apple MLX 原生 Whisper（Metal 加速） |
+
+> ⚠️ `mlx-whisper` 只在 Apple Silicon（M1 以上）可用。Intel Mac 不必裝；daemon 會自動 fallback 到 faster-whisper CPU。
+
+### macOS 一鍵安裝
+
+Apple Silicon（建議）：
 
 ```bash
-# macOS / Linux（不裝 nvidia-* 系列）
-pip install --user \
+pip install \
+    faster-whisper \
+    sounddevice \
+    pynput \
+    opencc-python-reimplemented \
+    mlx-whisper
+```
+
+Intel Mac（不裝 mlx-whisper）：
+
+```bash
+pip install \
     faster-whisper sounddevice pynput opencc-python-reimplemented
 ```
 
-macOS Apple Silicon 之後可能改用 `mlx-whisper`（原生 Metal 加速）；Linux 有 NVIDIA GPU 時可加裝 `nvidia-cudnn-cu12` 等。詳見 [Roadmap](#roadmap)。
+### Linux 安裝（規劃中）
+
+僅裝跨平台核心即可,有 NVIDIA GPU 時可加裝 `nvidia-cudnn-cu12` 等（同 Windows 路徑）。詳見 [Roadmap](#roadmap)。
 
 ---
 
@@ -101,19 +127,20 @@ macOS Apple Silicon 之後可能改用 `mlx-whisper`（原生 Metal 加速）；
 
 預設用 `large-v3-turbo`（品質最高、需要 GPU 或大量 CPU）。不是每個人都有 RTX 級顯卡，下表四個 preset 涵蓋常見硬體，挑一個適合你的：
 
-| Preset | `STT_MODEL` | Disk | CPU RAM | GPU VRAM | CPU 延遲 | GPU 延遲 | 品質 | 適用硬體 |
-|--------|------------|------|---------|----------|---------|---------|------|---------|
-| **Maximum** ⭐（預設） | `large-v3-turbo` | 1.5 GB | ~1.5 GB | ~2 GB | 5–12 s | **~0.2 s** | 最高 | NVIDIA GPU ≥ 4 GB VRAM（RTX 30/40/50 系列、A 系列） |
+| Preset | `STT_MODEL` | Disk | CPU RAM | GPU/Metal VRAM | CPU 延遲 | GPU/Metal 延遲 | 品質 | 適用硬體 |
+|--------|------------|------|---------|----------------|---------|---------------|------|---------|
+| **Maximum** ⭐（預設） | `large-v3-turbo` | 1.5 GB | ~1.5 GB | ~2 GB | 5–12 s | **~0.2–0.5 s** | 最高 | NVIDIA GPU ≥ 4 GB VRAM（RTX 30/40/50 系列、A 系列） **或** Apple Silicon（M1 以上,走 MLX） |
 | **Balanced** | `medium` | 800 MB | ~1.2 GB | ~1.5 GB | ~5 s | ~0.15 s | 高 | NVIDIA GPU 2–4 GB VRAM、或新 CPU（i5/Ryzen 5 以上） |
 | **Light** | `small` | 250 MB | ~400 MB | ~600 MB | ~2 s | ~0.1 s | 中等 | 一般筆電 CPU、或無獨顯 |
 | **Mini** | `base` | 75 MB | ~180 MB | ~250 MB | ~0.5 s | <0.1 s | 較低 | 老筆電、極低配硬體、想極省資源 |
 
 ### 注意
 
-- **數字是估算範圍**，實際依模型版本、CUDA、量化精度有變動
+- **數字是估算範圍**，實際依模型版本、CUDA / Metal、量化精度有變動
 - **「品質」是針對中英混合場景**：Maximum / Balanced 兩個都表現極好；**Light 開始會在英文細節犯錯**；Mini 中文還行但英文較弱
 - **首次啟動會下載模型** 到 `~/.cache/huggingface/`，下載完就一直放著；切 preset 也不會刪舊模型，所以**換來換去都很快**
-- **沒 GPU 也能跑** —— daemon 會嘗試 CUDA，失敗自動退到 CPU int8。建議無 GPU 時直接用 Light 或 Mini
+- **沒 GPU 也能跑** —— Windows daemon 會嘗試 CUDA，失敗自動退到 CPU int8；macOS Apple Silicon 預設走 MLX,Intel Mac 自動退到 faster-whisper CPU int8。建議無 GPU/Metal 時直接用 Light 或 Mini
+- **backend 自動選**：Apple Silicon 預設 `mlx-whisper`(走 MLX);其餘平台 `faster-whisper`。`STT_MODEL = "large-v3-turbo"` 在兩種 backend 都能跑（MLX backend 會自動解析成 `mlx-community/whisper-large-v3-turbo`）
 
 ### 怎麼切換
 
@@ -131,16 +158,23 @@ STT_MODEL = "medium"   # 或 "small" / "base" / "large-v3-turbo"
 
 然後 stop + start：
 
+Windows：
 ```powershell
 .\scripts\stt-stop.ps1
 .\scripts\stt-start.ps1
+```
+
+macOS：
+```bash
+bash scripts/stt-stop.sh
+bash scripts/stt-start.sh
 ```
 
 啟動 log 會印出 `model: <你選的>`，第一次跑會下載新模型（幾百 MB 到 1.5 GB 不等）。
 
 ---
 
-## 第一次啟用
+## Windows 第一次啟用
 
 ### 1. Clone
 
@@ -153,9 +187,10 @@ cd home-stt
 
 ```
 scripts/
-├── stt-daemon.py    # daemon 主程式
-├── stt-start.ps1    # 啟動
-└── stt-stop.ps1     # 停止
+├── stt-daemon.py         # daemon 主程式
+├── stt_platform*.py      # 平台抽象（Pasteboard）
+├── stt-start.ps1         # Windows 啟動
+└── stt-stop.ps1          # Windows 停止
 ```
 
 ### 2. （可選）依硬體挑 Preset
@@ -201,17 +236,103 @@ Get-Content "$env:TEMP\stt-daemon.log" -Encoding utf8 -Tail 20
 
 ---
 
+## macOS 第一次啟用
+
+### 1. Clone
+
+```bash
+git clone https://github.com/DennisLiuCk/home-stt.git
+cd home-stt
+```
+
+### 2. 安裝套件
+
+見 [macOS 一鍵安裝](#macos-一鍵安裝)。Apple Silicon 用戶會多裝 `mlx-whisper`,daemon 自動偵測並走 MLX backend。
+
+### 3. 授權三個權限（最容易忽略的一步）
+
+macOS 對「全域聽鍵 + 發鍵 + 錄音」這三件事要分別授權,而且**要授權給你的 Python binary（不是 pyenv shim）**。先找出真實路徑:
+
+```bash
+python3 -c "import sys; print(sys.executable)"
+# 例如: /Users/<you>/.pyenv/versions/3.11.11/bin/python3
+# (這是 symlink → python3.11,授給任一個都行,系統會解析)
+```
+
+> 為什麼不用 `which python3` 或 `readlink -f`? pyenv shim 是個 Python 包裝腳本(不是 symlink),那些指令會回 shim 路徑(`~/.pyenv/shims/python3`),但 macOS 權限要綁的是實際執行 binary。`sys.executable` 才會給你對的答案。
+
+打開「系統設定 → 隱私權與安全性」,把上面那個路徑加進這三個項目：
+
+| 項目 | 為什麼 |
+|------|--------|
+| **輸入裝置監控**（Input Monitoring） | pynput 全域 listener 才能聽到 Right Option 被按下 |
+| **輔助使用**（Accessibility） | daemon 才能模擬 Cmd+V 把文字貼出去 |
+| **麥克風**（Microphone） | sounddevice 才能讀麥克風 |
+
+每加完一個項目,系統可能要求 daemon 重啟才會吃到新權限。
+
+> 💡 第一次跑 daemon 時,macOS 可能會跳出對話框問你要不要授權麥克風 —— 按「允許」即可。Input Monitoring / Accessibility 通常需要你主動去設定加。
+
+### 4. （可選）依硬體挑 Preset
+
+Apple Silicon 預設跑 `large-v3-turbo` on MLX,延遲約 0.3-0.5 秒,品質最高。如果是 Intel Mac 或想省 RAM,去 [依硬體選擇 Preset](#依硬體選擇-preset) 改 `STT_MODEL`。
+
+### 5. 啟動 daemon
+
+```bash
+bash scripts/stt-start.sh
+```
+
+第一次跑會下載 MLX 版的 large-v3-turbo（約 1.5 GB）到 `~/.cache/huggingface/`,要等 30 秒到幾分鐘。後續啟動約 10 秒（model load + Metal warmup）。
+
+成功會看到：
+```
+STT daemon started (PID 12345).
+Log: /var/folders/.../T/stt-daemon.log
+Allow ~10-30s for model load + Metal warmup before first trigger key.
+```
+
+### 6. 使用
+
+1. 把焦點放在任何想輸入文字的視窗（Notes / TextEdit / iTerm / VSCode / Slack...）
+2. 按住 **Right Option** → 聽到「叮」表示開始錄
+3. 對麥克風講話（中英文都可）
+4. 放開 Right Option
+5. 約 0.3–1 秒後文字自動出現,並聽到「咚」表示完成
+
+### 7. 確認狀態
+
+看 log（`$TMPDIR` 通常是 `/var/folders/.../T/`）：
+```bash
+tail -n 20 "$TMPDIR/stt-daemon.log"
+```
+
+每次說話 daemon 會 log 一行（跟 Windows 相同格式）：
+```
+[stt] zh 0.34s -> 幫我 review 這個 Python function
+```
+
+---
+
 ## 停止
 
+Windows：
 ```powershell
 .\scripts\stt-stop.ps1
 ```
 
-停止後 Right Alt / Right Ctrl 就回到原本的鍵位功能。
+macOS：
+```bash
+bash scripts/stt-stop.sh
+```
+
+停止後觸發鍵就回到原本的功能（Windows：Right Alt / Right Ctrl；macOS：Right Option）。
 
 ---
 
 ## 開機自動啟動（選用）
+
+### Windows
 
 把 `stt-start.ps1` 的捷徑放進 Windows 啟動資料夾：
 
@@ -220,6 +341,12 @@ Get-Content "$env:TEMP\stt-daemon.log" -Encoding utf8 -Tail 20
    ```
    powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\path\to\home-stt\scripts\stt-start.ps1"
    ```
+
+### macOS
+
+可以做 LaunchAgent,但要考量到三個權限只能授給特定的 binary,如果之後切 pyenv 版本路徑會變。
+
+最簡單的做法：把 `bash /path/to/home-stt/scripts/stt-start.sh` 加進「系統設定 → 一般 → 登入項目與擴充功能 → 開啟登入」(用 `Automator` 包成 Application,或寫個 `.command` 拖進去)。日後如果需要正式 LaunchAgent,可以放在 `~/Library/LaunchAgents/com.homestt.daemon.plist`。
 
 ---
 
@@ -230,9 +357,9 @@ Get-Content "$env:TEMP\stt-daemon.log" -Encoding utf8 -Tail 20
 ```python
 SAMPLE_RATE      = 16000                   # 麥克風取樣率
 MIN_AUDIO_SEC    = 0.3                     # 太短的按鍵自動忽略
-STT_BACKEND      = "faster-whisper"        # 換引擎：見「STT 模型抽象」段
-STT_MODEL        = "large-v3-turbo"        # 換模型：medium / small / ...
-TRIGGER_KEYS     = {Key.alt_gr, Key.ctrl_r}  # 想換 / 加觸發鍵就改這個 set
+STT_BACKEND      = _DEFAULT_BACKEND        # 自動：Apple Silicon → mlx-whisper,其餘 → faster-whisper
+STT_MODEL        = "large-v3-turbo"        # 換模型：medium / small / ...（兩種 backend 都吃）
+TRIGGER_KEYS     = None                    # None = 平台預設（Win: alt_gr+ctrl_r,Mac: alt_r);改 set 可覆蓋
 
 # 提示音
 BEEPS_ENABLED    = True                    # 想完全靜音設 False
@@ -242,7 +369,7 @@ BEEP_DURATION_MS = 80
 BEEP_VOLUME      = 0.15                    # 0.0–1.0；太大聲會干擾 mic
 ```
 
-改完用 `stt-stop.ps1` + `stt-start.ps1` 重啟。
+改完用 stop + start 腳本重啟（Windows: `.ps1`,macOS: `.sh`）。
 
 > 切換模型大小（依硬體）見 [依硬體選擇 Preset](#依硬體選擇-preset)；切換到不同 STT 引擎見 [STT 模型抽象](#stt-模型抽象)。
 
@@ -257,6 +384,18 @@ BEEP_VOLUME      = 0.15                    # 0.0–1.0；太大聲會干擾 mic
 ---
 
 ## 疑難排解
+
+### 通用
+
+**中文是簡體**
+- 確認 `opencc-python-reimplemented` 已安裝
+- 看 log 是否有 OpenCC 相關錯誤
+
+**文字貼到不對的視窗**
+- 焦點問題 — 你放開觸發鍵前必須先把焦點放到目標輸入框
+- 不要按完馬上切視窗
+
+### Windows
 
 **Daemon 啟動但按觸發鍵沒反應**
 - 確認 daemon 還活著：`Get-Content "$env:TEMP\stt-daemon.log" -Encoding utf8 -Tail 5` 應該有 `warmup ... — hold Key.ctrl_r, Key.alt_gr to record.`
@@ -273,18 +412,39 @@ BEEP_VOLUME      = 0.15                    # 0.0–1.0；太大聲會干擾 mic
   pip show nvidia-cudnn-cu12 nvidia-cublas-cu12
   ```
 
-**中文是簡體**
-- 確認 `opencc-python-reimplemented` 已安裝
-- 看 log 是否有 OpenCC 相關錯誤
-
-**文字貼到不對的視窗**
-- 焦點問題 — 你放開觸發鍵前必須先把焦點放到目標輸入框
-- 不要按完馬上切視窗
-
 **Daemon 死掉**
 ```powershell
 Get-Content "$env:TEMP\stt-daemon.err.log" -Encoding utf8 -Tail 30
 ```
+
+### macOS
+
+**按 Right Option 沒任何反應(沒「叮」聲、log 沒 REC 行)**
+- 大概率是「輸入裝置監控(Input Monitoring)」沒給 — 沒給的話 pynput listener 完全收不到鍵
+- 去「系統設定 → 隱私權與安全性 → 輸入裝置監控」確認你的 Python binary(`python3 -c "import sys; print(sys.executable)"` 取得的真實路徑)在列表裡且開關打開
+- 改完設定後重啟 daemon:`bash scripts/stt-stop.sh && bash scripts/stt-start.sh`
+
+**有「叮」聲但放開後沒文字貼出來**
+- 「輔助使用(Accessibility)」沒給 — daemon 收得到鍵但發不出 Cmd+V
+- log 通常看得到 `[stt] zh ...s -> ...`(代表 STT 跑完了),但畫面沒文字 = 卡在 paste
+- 同樣去「系統設定 → 隱私權與安全性 → 輔助使用」加 Python binary
+
+**麥克風完全收不到聲音 / log 出現 silence**
+- 第一次跑時 macOS 應該會跳對話框問麥克風授權,如果沒跳或不小心按了拒絕,去「系統設定 → 隱私權與安全性 → 麥克風」開
+- 確認系統麥克風輸入裝置有選到對的(內建/外接)
+
+**mlx-whisper 載入失敗 / 沒 Metal 加速**
+- log 出現 `Unknown STT backend: 'mlx-whisper'` → 沒裝 `mlx-whisper`,跑 `pip install mlx-whisper`
+- Intel Mac 跑 mlx-whisper 會失敗,正常 — daemon 預設會走 faster-whisper CPU。如果你硬要設 `STT_BACKEND = "mlx-whisper"` 在 Intel 上就會炸
+
+**Daemon 死掉**
+```bash
+tail -n 30 "$TMPDIR/stt-daemon.err.log"
+```
+
+**pyenv 切換 Python 版本後權限失效**
+- macOS 權限是綁特定 binary 路徑,你切到別的 pyenv version 等於換 binary
+- 解法:把新版本的 binary 重新加進三個權限項目 — 或者固定一個版本就不要切
 
 ---
 
@@ -295,13 +455,18 @@ home-stt/
 ├── README.md
 ├── .gitignore
 └── scripts/
-    ├── stt-daemon.py    # 主程式：keyboard hook + audio capture + Whisper + clipboard/paste
-    ├── stt-start.ps1    # 啟動：背景 spawn python，寫 PID file（Windows）
-    ├── stt-stop.ps1     # 停止：讀 PID file 或掃 process tree 殺（Windows）
-    └── stt-daemon.pid   # daemon PID（runtime 產生，已 gitignore）
+    ├── stt-daemon.py        # 主程式:keyboard hook + audio + STT backends + state machine
+    ├── stt_platform.py      # Pasteboard ABC + build_pasteboard() factory dispatch
+    ├── stt_platform_win.py  # WindowsPasteboard:ctypes SendInput + PowerShell clipboard + NVIDIA DLL
+    ├── stt_platform_mac.py  # MacOSPasteboard:pbcopy + pynput Cmd+V
+    ├── stt-start.ps1        # Windows 啟動:背景 spawn python,寫 PID file
+    ├── stt-stop.ps1         # Windows 停止:讀 PID file 或掃 process tree 殺
+    ├── stt-start.sh         # macOS 啟動:nohup 背景跑,寫 PID file
+    ├── stt-stop.sh          # macOS 停止:讀 PID file + pgrep fallback
+    └── stt-daemon.pid       # daemon PID(runtime 產生,已 gitignore)
 
-%TEMP%\
-├── stt-daemon.log       # 主 log（包含 transcription）
+Windows %TEMP%\ 或 macOS $TMPDIR (/var/folders/.../T/)
+├── stt-daemon.log       # 主 log(包含 transcription)
 └── stt-daemon.err.log   # 錯誤 log
 ```
 
@@ -319,41 +484,51 @@ home-stt/
 | 中文跟英文連在一起沒空格 | regex 自動在 CJK ↔ ASCII letter/digit 邊界補空格 |
 | CTranslate2 找不到 cuDNN DLL | `pip install nvidia-cudnn-cu12` + 啟動時 `add_dll_directory` 和 prepend PATH |
 | Cold start CUDA JIT compile 約 10 秒 | daemon 啟動時跑一次 dummy transcribe 預熱 |
+| Windows-only `ctypes.WinDLL("user32")` 在 macOS import 直接炸 | 抽到 `stt_platform_win.py`,只在 `sys.platform == "win32"` 時 lazy import |
+| macOS 全域聽鍵需要 Input Monitoring,模擬發鍵需要 Accessibility | daemon 啟動時就需要這兩個權限授給 Python binary;pyenv shim 路徑會綁錯,必須授實際 binary(`readlink -f $(which python3)`) |
+| macOS mlx-whisper 第一次跑要從 HF 下載 ~1.5GB | 跟 faster-whisper 一樣會快取在 `~/.cache/huggingface/`,後續啟動秒級 |
+| macOS pynput Controller 模擬 Cmd+V 在某些 pyenv 設定下被 Accessibility silent drop(文字停在剪貼簿但沒貼出) | 改走 `osascript -e 'tell ... keystroke "v" using command down'` — 權限綁系統 binary 而非 Python,跨 pyenv 版本穩定 |
+| macOS beep 用 16kHz 取樣率送 sd.play 在 48kHz 輸出裝置上 resample 產生「叮叮」破碎感 | 啟動時用 `sd.query_devices(kind='output')['default_samplerate']` 取得原生取樣率、改用 raised-cosine fade、前面墊 5ms 靜音吸收開 stream 的 click |
 
 ---
 
 ## 跨平台設計
 
-目前 daemon **核心管線 100% 跨平台**：
+daemon **核心管線 100% 跨平台**：
 
 ```
 [mic] sounddevice
-  → faster-whisper（CPU 各平台都跑；GPU backend 因平台而異）
+  → STTBackend (faster-whisper on Win/Linux/Intel-Mac; mlx-whisper on Apple Silicon)
   → OpenCC s2tw  +  regex CJK/ASCII spacing
-  → [insert]      ← ★ 這層是唯一綁平台的薄層
+  → Pasteboard.set_text() + Pasteboard.paste()   ← ★ 唯一綁平台的薄層
 ```
 
-需要分平台寫的只有三件事：
+平台特定的三件事從 v0.2.0 起抽到 `Pasteboard` 介面(`scripts/stt_platform.py`),`build_pasteboard()` 依 `sys.platform` lazy-import 對應實作模組:
 
-| 抽象層 | Windows（已實作） | macOS（規劃） | Linux（規劃） |
-|--------|------------------|--------------|--------------|
-| **Clipboard 寫入** | PowerShell `Set-Clipboard` | `pbcopy` | `xclip` (X11) / `wl-copy` (Wayland) |
-| **Paste 模擬** | ctypes `SendInput` Ctrl+V | `osascript` Cmd+V 或 pyobjc NSEvent | `xdotool key ctrl+v` (X11) / `ydotool` 或 `wtype` (Wayland) |
-| **觸發鍵代號** | `{Key.alt_gr, Key.ctrl_r}` | 預定 Right Option | 預定 Right Alt / Right Ctrl |
+| 抽象層 | Windows(`stt_platform_win.py`) | macOS(`stt_platform_mac.py`) | Linux(規劃) |
+|--------|------------------------------|----------------------------|----------|
+| **Clipboard 寫入** | PowerShell `Set-Clipboard`(UTF-8 強制) | `pbcopy` 子程序 | `xclip` (X11) / `wl-copy` (Wayland) |
+| **Paste 模擬** | ctypes `SendInput` Ctrl+V(IME-proof) | `osascript` 透過 System Events 發 Cmd+V(Accessibility 綁系統 binary,不會因 pyenv 切版漂移) | `xdotool key ctrl+v` (X11) / `ydotool` 或 `wtype` (Wayland) |
+| **預設觸發鍵** | `{Key.alt_gr, Key.ctrl_r}` | `{Key.alt_r}` (Right Option) | 預定 `{Key.alt_r}` |
+| **Native lib 註冊** | NVIDIA cuDNN/cuBLAS DLL 路徑 | n/a(回 0) | NVIDIA(同 Win) |
 
-未來重構建議：抽象成 `Pasteboard` 介面，三平台各自 implementation，主流程不動：
+加新平台:在 `scripts/` 開一個 `stt_platform_<os>.py`、實作 `Pasteboard` 子類、在 `stt_platform.py:build_pasteboard()` 加一個 `if sys.platform == "..."` 分支即可,`stt-daemon.py` 不用動。
 
 ```python
-class Pasteboard:
-    def set(self, text: str) -> None: ...
-    def paste(self) -> None: ...
-
-if sys.platform == "win32":   pasteboard = WindowsPasteboard()
-elif sys.platform == "darwin": pasteboard = MacOSPasteboard()
-else:                          pasteboard = LinuxPasteboard()
+# scripts/stt_platform.py
+def build_pasteboard() -> Pasteboard:
+    if sys.platform == "win32":
+        from stt_platform_win import WindowsPasteboard
+        return WindowsPasteboard()
+    if sys.platform == "darwin":
+        from stt_platform_mac import MacOSPasteboard
+        return MacOSPasteboard()
+    raise NotImplementedError(...)
 ```
 
-GPU 後端類似結構：Windows / Linux 走 CUDA + CTranslate2；macOS Apple Silicon 改用 `mlx-whisper`（原生 Metal）或 `whisper.cpp` + Metal。
+> 重點:**lazy import**。`stt_platform_win.py` 在 module-level 用了 `ctypes.WinDLL("user32")`,如果在 macOS 上直接 import 會炸 — 所以 `build_pasteboard()` 只在跑到對應 branch 時才 import,跨平台 import 安全。
+
+STT 後端走完全相同結構(見 [STT 模型抽象](#stt-模型抽象)):Windows / Linux 走 CUDA + CTranslate2;macOS Apple Silicon 從 v0.2.0 走 `mlx-whisper`(原生 Metal),Intel Mac 自動 fallback 到 faster-whisper CPU。
 
 ---
 
@@ -369,21 +544,27 @@ class STTBackend(ABC):
     def device_label(self) -> str: ...
 
 class FasterWhisperBackend(STTBackend):
-    # 現有實作（Whisper large-v3-turbo via CTranslate2）
+    # Whisper large-v3-turbo via CTranslate2 — Win/Linux CUDA + CPU fallback
+
+class MlxWhisperBackend(STTBackend):
+    # Whisper large-v3-turbo via Apple MLX — Apple Silicon Metal 原生
 
 def build_backend(name: str, model: str) -> STTBackend:
     if name == "faster-whisper":
         return FasterWhisperBackend(model)
+    if name == "mlx-whisper":
+        return MlxWhisperBackend(model)
     # elif name == "sense-voice":    ← 規劃
     # elif name == "paraformer":     ← 規劃
-    # elif name == "mlx-whisper":    ← 規劃
+    raise ValueError(...)
 ```
 
-切換只需改頂部兩個常數：
+切換只需改頂部兩個常數(或讓平台自動選):
 
 ```python
-STT_BACKEND = "faster-whisper"   # or "sense-voice", "paraformer", "mlx-whisper"
-STT_MODEL   = "large-v3-turbo"   # backend-specific model identifier
+# 自動:Apple Silicon → mlx-whisper,其餘 → faster-whisper
+STT_BACKEND = _DEFAULT_BACKEND      # 或硬編碼 "faster-whisper" / "mlx-whisper"
+STT_MODEL   = "large-v3-turbo"      # 兩種 backend 都吃這個短名
 ```
 
 主流程 (`_transcribe_and_emit`) 只跟介面對話，**換引擎不影響 mic 收音、post-processing、clipboard/paste 任何邏輯**。
@@ -392,10 +573,10 @@ STT_MODEL   = "large-v3-turbo"   # backend-specific model identifier
 
 | 後端 | 引擎 | 主要強項 | 狀態 |
 |------|------|---------|-----|
-| `faster-whisper` | Whisper large-v3-turbo via CTranslate2 | **中英混合 SOTA**、99 語、CUDA float16 | ✅ 預設 |
+| `faster-whisper` | Whisper large-v3-turbo via CTranslate2 | **中英混合 SOTA**、99 語、CUDA float16 / CPU int8 | ✅ 預設(Win/Linux/Intel Mac) |
+| `mlx-whisper` | Apple MLX 原生 Metal | Apple Silicon 上最快 Whisper backend(turbo ~0.3s) | ✅ 預設(Apple Silicon, v0.2.0) |
 | `sense-voice` | 阿里 FunASR SenseVoice-Small | 體積 234 MB、速度極快、含情感/事件偵測、5 語 | 🛣️ 規劃 |
 | `paraformer` | 阿里 FunASR Paraformer-zh | **純中文 SOTA**（非自回歸） | 🛣️ 規劃 |
-| `mlx-whisper` | Apple MLX 原生 Metal | macOS Apple Silicon 上最快 Whisper backend | 🛣️ 規劃（搭配 macOS 平台支援） |
 
 ---
 
@@ -405,12 +586,13 @@ STT_MODEL   = "large-v3-turbo"   # backend-specific model identifier
 
 - [x] **Windows 10/11**
   - NVIDIA CUDA 加速、注音 IME 共存、繁中混英文、自動 spacing、雙 trigger key
-- [ ] **macOS（含 Apple Silicon M 系列）**
-  - Clipboard：`subprocess pbcopy`
-  - Paste：`osascript -e 'tell application "System Events" to keystroke "v" using command down'`
-  - 觸發鍵：Right Option
-  - GPU 加速：搭配 `mlx-whisper` backend（原生 Metal）
-  - 系統權限：「系統設定 → 隱私與安全性 → 輔助使用 / 麥克風」需手動授權 Python
+- [x] **macOS(Apple Silicon M 系列)** — v0.2.0
+  - Clipboard:`subprocess pbcopy`
+  - Paste:pynput Controller Cmd+V(走 Quartz CGEvent)
+  - 觸發鍵:Right Option
+  - 加速:`mlx-whisper` backend(原生 Metal)
+  - 系統權限:三個都要 — 「系統設定 → 隱私權與安全性 → 輸入裝置監控 / 輔助使用 / 麥克風」手動加 Python binary
+  - Intel Mac:自動 fallback 到 faster-whisper CPU int8(可用但延遲較高)
 - [ ] **Linux X11**
   - Clipboard：`xclip -selection clipboard`
   - Paste：`xdotool key ctrl+v`
@@ -424,6 +606,9 @@ STT_MODEL   = "large-v3-turbo"   # backend-specific model identifier
 
 - [x] **faster-whisper**（CTranslate2 + Whisper large-v3-turbo）
   - 中英混合 SOTA、CUDA float16 + CPU int8 fallback
+- [x] **mlx-whisper**(Apple MLX 原生 Metal Whisper) — v0.2.0
+  - macOS Apple Silicon 專用,跟 macOS 平台支援一起做
+  - 同 `large-v3-turbo` 模型但跑在 Metal 上,turbo 延遲 ~0.3-0.5s
 - [ ] **sense-voice**（阿里 FunASR SenseVoice-Small）
   - 234 MB 體積、含情感 / 事件偵測、多語但同句內單一語言
   - 套件：`pip install funasr modelscope`
@@ -432,12 +617,8 @@ STT_MODEL   = "large-v3-turbo"   # backend-specific model identifier
   - 純中文場景的精度標竿、非自回歸架構速度極快
   - 同上 FunASR 套件
   - 適用：純中文場景比 Whisper 強，但英文/中英混合會崩
-- [ ] **mlx-whisper**（Apple MLX 原生 Metal Whisper）
-  - macOS Apple Silicon 專用
-  - 同 `large-v3-turbo` 模型但跑在 Metal 上
-  - 跟 [macOS 平台支援] 一起做
 
-### 介面化重構（已部分完成）
+### 介面化重構
 
-- [x] **`STTBackend` 抽象** — 已抽出，換引擎只改 `STT_BACKEND` 常數 + 加一個 class
-- [ ] **`Pasteboard` 抽象** — Clipboard 寫入 / Paste 模擬 / 觸發鍵代號要分平台，隨第二個平台支援時一起做
+- [x] **`STTBackend` 抽象** — 已抽出,換引擎只改 `STT_BACKEND` 常數 + 加一個 class
+- [x] **`Pasteboard` 抽象** — v0.2.0 隨 macOS 支援一起完成。Clipboard 寫入 / Paste 模擬 / 觸發鍵代號全部抽到 `scripts/stt_platform*.py`,加新平台只要實作 `Pasteboard` 子類即可
