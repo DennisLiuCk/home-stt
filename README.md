@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.3.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.4.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -12,8 +12,9 @@
 |------|------|--------------|------------------|
 | **Windows 10 / 11** | ✅ 已實作、實測 | Right Alt (AltGr) **或** Right Ctrl | faster-whisper + NVIDIA CUDA（CTranslate2 + cuDNN） |
 | **macOS（Apple Silicon M 系列）** | ✅ 已實作 | Right Option | **Qwen3-ASR-0.6B via mlx-qwen3-asr**（Metal 原生,預設 v0.3.0+）/ 也可切 mlx-whisper |
-| **macOS（Intel）** | ⚙️ 可跑（自動 CPU fallback） | Right Option | faster-whisper CPU int8 |
 | **Linux（X11 / Wayland）** | 🛣️ 規劃中 | 預定 Right Alt | faster-whisper + NVIDIA CUDA（同 Win） |
+
+> ⛔ **Intel Mac (darwin x86_64) 不再支援(v0.4.0+)** — daemon 啟動會 SystemExit 並提示降版到 v0.3.0。Intel 機已罕見,維護 + 文件成本不划算。要 Intel Mac 請 `git checkout v0.3.0`。
 
 > 🏗️ **核心管線（麥克風 → Whisper → 文字後處理）100% 跨平台**。平台特定的薄薄三層 —— **clipboard 寫入**、**paste 模擬**、**全域熱鍵代號** —— 從 v0.2.0 起抽到 `Pasteboard` 介面實作。詳見 [跨平台設計](#跨平台設計) 段。
 
@@ -43,7 +44,7 @@
 
 ### macOS（v0.2.0 起支援）
 - **OS**：macOS 12 Monterey 以上（實測 26.1 Tahoe / Apple Silicon）
-- **硬體**：建議 Apple Silicon（M1 以上，走 Apple MLX 在 Metal 上原生跑 **Qwen3-ASR-0.6B**，預設;延遲 ~0.3-0.5 秒，中文標點 + 中英混合表現比 Whisper turbo 強）；Intel Mac 也能跑但自動 fallback 到 faster-whisper CPU int8
+- **硬體**：**Apple Silicon（M1 以上)專用**(v0.4.0 起);走 Apple MLX 在 Metal 上原生跑 **Qwen3-ASR-0.6B**(預設),延遲 ~0.3-0.5 秒,中文標點 + 中英混合表現比 Whisper turbo 強。Intel Mac 不再支援。
 - **權限**：第一次跑要去「系統設定 → 隱私權與安全性」開三個權限（Input Monitoring / Accessibility / 麥克風），詳見 [macOS 第一次啟用](#macos-第一次啟用)
 
 ### Linux（規劃中）
@@ -96,11 +97,9 @@ pip install --user numpy
 | `mlx-qwen3-asr` | **預設 backend（v0.3.0+）** — Qwen3-ASR via Apple MLX（Metal 加速）。中文標點 + 中英混合表現比 Whisper turbo 強 |
 | `mlx-whisper` | 可選 — Whisper large-v3-turbo via Apple MLX，v0.2.x 的舊預設，仍可切回去 |
 
-> ⚠️ 這兩個都只在 Apple Silicon（M1 以上）可用。Intel Mac 不必裝任何一個；daemon 會自動走 faster-whisper CPU 路徑。
+> ⚠️ 這兩個都只在 Apple Silicon（M1 以上）可用。Intel Mac 從 v0.4.0 起不支援(daemon 啟動會拒絕)。
 
-### macOS 一鍵安裝
-
-Apple Silicon（建議）：
+### macOS 一鍵安裝(Apple Silicon)
 
 ```bash
 pip install \
@@ -112,14 +111,7 @@ pip install \
     mlx-whisper
 ```
 
-> `mlx-whisper` 不是必裝，只是想留個切換選項才裝。最小集合可拿掉它，daemon 預設只用 `mlx-qwen3-asr`。
-
-Intel Mac（不裝 mlx-whisper）：
-
-```bash
-pip install \
-    faster-whisper sounddevice pynput opencc-python-reimplemented
-```
+> `mlx-whisper` 不是必裝，只是想留個切換選項才裝。最小集合可拿掉它，daemon 預設只用 `mlx-qwen3-asr`。`faster-whisper` 也不是預設需要的(macOS 預設 backend 是 qwen3-asr),但留著當 CPU fallback / debug 工具。
 
 ### Linux 安裝（規劃中）
 
@@ -143,7 +135,7 @@ pip install \
 - **數字是估算範圍**，實際依模型版本、CUDA / Metal、量化精度有變動
 - **「品質」是針對中英混合場景**：Maximum / Balanced 兩個都表現極好；**Light 開始會在英文細節犯錯**；Mini 中文還行但英文較弱
 - **首次啟動會下載模型** 到 `~/.cache/huggingface/`，下載完就一直放著；切 preset 也不會刪舊模型，所以**換來換去都很快**
-- **沒 GPU 也能跑** —— Windows daemon 會嘗試 CUDA，失敗自動退到 CPU int8；macOS Apple Silicon 預設走 MLX,Intel Mac 自動退到 faster-whisper CPU int8。建議無 GPU/Metal 時直接用 Light 或 Mini
+- **沒 GPU 也能跑** —— Windows daemon 會嘗試 CUDA，失敗自動退到 CPU int8;macOS Apple Silicon 預設走 MLX(Qwen3-ASR / Whisper 都有 Metal 加速)。建議無 GPU/Metal 時直接用 Light 或 Mini
 - **backend 自動選**:Apple Silicon 預設 `qwen3-asr`(Qwen3-ASR-0.6B via MLX,v0.3.0 起);其餘平台 `faster-whisper`。下表 preset 模型主要對應 `faster-whisper` / `mlx-whisper`(Whisper 系列);要切回 Whisper 改 `STT_BACKEND = "mlx-whisper"`,要試 Qwen3-ASR-1.7B 改 `STT_MODEL = "1.7B"`
 
 ### 怎麼切換
@@ -282,7 +274,7 @@ python3 -c "import sys; print(sys.executable)"
 
 ### 4. （可選）依硬體挑 Preset
 
-Apple Silicon 預設跑 **Qwen3-ASR-0.6B** on MLX,延遲約 0.3-0.5 秒,中文標點 + 中英混合表現比 Whisper turbo 強。想試 1.7B 把 `STT_MODEL` 改成 `"1.7B"`;想切回 Whisper 把 `STT_BACKEND` 改成 `"mlx-whisper"`。Intel Mac 或想省 RAM,去 [依硬體選擇 Preset](#依硬體選擇-preset) 改。
+Apple Silicon 預設跑 **Qwen3-ASR-0.6B** on MLX,延遲約 0.3-0.5 秒,中文標點 + 中英混合表現比 Whisper turbo 強。想試 1.7B 把 `STT_MODEL` 改成 `"1.7B"`;想切回 Whisper 把 `STT_BACKEND` 改成 `"mlx-whisper"`,然後去 [依硬體選擇 Preset](#依硬體選擇-preset) 改 `STT_MODEL`。
 
 ### 5. 啟動 daemon
 
@@ -442,7 +434,7 @@ Get-Content "$env:TEMP\stt-daemon.err.log" -Encoding utf8 -Tail 30
 
 **mlx-whisper 載入失敗 / 沒 Metal 加速**
 - log 出現 `Unknown STT backend: 'mlx-whisper'` → 沒裝 `mlx-whisper`,跑 `pip install mlx-whisper`
-- Intel Mac 跑 mlx-whisper 會失敗,正常 — daemon 預設會走 faster-whisper CPU。如果你硬要設 `STT_BACKEND = "mlx-whisper"` 在 Intel 上就會炸
+- v0.4.0 起 Intel Mac 不再支援,daemon 啟動會 SystemExit。要 Intel Mac 請降版到 v0.3.0
 
 **Daemon 死掉**
 ```bash
@@ -505,7 +497,7 @@ daemon **核心管線 100% 跨平台**：
 
 ```
 [mic] sounddevice
-  → STTBackend (qwen3-asr on Apple Silicon v0.3.0+; faster-whisper on Win/Linux/Intel-Mac; mlx-whisper switchable)
+  → STTBackend (qwen3-asr on Apple Silicon v0.3.0+; faster-whisper on Win/Linux; mlx-whisper switchable)
   → OpenCC s2tw  +  regex CJK/ASCII spacing
   → Pasteboard.set_text() + Pasteboard.paste()   ← ★ 唯一綁平台的薄層
 ```
@@ -535,7 +527,7 @@ def build_pasteboard() -> Pasteboard:
 
 > 重點:**lazy import**。`stt_platform_win.py` 在 module-level 用了 `ctypes.WinDLL("user32")`,如果在 macOS 上直接 import 會炸 — 所以 `build_pasteboard()` 只在跑到對應 branch 時才 import,跨平台 import 安全。
 
-STT 後端走完全相同結構(見 [STT 模型抽象](#stt-模型抽象)):Windows / Linux 走 CUDA + CTranslate2;macOS Apple Silicon 從 v0.3.0 預設走 **Qwen3-ASR-0.6B via `mlx-qwen3-asr`**(原生 Metal,中文標點 + 中英混合都比 Whisper turbo 強);v0.2.x 預設的 `mlx-whisper` (large-v3-turbo) 也仍可手動切換。Intel Mac 自動 fallback 到 faster-whisper CPU。
+STT 後端走完全相同結構(見 [STT 模型抽象](#stt-模型抽象)):Windows / Linux 走 CUDA + CTranslate2;macOS Apple Silicon 從 v0.3.0 預設走 **Qwen3-ASR-0.6B via `mlx-qwen3-asr`**(原生 Metal,中文標點 + 中英混合都比 Whisper turbo 強);v0.2.x 預設的 `mlx-whisper` (large-v3-turbo) 也仍可手動切換。Intel Mac 從 v0.4.0 起不再支援。
 
 ---
 
@@ -587,7 +579,7 @@ STT_MODEL   = _DEFAULT_MODEL        # 對應 platform 的 default model 字串
 | 後端 | 引擎 | 主要強項 | 狀態 |
 |------|------|---------|-----|
 | `qwen3-asr` | Alibaba Qwen3-ASR 0.6B / 1.7B via Apple MLX | **中文標點 + 中英 code-switching SOTA**,52 語 + 22 中文方言,中文場景比 Whisper 強 | ✅ **預設(Apple Silicon, v0.3.0+)** |
-| `faster-whisper` | Whisper large-v3-turbo via CTranslate2 | 中英混合強,99 語、CUDA float16 / CPU int8 | ✅ 預設(Win/Linux/Intel Mac) |
+| `faster-whisper` | Whisper large-v3-turbo via CTranslate2 | 中英混合強,99 語、CUDA float16 / CPU int8 | ✅ 預設(Win/Linux) |
 | `mlx-whisper` | Whisper large-v3-turbo via Apple MLX | Apple Silicon Whisper backend,中英混合穩、v0.2.x 預設 | ✅ 可選(Apple Silicon) |
 | `sense-voice` | 阿里 FunASR SenseVoice-Small | 體積 234 MB、速度極快、含情感/事件偵測、5 語 | 🛣️ 規劃 |
 | `paraformer` | 阿里 FunASR Paraformer-zh | **純中文 SOTA**(非自回歸) | 🛣️ 規劃 |
@@ -606,7 +598,7 @@ STT_MODEL   = _DEFAULT_MODEL        # 對應 platform 的 default model 字串
   - 觸發鍵:Right Option
   - 加速:`qwen3-asr` (Qwen3-ASR-0.6B via mlx-qwen3-asr) 預設(v0.3.0+);可切回 `mlx-whisper` (Whisper large-v3-turbo)
   - 系統權限:Python 要授 Input Monitoring + Microphone + Accessibility(IME-safe paste);System Events 也建議授 Accessibility(fallback 用)
-  - Intel Mac:自動 fallback 到 faster-whisper CPU int8(可用但延遲較高)
+  - Intel Mac:**v0.4.0 起不再支援**(daemon 啟動會 SystemExit,要用請 pin v0.3.0)
 - [ ] **Linux X11**
   - Clipboard：`xclip -selection clipboard`
   - Paste：`xdotool key ctrl+v`

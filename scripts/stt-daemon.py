@@ -4,7 +4,7 @@ Hold-to-talk voice → text daemon.
 Hold the trigger key (Right Alt/AltGr or Right Ctrl on Windows; Right Option
 on macOS) to record from the default microphone. Release to:
   1. Transcribe via the active STT backend (default: faster-whisper on
-     Windows/Linux/Intel-Mac, mlx-whisper on Apple Silicon).
+     Windows/Linux, mlx-whisper on Apple Silicon).
   2. Convert simplified Chinese to Taiwan-traditional via OpenCC.
   3. Insert spaces at zh ↔ en/digit boundaries.
   4. Place the text on the system clipboard AND simulate Ctrl+V / Cmd+V to
@@ -69,7 +69,7 @@ from stt_platform import Pasteboard, build_pasteboard
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -79,15 +79,25 @@ SAMPLE_RATE      = 16000
 MIN_AUDIO_SEC    = 0.3                 # taps shorter than this are ignored
 
 # STT backend + model defaults per platform.
-#   Apple Silicon (arm64): Qwen3-ASR-0.6B via mlx-qwen3-asr. Strong Chinese
-#       punctuation + native zh-en code-switching beat Whisper turbo for
-#       our 80%-zh + tech-loanword usage. Default since v0.3.0; v0.2.0/0.2.1
-#       default was mlx-whisper large-v3-turbo, still available via
+#   macOS (Apple Silicon only as of v0.4.0): Qwen3-ASR-0.6B via mlx-qwen3-asr.
+#       Strong Chinese punctuation + native zh-en code-switching beat Whisper
+#       turbo for our 80%-zh + tech-loanword usage. Default since v0.3.0;
+#       v0.2.x default was mlx-whisper large-v3-turbo, still available via
 #       STT_BACKEND="mlx-whisper".
-#   Windows / Linux / Intel Mac / Rosetta: faster-whisper large-v3-turbo
-#       (CUDA float16 when available, CPU int8 fallback).
+#   Windows / Linux: faster-whisper large-v3-turbo (CUDA float16 when
+#       available, CPU int8 fallback).
+# Intel Mac (darwin x86_64) support was dropped in v0.4.0 — the platform is
+# rare enough now that the maintenance + docs cost outweighs the benefit.
+# Pin to v0.3.0 or earlier for Intel Mac.
 # Override by hardcoding STT_BACKEND / STT_MODEL below.
-if sys.platform == "darwin" and _host_platform.machine() == "arm64":
+if sys.platform == "darwin":
+    if _host_platform.machine() != "arm64":
+        raise SystemExit(
+            "home-stt no longer supports Intel Mac (darwin "
+            f"{_host_platform.machine()}) since v0.4.0. macOS support is "
+            "Apple Silicon (arm64) only. Pin to v0.3.0 or earlier if you "
+            "need Intel Mac."
+        )
     _DEFAULT_BACKEND = "qwen3-asr"
     _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
 else:
@@ -294,9 +304,8 @@ class MlxWhisperBackend(STTBackend):
 
     Accepts either a short Whisper model name like ``large-v3-turbo`` (auto-
     resolved to ``mlx-community/whisper-large-v3-turbo``) or a fully-
-    qualified HuggingFace repo id. Apple Silicon only — on Intel Mac /
-    Rosetta the pipeline falls back to ``faster-whisper`` via the default
-    backend picker in the Config section.
+    qualified HuggingFace repo id. Apple Silicon only — other platforms
+    should use ``faster-whisper``.
     """
 
     name = "mlx-whisper"

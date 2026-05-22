@@ -71,8 +71,8 @@ class MacOSPasteboard(Pasteboard):
         self._has_ax = self._probe_ax_trust()
         if self._has_ax:
             # Lazy-import Quartz only if we'll actually use it — saves
-            # ~30ms startup on Intel Macs / unprivileged daemons that fall
-            # through to osascript.
+            # ~30ms startup on unprivileged daemons that fall through to
+            # osascript.
             from Quartz import (
                 CGEventCreateKeyboardEvent,
                 CGEventPost,
