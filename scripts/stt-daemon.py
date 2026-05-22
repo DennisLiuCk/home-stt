@@ -69,7 +69,7 @@ from stt_platform import Pasteboard, build_pasteboard
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -78,23 +78,32 @@ __version__ = "0.2.1"
 SAMPLE_RATE      = 16000
 MIN_AUDIO_SEC    = 0.3                 # taps shorter than this are ignored
 
-# STT backend defaults are platform-aware. Apple Silicon gets MLX (Metal-
-# native large-v3-turbo, latency comparable to NVIDIA float16). Everything
-# else (Windows, Linux, Intel Mac, Rosetta) defaults to faster-whisper,
-# which auto-falls-back to CPU int8 when CUDA is unavailable.
-# Override by hardcoding STT_BACKEND below.
+# STT backend + model defaults per platform.
+#   Apple Silicon (arm64): Qwen3-ASR-0.6B via mlx-qwen3-asr. Strong Chinese
+#       punctuation + native zh-en code-switching beat Whisper turbo for
+#       our 80%-zh + tech-loanword usage. Default since v0.3.0; v0.2.0/0.2.1
+#       default was mlx-whisper large-v3-turbo, still available via
+#       STT_BACKEND="mlx-whisper".
+#   Windows / Linux / Intel Mac / Rosetta: faster-whisper large-v3-turbo
+#       (CUDA float16 when available, CPU int8 fallback).
+# Override by hardcoding STT_BACKEND / STT_MODEL below.
 if sys.platform == "darwin" and _host_platform.machine() == "arm64":
-    _DEFAULT_BACKEND = "mlx-whisper"
+    _DEFAULT_BACKEND = "qwen3-asr"
+    _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
 else:
     _DEFAULT_BACKEND = "faster-whisper"
+    _DEFAULT_MODEL = "large-v3-turbo"
 
 STT_BACKEND      = _DEFAULT_BACKEND
 # Model identifier passed to the backend. Interpretation is backend-specific:
 #   faster-whisper:  Whisper model name ("large-v3-turbo", "medium", ...)
 #   mlx-whisper:     short name or HF repo id (auto-resolves "large-v3-turbo"
 #                    to "mlx-community/whisper-large-v3-turbo")
+#   qwen3-asr:       HF repo id ("Qwen/Qwen3-ASR-0.6B" / "Qwen/Qwen3-ASR-1.7B")
+#                    or short aliases "0.6B" / "1.7B" (case-insensitive). Anything
+#                    unrecognised falls back to the 0.6B variant.
 #   sense-voice:     ModelScope ID, e.g. "iic/SenseVoiceSmall" (planned)
-STT_MODEL        = "large-v3-turbo"
+STT_MODEL        = _DEFAULT_MODEL
 
 # Set of pynput Key/character triggers to listen for as hold-to-record keys.
 # `None` means "use the platform default" (Windows: Right Alt + Right Ctrl;
@@ -334,6 +343,100 @@ class MlxWhisperBackend(STTBackend):
         )
 
 
+class Qwen3AsrBackend(STTBackend):
+    """Qwen3-ASR via mlx-qwen3-asr (Apple Silicon Metal-native).
+
+    Alibaba's Qwen3-ASR, released 2026-01 under Apache-2.0. Two model sizes:
+        Qwen/Qwen3-ASR-0.6B  — default, ~1.2 GB fp16, 92ms TTFT
+        Qwen/Qwen3-ASR-1.7B  — higher accuracy, ~3.4 GB fp16
+
+    Strengths vs Whisper turbo for this daemon's typical usage:
+      - Native Chinese punctuation (Qwen3 LLM backbone — text generation is
+        a first-class objective, unlike Whisper which trained on subtitles
+        where punctuation is inconsistent).
+      - Native code-switching: zh + occasional English proper nouns
+        (Python, MLX, async, function, …) handled in one pass without
+        the model needing to flip language mid-sentence.
+      - 52 languages + 22 Chinese dialects in the training mix.
+
+    Accepts:
+      - Fully qualified HF repo ids ("Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B")
+      - Short aliases ("0.6B", "1.7B", case-insensitive)
+      - Anything else falls back to the 0.6B default — so a user with
+        STT_MODEL = "large-v3-turbo" who just flips STT_BACKEND still
+        gets a working setup without editing two lines.
+    """
+
+    name = "qwen3-asr"
+
+    # Map mlx-qwen3-asr's human-readable language names back to the ISO-ish
+    # short codes used elsewhere in the daemon log ("zh", "en", ...).
+    _LANG_NORM = {
+        "chinese":    "zh",
+        "english":    "en",
+        "japanese":   "ja",
+        "korean":     "ko",
+        "french":     "fr",
+        "german":     "de",
+        "spanish":    "es",
+        "portuguese": "pt",
+        "russian":    "ru",
+        "italian":    "it",
+        "arabic":     "ar",
+    }
+
+    def __init__(self, model_name: str):
+        import mlx_qwen3_asr  # lazy import (Apple Silicon only)
+
+        self._mqa = mlx_qwen3_asr
+        self._model_name = self._resolve_model_name(model_name)
+        self._device_label = "Apple Silicon (Metal, MLX) — Qwen3-ASR"
+
+    @staticmethod
+    def _resolve_model_name(model_name: str) -> str:
+        # Already a HF repo id — pass through (covers community forks too).
+        if "/" in model_name:
+            return model_name
+        m = model_name.lower()
+        if "1.7b" in m or "1_7" in m:
+            return "Qwen/Qwen3-ASR-1.7B"
+        if "0.6b" in m or "0_6" in m:
+            return "Qwen/Qwen3-ASR-0.6B"
+        # User probably has STT_MODEL = "large-v3-turbo" left over from the
+        # Whisper path; pick the smaller Qwen3-ASR variant by default.
+        return "Qwen/Qwen3-ASR-0.6B"
+
+    @property
+    def device_label(self) -> str:
+        return self._device_label
+
+    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
+        result = self._mqa.transcribe(
+            samples,
+            model=self._model_name,
+            verbose=False,
+        )
+        text = (getattr(result, "text", "") or "").strip()
+        raw_lang = (getattr(result, "language", "") or "").strip().lower()
+        # Normalise "Chinese" → "zh", "English" → "en", etc. Falls back to
+        # the first two letters of whatever the model returned so unknown
+        # languages still produce something sensible in the log line.
+        language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
+        return text, language
+
+    def warmup(self) -> None:
+        # First call downloads weights (~1.2 GB for 0.6B) on first run and
+        # materialises Metal kernels. Once warm, the next transcribe is
+        # near the ~92ms time-to-first-token claimed by the upstream MLX
+        # port.
+        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        self._mqa.transcribe(
+            warm_audio,
+            model=self._model_name,
+            verbose=False,
+        )
+
+
 def build_backend(name: str, model: str) -> STTBackend:
     """Factory. To add a new backend: implement STTBackend in a new class,
     add a branch here, and update STT_BACKEND in the Config section."""
@@ -341,6 +444,8 @@ def build_backend(name: str, model: str) -> STTBackend:
         return FasterWhisperBackend(model)
     if name == "mlx-whisper":
         return MlxWhisperBackend(model)
+    if name == "qwen3-asr":
+        return Qwen3AsrBackend(model)
     # ── Future backends ────────────────────────────────────────────────
     # elif name == "sense-voice":
     #     return SenseVoiceBackend(model)
