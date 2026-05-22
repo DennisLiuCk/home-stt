@@ -1,0 +1,40 @@
+# --- Project runtime ---
+# PID file produced by stt-start.ps1
+stt-daemon.pid
+# Logs (we write to %TEMP% by default, but local runs may dump these here)
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg
+pip-log.txt
+
+# --- OS metadata ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*~
+*.sublime-workspace
+
+# --- Local secrets / environment ---
+.env
+.env.*
+!.env.example
