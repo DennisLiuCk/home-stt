@@ -1,7 +1,7 @@
 """
 Optional text post-processing layer.
 
-Sits between the ASR backend's output (after s2tw + CJK/ASCII spacing) and
+Sits between the ASR backend's output (after s2twp + CJK/ASCII spacing) and
 the clipboard write. The default `NoopPolisher` returns the input unchanged
 — so existing setups without polish enabled behave identically.
 
@@ -38,7 +38,6 @@ Design notes:
 from __future__ import annotations
 
 import sys
-import time
 from abc import ABC, abstractmethod
 
 
@@ -129,7 +128,6 @@ class MlxLocalLlmPolisher(TextPostProcessor):
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            t0 = time.time()
             response = self._generate(
                 self._model,
                 self._tokenizer,
@@ -137,7 +135,6 @@ class MlxLocalLlmPolisher(TextPostProcessor):
                 max_tokens=self._max_tokens,
                 verbose=False,
             )
-            elapsed = time.time() - t0
             polished = (response or "").strip()
             if not polished:
                 return text
@@ -146,8 +143,6 @@ class MlxLocalLlmPolisher(TextPostProcessor):
             if (polished.startswith('"') and polished.endswith('"')) or \
                (polished.startswith("「") and polished.endswith("」")):
                 polished = polished[1:-1].strip() or polished
-            # Stash the last polish duration so the caller can log it.
-            self.last_elapsed = elapsed
             return polished
         except Exception as e:
             print(f"[stt] polish failed, returning raw: {e}",
@@ -189,16 +184,28 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             )
 
         self._torch = torch
+        # Pinned device id used by from_pretrained AND polish's input
+        # tensor move — kept in one place so they stay in sync. To run
+        # on a different physical GPU, set CUDA_VISIBLE_DEVICES env var
+        # (remaps the chosen GPU to cuda:0 inside the process).
+        self._device = "cuda:0"
         self._tokenizer = AutoTokenizer.from_pretrained(model_name)
         self._model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype=torch.bfloat16,
-            device_map="cuda:0",
+            device_map=self._device,
         )
         self._model.eval()
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
         self._model_name = model_name
+        # Resolve generate's pad/stop token once. For Qwen2/3 chat models the
+        # chat template terminates at <|im_end|>; some community variants
+        # report tokenizer.eos_token_id as a list or use a different base-EOS
+        # that doesn't match the chat boundary. Pin to <|im_end|> when
+        # available (so generate() stops at chat boundary), else fall back
+        # to a scalar eos.
+        self._pad_token_id = self._resolve_pad_token_id()
         try:
             # torch returns e.g. "NVIDIA GeForce RTX 5080" — already has
             # vendor prefix; don't add a second "NVIDIA ".
@@ -209,6 +216,20 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             f"{model_name} (PyTorch bfloat16 @ {gpu_name}, "
             f"≤{max_tokens} tok)"
         )
+
+    def _resolve_pad_token_id(self) -> int:
+        """Pin pad/stop to <|im_end|> when present (Qwen2/3 chat models all
+        terminate there). Fall back to a scalar form of eos_token_id —
+        defensively unwrap list form some community fine-tunes report.
+        Without this, model swaps that report eos as a list trip
+        generate()'s 'pad_token_id must be int' ValueError; swaps where
+        base eos != chat terminator run past chat boundary to max_tokens."""
+        im_end = self._tokenizer.convert_tokens_to_ids("<|im_end|>")
+        unk = getattr(self._tokenizer, "unk_token_id", None)
+        if im_end is not None and im_end != unk:
+            return im_end
+        eos = self._tokenizer.eos_token_id
+        return eos[0] if isinstance(eos, list) else eos
 
     @property
     def device_label(self) -> str:
@@ -231,7 +252,16 @@ class TorchLocalLlmPolisher(TextPostProcessor):
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            inputs = self._tokenizer(prompt, return_tensors="pt").to("cuda:0")
+            # add_special_tokens=False: the chat template already inserts
+            # any BOS / role-marker tokens the model expects. For Qwen
+            # tokenizers add_bos_token defaults False so this is a no-op
+            # today, but Llama-family tokenizers auto-prepend <s> — without
+            # this flag, a future POLISH_MODEL swap to Llama-derived weights
+            # would silently produce double-BOS prompts and degrade quality
+            # with no error.
+            inputs = self._tokenizer(
+                prompt, return_tensors="pt", add_special_tokens=False,
+            ).to(self._device)
             with self._torch.no_grad():
                 outputs = self._model.generate(
                     **inputs,
@@ -239,7 +269,7 @@ class TorchLocalLlmPolisher(TextPostProcessor):
                     # Greedy (do_sample=False) is deterministic + ~30%
                     # faster than sampling for this single-step polish task.
                     do_sample=False,
-                    pad_token_id=self._tokenizer.eos_token_id,
+                    pad_token_id=self._pad_token_id,
                 )
             new_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
             polished = self._tokenizer.decode(
@@ -295,14 +325,34 @@ def build_polisher(
         #     install the missing NVIDIA wheels / reinstall torch.
         #   - Other: surface raw exception.
         msg = str(e)
+        # torch is importable here — if it weren't, we'd be in the
+        # ImportError branch above. Use isinstance over string-typed class
+        # name compare so future torch renames/wraps don't silently break
+        # OOM detection.
+        try:
+            import torch as _torch
+            oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
+        except Exception:
+            _torch = None
+            oom_cls = None
         is_oom = (
-            "out of memory" in msg.lower()
-            or type(e).__name__ == "OutOfMemoryError"
+            (oom_cls is not None and isinstance(e, oom_cls))
+            or "out of memory" in msg.lower()
         )
         is_dll = isinstance(e, OSError) and any(
             s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
         )
         if is_oom:
+            # Free any partial allocation before the next from_pretrained
+            # (e.g. ASR backend init) tries to allocate. Without this, the
+            # abandoned-but-not-yet-GC'd tensors hold CUDA memory until
+            # Python's GC runs, cascading into a second OOM on the ASR
+            # path even though the polish-side allocation is logically dead.
+            if _torch is not None:
+                try:
+                    _torch.cuda.empty_cache()
+                except Exception:
+                    pass
             print(
                 f"[stt] polish disabled — CUDA OOM loading {model_name}: "
                 f"{e}. Try POLISH_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct' "

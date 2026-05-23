@@ -66,7 +66,7 @@ v0.5.0+ 起 **可選 LLM polish 後處理層**:走小型本地 LLM (預設 Qwen3
 | `sounddevice` | 從麥克風讀音訊 |
 | `numpy` | 音訊資料運算 |
 | `pynput` | 全域 keyboard hook |
-| `opencc-python-reimplemented` | 簡轉繁（s2tw，台灣正體） |
+| `opencc-python-reimplemented` | 簡轉繁(s2twp,台灣正體 + 詞彙慣用) |
 
 ### Windows GPU 加速套件(v0.6.0+ 預設配置)
 
@@ -572,7 +572,7 @@ Windows %TEMP%\ 或 macOS $TMPDIR (/var/folders/.../T/)
 | 注音 IME 攔截英文 ASCII keypress（逐字 type 時） | 早期試 `SendInput + KEYEVENTF_UNICODE` 直送 unicode；後來放棄 |
 | `KEYEVENTF_UNICODE` 在中文頓號（、）之後 IME 仍會吞掉後續字元 | **改用 clipboard + Ctrl+V 一次貼整段**：Ctrl 是 system modifier，IME 不攔；系統 paste 是原子操作不會中途斷掉 |
 | PowerShell 5.1 stdin/stdout cp950 編碼簡體字爆炸 | 強制 `[Console]::InputEncoding = UTF8` / `sys.stdout.reconfigure(utf-8)` |
-| Whisper 預設輸出簡體中文 | OpenCC `s2tw` 自動簡轉繁台灣正體 |
+| Whisper / Qwen3-ASR 預設輸出簡體中文 | OpenCC `s2twp` 自動簡轉繁台灣正體(含詞彙慣用,例如 异步→非同步、代码→程式碼) |
 | 中文跟英文連在一起沒空格 | regex 自動在 CJK ↔ ASCII letter/digit 邊界補空格 |
 | CTranslate2 找不到 cuDNN DLL | `pip install nvidia-cudnn-cu12` + 啟動時 `add_dll_directory` 和 prepend PATH |
 | Cold start CUDA JIT compile 約 10 秒 | daemon 啟動時跑一次 dummy transcribe 預熱 |
@@ -591,7 +591,7 @@ daemon **核心管線 100% 跨平台**：
 ```
 [mic] sounddevice
   → STTBackend (qwen3-asr default on Apple Silicon v0.3.0+ AND Windows/Linux v0.6.0+; faster-whisper / mlx-whisper switchable)
-  → OpenCC s2tw  +  regex CJK/ASCII spacing
+  → OpenCC s2twp  +  regex CJK/ASCII spacing (called twice: pre + post polish)
   → TextPostProcessor.polish() (optional, v0.5.0+ macOS / v0.6.0+ Win/Linux; gated on detected language)
   → Pasteboard.set_text() + Pasteboard.paste()   ← ★ 唯一綁平台的薄層
 ```

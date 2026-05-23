@@ -326,7 +326,7 @@ class STTBackend(ABC):
     def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
         """Run inference on a 1-D float32 PCM array (16 kHz, mono).
         Returns (raw_text, language_code). Backends do NOT post-process
-        text (no s2tw, no spacing) — that's done downstream."""
+        text (no s2twp, no spacing) — that's done downstream."""
 
     def warmup(self) -> None:
         """Optional: do a dummy inference so the first real request is fast.
@@ -659,9 +659,16 @@ def build_backend_with_fallback() -> STTBackend:
         #   - DLL load failure: hint to install NVIDIA cuDNN/cuBLAS wheels
         #   - Other: surface raw exception
         msg = str(e)
+        # isinstance check beats string-typed class name compare — future
+        # torch renames/wraps won't silently break OOM detection.
+        try:
+            import torch as _torch
+            oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
+        except Exception:
+            oom_cls = None
         is_oom = (
-            "out of memory" in msg.lower()
-            or type(e).__name__ == "OutOfMemoryError"
+            (oom_cls is not None and isinstance(e, oom_cls))
+            or "out of memory" in msg.lower()
         )
         is_dll = isinstance(e, OSError) and any(
             s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
