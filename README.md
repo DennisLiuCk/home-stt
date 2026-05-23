@@ -1,8 +1,10 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.4.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.5.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
+
+v0.5.0+ 起 **可選 LLM polish 後處理層**:走小型本地 LLM (預設 Qwen3-4B-Instruct-2507) 移除口語贅字(呃、嗯、就是、那個、然後)、修口誤,讓貼出去的文字更乾淨。可關。
 
 完全離線，無 API key、無流量費。
 
@@ -94,8 +96,9 @@ pip install --user numpy
 
 | 套件 | 用途 |
 |------|------|
-| `mlx-qwen3-asr` | **預設 backend（v0.3.0+）** — Qwen3-ASR via Apple MLX（Metal 加速）。中文標點 + 中英混合表現比 Whisper turbo 強 |
-| `mlx-whisper` | 可選 — Whisper large-v3-turbo via Apple MLX，v0.2.x 的舊預設，仍可切回去 |
+| `mlx-qwen3-asr` | **預設 ASR backend（v0.3.0+）** — Qwen3-ASR via Apple MLX（Metal 加速）。中文標點 + 中英混合表現比 Whisper turbo 強 |
+| `mlx-whisper` | 可選 ASR — Whisper large-v3-turbo via Apple MLX，v0.2.x 的舊預設，仍可切回去 |
+| `mlx-lm` | **預設 polish 後處理 backend（v0.5.0+）** — 跑小 LLM 移除口語贅字 + 修口誤。可關 (`POLISH_ENABLED = False`) |
 
 > ⚠️ 這兩個都只在 Apple Silicon（M1 以上）可用。Intel Mac 從 v0.4.0 起不支援(daemon 啟動會拒絕)。
 
@@ -108,10 +111,11 @@ pip install \
     pynput \
     opencc-python-reimplemented \
     mlx-qwen3-asr \
-    mlx-whisper
+    mlx-whisper \
+    mlx-lm
 ```
 
-> `mlx-whisper` 不是必裝，只是想留個切換選項才裝。最小集合可拿掉它，daemon 預設只用 `mlx-qwen3-asr`。`faster-whisper` 也不是預設需要的(macOS 預設 backend 是 qwen3-asr),但留著當 CPU fallback / debug 工具。
+> `mlx-whisper` 不是必裝，只是想留個切換選項才裝。最小集合可拿掉它，daemon 預設只用 `mlx-qwen3-asr`。`faster-whisper` 也不是預設需要的(macOS 預設 backend 是 qwen3-asr),但留著當 CPU fallback / debug 工具。`mlx-lm` 是 v0.5.0+ 的 polish 後處理用的;不裝的話 daemon 自動 fall back 到 NoopPolisher,直接貼原始 ASR 輸出,行為等同 v0.4.x。
 
 ### Linux 安裝（規劃中）
 
@@ -360,6 +364,12 @@ STT_BACKEND      = _DEFAULT_BACKEND        # 自動：Apple Silicon → qwen3-as
 STT_MODEL        = _DEFAULT_MODEL          # 自動：Apple Silicon → Qwen/Qwen3-ASR-0.6B，其餘 → large-v3-turbo
 TRIGGER_KEYS     = None                    # None = 平台預設（Win: alt_gr+ctrl_r,Mac: alt_r);改 set 可覆蓋
 
+# Polish 後處理（v0.5.0+;用小 LLM 修飾 ASR 輸出,去口語贅字)
+POLISH_ENABLED   = True                    # False = 跳過 polish,直接貼原始 ASR(行為等同 v0.4.x)
+POLISH_MODEL     = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit"  # ~2.5GB on disk, ~4-5GB peak RSS
+POLISH_LANGUAGES = {"zh", "ja", "ko"}      # 只 polish CJK;純英文 bypass(小 LLM 容易誤翻英文)
+POLISH_PROMPT    = "..."                   # 移除「呃、嗯、就是、那個、然後」+ 修口誤的 system prompt
+
 # 提示音
 BEEPS_ENABLED    = True                    # 想完全靜音設 False
 BEEP_START_HZ    = 880                     # 按下觸發鍵時的「叮」
@@ -371,6 +381,30 @@ BEEP_VOLUME      = 0.15                    # 0.0–1.0；太大聲會干擾 mic
 改完用 stop + start 腳本重啟（Windows: `.ps1`,macOS: `.sh`）。
 
 > 切換模型大小（依硬體）見 [依硬體選擇 Preset](#依硬體選擇-preset)；切換到不同 STT 引擎見 [STT 模型抽象](#stt-模型抽象)。
+
+### Polish 後處理 (v0.5.0+)
+
+ASR 跑完後可選一段 polish 後處理:走小型本地 LLM 修飾文字,去除口語贅字(呃、嗯、就是、那個、然後)、修正立即重複(「我我我覺得」→「我覺得」),保留說話原意 + 中英專有名詞。
+
+**預設行為**:Apple Silicon 啟用 `POLISH_ENABLED = True`,用 `lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit`(~2.5GB disk、~4-5GB RSS peak),只 polish CJK 語句(`zh`、`ja`、`ko`),純英文輸入 bypass。
+
+**典型效果**:
+```
+[stt] zh 0.40s+polish 0.36s -> 我覺得這個 Python function 的設計可以再優化一下
+                              ↑ 原始 ASR:「呃我我我覺得這個 Python function 的設計,嗯,可以再優化一下」
+```
+
+**記憶體佔用**:daemon 總 RSS peak ~4.5GB(Qwen3-ASR 0.6B + Qwen3-4B-Instruct 4bit + Python overhead)。16GB Mac 舒服;**8GB Mac 建議 `POLISH_ENABLED = False`**(回到 ~1.5-2GB)。
+
+**Polish 失敗 fallback**:如果 `mlx-lm` 沒裝、模型載入失敗或 OOM,daemon 印一行 warning 後自動退到 `NoopPolisher`(原樣輸出),不會 crash。
+
+**換更小的 polish 模型**(8GB Mac 想保留 polish 功能):
+```python
+# ~1.8GB on disk,~2.8GB RSS peak,品質中等(偶爾誤翻英文邊角 case)
+POLISH_MODEL = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+```
+
+> ⚠️ Qwen3.5 系列(0.8B / 2B / 4B)目前**不適合**做 polish — 它們預設 thinking 模式會吐 chain-of-thought trace,把 max_tokens 用光也沒寫到 polish 結果。Qwen3-Instruct-2507 才是純指令跟隨變體。
 
 ### 提示音說明
 
@@ -499,6 +533,7 @@ daemon **核心管線 100% 跨平台**：
 [mic] sounddevice
   → STTBackend (qwen3-asr on Apple Silicon v0.3.0+; faster-whisper on Win/Linux; mlx-whisper switchable)
   → OpenCC s2tw  +  regex CJK/ASCII spacing
+  → TextPostProcessor.polish() (optional, v0.5.0+; gated on detected language)
   → Pasteboard.set_text() + Pasteboard.paste()   ← ★ 唯一綁平台的薄層
 ```
 
@@ -633,3 +668,4 @@ STT_MODEL   = _DEFAULT_MODEL        # 對應 platform 的 default model 字串
 
 - [x] **`STTBackend` 抽象** — 已抽出,換引擎只改 `STT_BACKEND` 常數 + 加一個 class
 - [x] **`Pasteboard` 抽象** — v0.2.0 隨 macOS 支援一起完成。Clipboard 寫入 / Paste 模擬 / 觸發鍵代號全部抽到 `scripts/stt_platform*.py`,加新平台只要實作 `Pasteboard` 子類即可
+- [x] **`TextPostProcessor` 抽象** — v0.5.0 加進來,跑在 ASR 跟 paste 之間。`NoopPolisher`(預設關)或 `MlxLocalLlmPolisher`(小 LLM 走 mlx-lm 修飾文字)。介面 `polish(text) -> str`,未來要試 multi-modal polishing(例如 Qwen3-Omni)可擴展加 audio kwarg

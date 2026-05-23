@@ -1,6 +1,6 @@
 # Plan — Windows Qwen3-ASR + CUDA backend
 
-> ⏳ **Disposable planning doc.** 實作完成 + v0.5.0 commit 之後 **刪掉這份檔案**。
+> ⏳ **Disposable planning doc.** 實作完成 + v0.6.0 commit 之後 **刪掉這份檔案**。
 > 不要長期留在 repo,不歸 README 管理範圍。
 
 ## 目標一句話
@@ -236,25 +236,25 @@ else:
 ### 改動 3:`__version__` bump
 
 ```python
-__version__ = "0.4.0"  → "0.5.0"
+__version__ = "0.5.0"  → "0.6.0"
 ```
 
 ### 改動 4:README 更新清單
 
 依重要度排序 — 沒做完不要 commit:
 
-1. **Badge** v0.4.0 → v0.5.0(line ~3)
+1. **Badge** v0.5.0 → v0.6.0(line ~3)
 2. **平台表** Windows 那列「STT backend / 加速」:
    `faster-whisper + NVIDIA CUDA` →
-   `Qwen3-ASR-0.6B via qwen-asr + NVIDIA CUDA(預設 v0.5.0+);也可切 faster-whisper`
+   `Qwen3-ASR-0.6B via qwen-asr + NVIDIA CUDA(預設 v0.6.0+);也可切 faster-whisper`
 3. **Windows 系統需求**(~line 38):加進「PyTorch+CUDA wheel 要先裝」這一步
 4. **依賴 → Windows GPU 加速** + **Windows 一鍵安裝**:重寫成下面的「Windows 端安裝步驟」三步格式
 5. **Backend 狀態表**(~line 587):
-   - `qwen3-asr` 狀態欄改成 `✅ 預設(Apple Silicon v0.3.0+ / Windows + Linux v0.5.0+)`
+   - `qwen3-asr` 狀態欄改成 `✅ 預設(Apple Silicon v0.3.0+ / Windows + Linux v0.6.0+)`
    - `faster-whisper` 狀態欄改成 `✅ 可選(Win/Linux fallback)`
 6. **Roadmap → STT 模型/後端 → qwen3-asr**:把「macOS Apple Silicon 專用」
    那句改成「Apple Silicon (MLX) + Windows/Linux (PyTorch CUDA)」
-7. **Roadmap → 平台支援 → Windows 10/11**:加一句「v0.5.0 起預設 qwen3-asr,
+7. **Roadmap → 平台支援 → Windows 10/11**:加一句「v0.6.0 起預設 qwen3-asr,
    v0.4.x 預設 faster-whisper 仍可切換」
 
 ---
@@ -308,14 +308,14 @@ notepad plan-windows-qwen3-asr.md   # 或在 VSCode 開
 #    - 整個 class 換成計劃裡「改動 1」的新版
 #    - 在它後面加 _Qwen3MlxImpl + _Qwen3TorchImpl 兩個 class
 #    - Config block 套用「改動 2」
-#    - __version__ 改 "0.5.0"
+#    - __version__ 改 "0.6.0"
 
 # 4. 改 README.md(對照「改動 4」清單)
 
 # 5. 本地 smoke test:不啟動 daemon,先驗證 import
 python -c "import sys; sys.path.insert(0, 'scripts'); import importlib.util; spec = importlib.util.spec_from_file_location('stt_daemon', 'scripts/stt-daemon.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print('OK; version:', mod.__version__); b = mod.build_backend('qwen3-asr', 'Qwen/Qwen3-ASR-0.6B'); print('backend:', b.__class__.__name__, '|', b.device_label)"
 # 預期看到:
-#   OK; version: 0.5.0
+#   OK; version: 0.6.0
 #   backend: Qwen3AsrBackend | NVIDIA <GPU 名> (bfloat16) — Qwen3-ASR
 # 如果 device_label 變 "CPU (float32)" 表示 step 1 沒裝對 CUDA torch
 
@@ -325,7 +325,7 @@ python -c "import sys; sys.path.insert(0, 'scripts'); import importlib.util; spe
 # 7. tail log 確認 backend / device_label
 Get-Content "$env:TEMP\stt-daemon.log" -Encoding utf8 -Tail 10
 # 預期:
-#   [stt] home-stt v0.5.0 starting
+#   [stt] home-stt v0.6.0 starting
 #   [stt] platform: win32 (AMD64) | native libs registered: 2
 #   [stt] backend: qwen3-asr | model: Qwen/Qwen3-ASR-0.6B
 #   [stt] warming up on NVIDIA <GPU 名> (bfloat16) — Qwen3-ASR...
@@ -340,8 +340,8 @@ git rm plan-windows-qwen3-asr.md
 # 10. commit + push
 #     程式 + README + 刪計劃檔 = 一個 commit:
 #     git add scripts/stt-daemon.py README.md
-#     git commit -m "v0.5.0: Qwen3-ASR + CUDA on Windows / Linux"
-#     git tag -a v0.5.0 -m "Release v0.5.0 — Qwen3-ASR backend on Windows / Linux via qwen-asr"
+#     git commit -m "v0.6.0: Qwen3-ASR + CUDA on Windows / Linux"
+#     git tag -a v0.6.0 -m "Release v0.6.0 — Qwen3-ASR backend on Windows / Linux via qwen-asr"
 #     git push origin main --tags
 ```
 
@@ -390,7 +390,7 @@ git rm plan-windows-qwen3-asr.md
    可以跑。Qwen3-ASR-1.7B 需要 ~6-7 GB,把 STT_MODEL 改 "1.7B" 試。
 
 6. **macOS 路徑不會被影響**:`_Qwen3MlxImpl` 是把現有 mlx-qwen3-asr 代碼搬到
-   一個 class 裡,行為等價。改完後在 Mac 上 daemon 跑起來應該跟現在 v0.4.0
+   一個 class 裡,行為等價。改完後在 Mac 上 daemon 跑起來應該跟現在 v0.5.0
    完全一樣。如果 Mac 端有問題那是 refactor 出錯,不是 PyTorch 路徑的問題。
 
 ---
@@ -398,8 +398,8 @@ git rm plan-windows-qwen3-asr.md
 ## 完成後清理(別忘了)
 
 1. `git rm plan-windows-qwen3-asr.md`
-2. `git commit -am "v0.5.0: Qwen3-ASR + CUDA on Windows / Linux"`(或分兩個 commit)
-3. `git tag -a v0.5.0 -m "Release v0.5.0 — Qwen3-ASR backend on Windows / Linux via qwen-asr"`
+2. `git commit -am "v0.6.0: Qwen3-ASR + CUDA on Windows / Linux"`(或分兩個 commit)
+3. `git tag -a v0.6.0 -m "Release v0.6.0 — Qwen3-ASR backend on Windows / Linux via qwen-asr"`
 4. `git push origin main --tags`
 
 如果實作過程發現本計劃有誤,**直接改本計劃 commit 一版,再進實作** — 之後

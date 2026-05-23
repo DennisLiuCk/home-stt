@@ -64,12 +64,13 @@ from pynput import keyboard
 from pynput.keyboard import Key
 
 from stt_platform import Pasteboard, build_pasteboard
+from text_polisher import TextPostProcessor, build_polisher
 
 
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,36 @@ STT_BACKEND      = _DEFAULT_BACKEND
 #                    unrecognised falls back to the 0.6B variant.
 #   sense-voice:     ModelScope ID, e.g. "iic/SenseVoiceSmall" (planned)
 STT_MODEL        = _DEFAULT_MODEL
+
+# ---------------------------------------------------------------------------
+# Optional polish stage (v0.5.0+): runs ASR output through a small local
+# instruction-tuned LLM that removes filler words (呃、嗯、就是、那個、然後),
+# fixes immediate repetitions (「我我我覺得」→「我覺得」), and otherwise
+# preserves the speaker's meaning. The polished text is what gets pasted.
+#
+# Defaults to Qwen3-4B-Instruct-2507-MLX-4bit (~2.5 GB on disk, ~3-4 GB
+# RSS once loaded). The 2507 build is a pure instruction-tuned variant
+# (no chain-of-thought trace) — newer Qwen3.5 thinking models are not a
+# good fit for this single-step polish task. POLISH_LANGUAGES gates which
+# detected-language transcripts get polished, because small Chinese-strong
+# instruction LLMs eagerly translate pure-English text into Chinese even
+# with an explicit "preserve English" instruction.
+#
+# Failure modes (mlx-lm missing, model load OOM) degrade silently to a
+# NoopPolisher — the daemon continues to work with raw ASR output.
+# ---------------------------------------------------------------------------
+POLISH_ENABLED   = True
+POLISH_MODEL     = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit"
+POLISH_LANGUAGES = {"zh", "ja", "ko"}
+POLISH_PROMPT    = (
+    "你是一個將口語逐字稿轉成精煉文字的助手。請依照以下原則修飾輸入文字:\n"
+    "1. 移除冗字、填充詞 (呃、嗯、就是、那個、然後)\n"
+    "2. 修正口誤、立即重複 (例如「我我我覺得」→「我覺得」)\n"
+    "3. 保持原始語意，不增加新資訊\n"
+    "4. 不過度改寫，保留說話者的句式風格\n"
+    "5. 中文使用繁體；英文保留原英文，不要翻譯英文單字或專有名詞\n"
+    "6. 只輸出修飾後的文字本身，不要解釋、引號、前綴"
+)
 
 # Set of pynput Key/character triggers to listen for as hold-to-record keys.
 # `None` means "use the platform default" (Windows: Right Alt + Right Ctrl;
@@ -486,6 +517,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
 # ---------------------------------------------------------------------------
 _backend: STTBackend       # set in main()
 _pasteboard: Pasteboard    # set in main()
+_polisher: TextPostProcessor  # set in main()
 
 
 def _transcribe_and_emit() -> None:
@@ -512,6 +544,16 @@ def _transcribe_and_emit() -> None:
             return
         text = post_process(raw)
 
+        # Optional polish stage (text → text). Gated on detected language
+        # because small Chinese-strong instruction LLMs translate pure-
+        # English text even with an explicit "preserve English" prompt.
+        # POLISH_LANGUAGES whitelists which language codes trigger polish.
+        polish_elapsed = 0.0
+        if language in POLISH_LANGUAGES:
+            t1 = time.time()
+            text = _polisher.polish(text)
+            polish_elapsed = time.time() - t1
+
         # Set clipboard, then paste — atomic, no per-char IME drama.
         # Tiny sleep lets the clipboard write settle before the keystroke
         # (otherwise the paste keystroke can race ahead and paste empty/stale
@@ -529,13 +571,16 @@ def _transcribe_and_emit() -> None:
             _play_beep(BEEP_END_HZ)
 
         try:
+            timing = f"{elapsed:.2f}s"
+            if polish_elapsed > 0:
+                timing += f"+polish {polish_elapsed:.2f}s"
             if paste_ok:
-                print(f"[stt] {language} {elapsed:.2f}s -> {text}", flush=True)
+                print(f"[stt] {language} {timing} -> {text}", flush=True)
             else:
                 # paste() already printed a user-facing 'paste blocked' line
                 # to the main log; we record the transcript itself so it's
                 # discoverable even when auto-paste didn't fire.
-                print(f"[stt] {language} {elapsed:.2f}s clipboard-only -> {text}",
+                print(f"[stt] {language} {timing} clipboard-only -> {text}",
                       flush=True)
         except Exception:
             print(f"[stt] inserted ({elapsed:.2f}s); log encoding failed",
@@ -593,6 +638,10 @@ def main() -> None:
     paste_desc = _pasteboard.describe_paste_path()
     if paste_desc:
         print(f"[stt] paste path: {paste_desc}", flush=True)
+
+    global _polisher
+    _polisher = build_polisher(POLISH_ENABLED, POLISH_MODEL, POLISH_PROMPT)
+    print(f"[stt] polish: {_polisher.device_label}", flush=True)
 
     _backend = build_backend(STT_BACKEND, STT_MODEL)
 
