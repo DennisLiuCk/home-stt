@@ -557,11 +557,13 @@ class _Qwen3MlxImpl:
 class _Qwen3TorchImpl:
     """Windows / Linux path — qwen-asr (PyTorch + transformers + NVIDIA CUDA).
 
-    Picks the device once at init: CUDA bfloat16 when a GPU is visible,
-    CPU float32 otherwise. CPU mode is functional but ~30-60× slower per
-    transcribe — well outside the hold-to-talk budget. We log a loud
-    warning rather than silently falling back inside transcribe(), so the
-    user can fix the install or switch STT_BACKEND="faster-whisper".
+    Hard-requires CUDA. On CPU the Qwen3-ASR-0.6B is ~30-60× slower per
+    transcribe — way over the hold-to-talk perceptual budget. Mirroring
+    TorchLocalLlmPolisher's pattern, __init__ raises RuntimeError if CUDA
+    is unavailable so the daemon's build_backend_with_fallback can route
+    to faster-whisper (which has its own working CPU int8 fallback inside
+    its __init__). Refusing CPU here is much better UX than silently
+    delivering 30-60 s transcribes.
     """
 
     def __init__(self, model_name: str):
@@ -569,27 +571,24 @@ class _Qwen3TorchImpl:
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        if torch.cuda.is_available():
-            device = "cuda:0"
-            dtype = torch.bfloat16
-            try:
-                # torch returns e.g. "NVIDIA GeForce RTX 5080" — already has
-                # vendor prefix; don't add a second "NVIDIA ".
-                gpu_name = torch.cuda.get_device_name(0)
-            except Exception:
-                gpu_name = "CUDA device"
-            self.device_label = f"{gpu_name} (bfloat16) — Qwen3-ASR"
-        else:
-            device = "cpu"
-            dtype = torch.float32
-            self.device_label = (
-                "CPU (float32) — Qwen3-ASR (no CUDA detected)"
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "_Qwen3TorchImpl requires CUDA. On CPU the Qwen3-ASR "
+                "model is 30-60x slower per transcribe — unusable for "
+                "hold-to-talk UX. Install torch with CUDA support, or "
+                "set STT_BACKEND = 'faster-whisper' which has a working "
+                "CPU int8 fallback."
             )
-            print(
-                "[stt] qwen-asr fell back to CPU — install torch with CUDA "
-                "support for GPU acceleration (see README → Windows 安裝).",
-                file=sys.stderr, flush=True,
-            )
+
+        device = "cuda:0"
+        dtype = torch.bfloat16
+        try:
+            # torch returns e.g. "NVIDIA GeForce RTX 5080" — already has
+            # vendor prefix; don't add a second "NVIDIA ".
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_name = "CUDA device"
+        self.device_label = f"{gpu_name} (bfloat16) — Qwen3-ASR"
 
         self._model = Qwen3ASRModel.from_pretrained(
             model_name,
@@ -655,16 +654,30 @@ def build_backend_with_fallback() -> STTBackend:
             file=sys.stderr, flush=True,
         )
     except Exception as e:
+        # Three actionable failure classes (mirrors build_polisher):
+        #   - CUDA OOM: hint to free polish VRAM or pick smaller STT model
+        #   - DLL load failure: hint to install NVIDIA cuDNN/cuBLAS wheels
+        #   - Other: surface raw exception
         msg = str(e)
         is_oom = (
             "out of memory" in msg.lower()
             or type(e).__name__ == "OutOfMemoryError"
         )
-        hint = (
-            " (CUDA OOM — try POLISH_ENABLED = False to free ~3-8 GB, "
-            "or pick a smaller STT_MODEL)"
-            if is_oom else ""
+        is_dll = isinstance(e, OSError) and any(
+            s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
         )
+        if is_oom:
+            hint = (
+                " (CUDA OOM — try POLISH_ENABLED = False to free ~3-8 GB, "
+                "or pick a smaller STT_MODEL)"
+            )
+        elif is_dll:
+            hint = (
+                " (CUDA DLL load failed — install nvidia-cudnn-cu12 + "
+                "nvidia-cublas-cu12 or reinstall torch with CUDA wheel)"
+            )
+        else:
+            hint = ""
         print(
             f"[stt] backend '{STT_BACKEND}' init failed: {e}{hint}. "
             f"Falling back to faster-whisper.",
@@ -738,18 +751,25 @@ def _transcribe_and_emit() -> None:
         # because small Chinese-strong instruction LLMs translate pure-
         # English text even with an explicit "preserve English" prompt.
         # POLISH_LANGUAGES whitelists which language codes trigger polish.
+        #
+        # `polish_edited` is computed on the polish output BEFORE the
+        # OpenCC backstop — otherwise edits that the backstop normalises
+        # away (e.g. polish leaked 简, s2twp converted back) would be
+        # invisible in the diff log even though polish DID change text.
         polish_elapsed = 0.0
+        polish_edited = False
         if language in POLISH_LANGUAGES:
             t1 = time.time()
-            text = _polisher.polish(text)
+            polished = _polisher.polish(text)
             polish_elapsed = time.time() - t1
+            polish_edited = polished != text
             # Polish models can leak simplified glyphs back in despite the
             # "中文一律繁體" prompt rule (especially smaller models with
             # weaker instruction following). Re-run post_process as a
             # deterministic μs-cost backstop — guarantees clipboard output
             # is always TW-traditional with consistent CJK/ASCII spacing,
             # regardless of which polish model is loaded or how strict it is.
-            text = post_process(text)
+            text = post_process(polished)
 
         # Set clipboard, then paste — atomic, no per-char IME drama.
         # Tiny sleep lets the clipboard write settle before the keystroke
@@ -769,14 +789,18 @@ def _transcribe_and_emit() -> None:
 
         try:
             timing = f"{elapsed:.2f}s"
-            if polish_elapsed > 0:
+            # 5ms threshold suppresses NoopPolisher's microsecond runtime
+            # — without it the log shows "+polish 0.00s" even when polish
+            # was disabled / fell back to Noop, falsely suggesting polish
+            # ran.
+            if polish_elapsed > 0.005:
                 timing += f"+polish {polish_elapsed:.2f}s"
-            # When polish substantively edited the text, print the raw
-            # (post-process'd, pre-polish) text on a preceding line so
-            # the user can diff polish's changes against ASR's output.
-            # No raw line when polish made no edit — keeps the common
-            # case quiet.
-            if polish_elapsed > 0 and text != pre_polish:
+            # Print the raw (pre-polish, post-OpenCC) text on a preceding
+            # line when polish substantively edited it — lets the user diff
+            # what polish changed vs what ASR produced. Gated on
+            # polish_edited (computed before the OpenCC backstop) so edits
+            # that the backstop normalises away are still surfaced.
+            if polish_edited:
                 print(f"[stt] {language} raw   -> {pre_polish}", flush=True)
             if paste_ok:
                 print(f"[stt] {language} {timing} -> {text}", flush=True)

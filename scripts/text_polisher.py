@@ -42,6 +42,22 @@ import time
 from abc import ABC, abstractmethod
 
 
+def _format_polish_user_msg(text: str) -> str:
+    """Wrap ASR text as data, not as a user-role request.
+
+    Strong instruction-tuned models (esp. unquantised bf16, less so 4-bit
+    quantised) otherwise treat question-shaped ASR output (e.g. "幫我
+    review 這個 function") as a real conversation request and ANSWER it
+    instead of polishing — despite the system prompt's rules. Wrapping
+    with an explicit "請修飾以下逐字稿:" prefix re-frames the input as
+    data to be transformed, which the model then handles correctly.
+
+    Applied uniformly to both MLX (Mac) and Torch (Win/Linux) impls so
+    the same POLISH_MODEL produces the same output across platforms.
+    """
+    return f"請修飾以下逐字稿:\n{text}"
+
+
 class TextPostProcessor(ABC):
     """Polish raw ASR text. Implementations may transform, leave unchanged,
     or fail-safely return the input. Must NEVER raise — failure modes are
@@ -106,7 +122,7 @@ class MlxLocalLlmPolisher(TextPostProcessor):
         try:
             messages = [
                 {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": text},
+                {"role": "user", "content": _format_polish_user_msg(text)},
             ]
             prompt = self._tokenizer.apply_chat_template(
                 messages,
@@ -203,18 +219,12 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         if not text:
             return text
         try:
-            # Wrap ASR text as data, not as a user request. bf16 Qwen3-4B
-            # otherwise treats question-shaped input as a real request and
-            # answers it ("幫我 review 這個 function" → model gives a code
-            # review instead of polishing). MLX 4-bit doesn't show this
-            # because quantisation degrades the answer-mode tendency.
-            # Lean wrapper: just the data prefix. The system prompt
-            # already carries the rules — duplicating them here is prefill
-            # cost on every call.
-            user_msg = f"請修飾以下逐字稿:\n{text}"
+            # Wrapper logic (request → data framing) lives in
+            # _format_polish_user_msg at module scope and is shared with
+            # MlxLocalLlmPolisher for cross-platform output consistency.
             messages = [
                 {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": user_msg},
+                {"role": "user", "content": _format_polish_user_msg(text)},
             ]
             prompt = self._tokenizer.apply_chat_template(
                 messages,
@@ -275,20 +285,36 @@ def build_polisher(
         )
         return NoopPolisher()
     except Exception as e:
-        # CUDA OOM lands here. On older torch it's a RuntimeError carrying
-        # 'CUDA out of memory'; on newer torch it's torch.cuda.OutOfMemoryError
-        # (which subclasses RuntimeError). Match on either signal — the
-        # actionable next step is "use a smaller model", not "reinstall".
+        # Three actionable failure classes:
+        #   - CUDA OOM: torch.cuda.OutOfMemoryError on newer torch, plain
+        #     RuntimeError carrying 'CUDA out of memory' on older. Hint:
+        #     swap to a smaller model.
+        #   - DLL load failure: OSError raised when torch.cuda.is_available()
+        #     or from_pretrained triggers loading cudart/cudnn/cublas DLLs
+        #     that aren't installed or are on a wrong CUDA version. Hint:
+        #     install the missing NVIDIA wheels / reinstall torch.
+        #   - Other: surface raw exception.
         msg = str(e)
         is_oom = (
             "out of memory" in msg.lower()
             or type(e).__name__ == "OutOfMemoryError"
+        )
+        is_dll = isinstance(e, OSError) and any(
+            s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
         )
         if is_oom:
             print(
                 f"[stt] polish disabled — CUDA OOM loading {model_name}: "
                 f"{e}. Try POLISH_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct' "
                 f"(~3 GB VRAM), or set POLISH_ENABLED = False.",
+                file=sys.stderr, flush=True,
+            )
+        elif is_dll:
+            print(
+                f"[stt] polish disabled — CUDA DLL load failed for "
+                f"{model_name}: {e}. Install nvidia-cudnn-cu12 + "
+                f"nvidia-cublas-cu12 (Windows), or reinstall torch with "
+                f"the CUDA wheel (see README -> Windows 安裝步驟).",
                 file=sys.stderr, flush=True,
             )
         else:
