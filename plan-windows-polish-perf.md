@@ -3,6 +3,14 @@
 > ⏳ **Disposable planning doc.** 實作完成 + v0.7.0 commit 之後 **刪掉這份檔案**。
 > 不要長期留在 repo,不歸 README 管理範圍。
 
+> 📌 **Plan baseline**:本計劃假設你已在 commit `1151809` 之後(8 個 LOW
+> code-review fixes 已 ship)的 `text_polisher.py` 上做增量修改,不是從
+> v0.6.0 base (ad02681) 重寫。1151809 對 `TorchLocalLlmPolisher` 加了:
+> `self._device` literal extraction、`self._pad_token_id` + `_resolve_pad_token_id()`
+> helper、polish() 的 `add_special_tokens=False`、`dtype=` 取代 deprecated
+> `torch_dtype=`。**這些都要保留**,本 plan 只在它們之上加 attention impl
+> 偵測 + 可選 4-bit 量化 + 可選 torch.compile。
+
 ## 目標一句話
 
 讓 Windows v0.7.0 polish 階段在長文情境下的延遲**降到接近 Mac MLX 等級**(~0.5-1.0s for 100-char output),解掉現在「RTX 5080 跑得比 Apple Silicon MLX 慢」的反直覺體驗。
@@ -46,12 +54,14 @@ RTX 5080 raw FLOPS 跟 memory bandwidth 都比 M-series 高 2-3 倍。理論上 
 
 PyTorch 2.0+ 內建,**不必裝任何套件**。預期 30-50% decode 改善。
 
+在現有的 `from_pretrained` 呼叫(已用 `dtype=` 不是 `torch_dtype=`)加一行:
+
 ```python
 self._model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    torch_dtype=torch.bfloat16,
-    device_map="cuda:0",
-    attn_implementation="sdpa",  # ← 加這行
+    dtype=torch.bfloat16,                  # 已在 1151809 改為 dtype
+    device_map=self._device,               # 已在 1151809 抽成 self._device
+    attn_implementation="sdpa",            # ← 階段 1 新增
 )
 ```
 
@@ -72,11 +82,16 @@ self._model = torch.compile(self._model, mode="reduce-overhead")
 
 ### 階段 3:Flash Attention 2
 
+**Pre-flight 必做** — Blackwell (sm_120) prebuilt wheel 可能還沒釋出:
+
 ```powershell
-# 需要 CUDA toolkit (不只是 runtime) 來編譯
-# Pre-built wheel 通常涵蓋 CUDA 11.8 / 12.1 / 12.4 + Python 3.10/3.11/3.12
-pip install flash-attn --no-build-isolation
+# 1. 先確認 flash-attn 有沒有 Blackwell prebuilt wheel
+#    去 https://github.com/Dao-AILab/flash-attention/releases 看最新 release
+#    或直接試裝 (失敗會立即知道,不會浪費編譯時間)
+pip install flash-attn --no-build-isolation --no-deps
 ```
+
+如果有 prebuilt wheel → 一行裝完。如果沒有 → 要 CUDA toolkit + MSVC + ~30-60 分鐘編譯時間或直接失敗;**建議**遇到 source build 就跳過階段 3,光階段 1 + 2 已有顯著改善。
 
 ```python
 self._model = AutoModelForCausalLM.from_pretrained(
@@ -88,8 +103,9 @@ self._model = AutoModelForCausalLM.from_pretrained(
 預期再 20-40% 改善(尤其長 context)。階段 1 + 階段 3 加總接近原始 50-100% 加速。
 
 風險:
-- pip install flash-attn 在 Windows 沒 prebuilt wheel 時要 from source build,需要 CUDA toolkit + MSVC。**可能 30-60 分鐘編譯時間**或直接失敗
-- 部分 GPU 架構不支援(Ampere / Ada Lovelace / Hopper 都行;RTX 5080 是 Blackwell,需確認支援 — 應該有)
+- **`is_flash_attn_2_available`** 的 import 路徑跨 transformers 版本可能不穩。Plan 改動 1 範例用 try/except 動態 import,別硬寫死路徑
+- pip install flash-attn 在 Windows 沒 prebuilt wheel 時要 from source build,需要 CUDA toolkit + MSVC
+- 部分 GPU 架構不支援。Ampere / Ada Lovelace / Hopper 都 OK;**RTX 5080 是 Blackwell (sm_120),flash-attn 2.x stable 截 2026 H1 應該已支援,但 prebuilt wheel 釋出時間可能晚於 PyTorch 主流支援**
 - 如果 flash-attn 裝不上,**保留階段 1 + 2 即可**,不必執著
 
 ### 階段 4:bitsandbytes INT4 量化
@@ -117,8 +133,8 @@ self._model = AutoModelForCausalLM.from_pretrained(
 預期再 20-40% 改善 + VRAM 砍掉 70%(1.5B bf16 ~3GB → INT4 ~750 MB)。
 
 風險:
-- bitsandbytes 在 Windows 歷史上 flaky,需要對的 CUDA 版本對應 wheel
-- 量化可能讓 polish 品質微降。實測比較 raw 跟 polished 輸出
+- bitsandbytes Windows native wheel 在 2025 H2 後已較穩定(早期歷史很 flaky,現在 OK)。挑跟你 CUDA 版本對應的 wheel — 我們現在跑 cu128 torch 2.11,bitsandbytes ≥ 0.43 應有支援
+- 量化可能讓 polish 品質微降。實測比較 raw 跟 polished 輸出(bench 表的「polish vs baseline 字數差」欄)
 - 跟 torch.compile 組合不一定相容,先一個一個來
 
 ### 階段 5(可選):換更小 polish 模型
@@ -146,51 +162,69 @@ vLLM 是專業 LLM inference engine,有 PagedAttention + continuous batching + t
 
 ## 改動清單
 
-### 改動 1:`scripts/text_polisher.py` — `TorchLocalLlmPolisher.__init__`
+### 改動 1:`scripts/text_polisher.py` — `TorchLocalLlmPolisher.__init__`(增量)
 
-把 model load 路徑改成可配置 attention + 可選量化。建議用 module-level constants 而不是塞進 Config block,讓主要 daemon Config 保持乾淨。
+**重要**:這是在 commit `1151809` 後的 `TorchLocalLlmPolisher` **之上** 加東西,不是全文重寫。
+要保留的 1151809 加的東西:`self._device`、`self._pad_token_id` + `_resolve_pad_token_id()`、
+polish() 的 `add_special_tokens=False`、`dtype=` (非 `torch_dtype=`)。
+
+**加 3 個 class-level 常數**(放在 class TorchLocalLlmPolisher 開頭,在 docstring 之後):
 
 ```python
 class TorchLocalLlmPolisher(TextPostProcessor):
-    # Attention implementation. Probed in this order:
-    #   "flash_attention_2" — fastest if flash-attn is installed
-    #   "sdpa"              — PyTorch 2.0+ built-in, no extra dep
-    #   "eager"             — last resort, slow on long sequences
+    """PyTorch + transformers + NVIDIA CUDA polisher for Windows / Linux.
+    (existing docstring stays)"""
+
+    # v0.7.0: attention impl preference order. Auto-falls back if a higher
+    # candidate isn't available. flash_attention_2 needs `pip install
+    # flash-attn`; sdpa is PyTorch 2.0+ built-in; eager is the last-resort
+    # legacy path.
     _PREFERRED_ATTN = ("flash_attention_2", "sdpa", "eager")
 
-    # 4-bit NF4 quantization via bitsandbytes. Set to True after
-    # `pip install bitsandbytes` is confirmed working — cuts VRAM ~75%
-    # and decode time ~20-40% on small models.
-    _USE_4BIT_QUANT = False  # toggle per machine
+    # v0.7.0: 4-bit NF4 quantization via bitsandbytes. Toggle True after
+    # `pip install bitsandbytes` is confirmed working. Cuts VRAM ~75% and
+    # decode time ~20-40% on small models; may microscopically degrade
+    # polish quality (validate via bench table).
+    _USE_4BIT_QUANT = False
 
-    # torch.compile the model after load. Adds ~30-60s startup warmup
-    # but gives ~20-30% decode improvement once warm.
-    _USE_TORCH_COMPILE = False  # toggle per machine
+    # v0.7.0: torch.compile the model after load. Adds ~30-60s startup
+    # warmup (graph capture + autotune) but ~20-30% decode improvement
+    # once warm. Set False if generate() emits empty/garbage output
+    # (known transformers + compile interaction bugs in older PyTorch).
+    _USE_TORCH_COMPILE = False
+```
 
-    def __init__(self, model_name, system_prompt, max_tokens=256):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+**改 `__init__`**:在 `_tokenizer = AutoTokenizer.from_pretrained(...)` **之後** 跟
+`self._model = AutoModelForCausalLM.from_pretrained(...)` **之前** 插入 attention
+偵測 + load_kwargs 組合。把現有的 `from_pretrained` 一行改成 `**load_kwargs`。
 
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "TorchLocalLlmPolisher requires CUDA. ..."
-            )
+```python
+        # ... (preceding lines unchanged: cuda check, self._torch = torch,
+        #      self._device = "cuda:0", self._tokenizer = ...)
 
-        # Choose best available attention impl
-        from transformers.utils import is_flash_attn_2_available
+        # ↓ v0.7.0 新增區段 ↓
+        # Resolve best available attention impl. Use try/import not the
+        # transformers helper — helper's API path varies across versions.
         attn = "eager"
         for candidate in self._PREFERRED_ATTN:
-            if candidate == "flash_attention_2" and not is_flash_attn_2_available():
-                continue
-            attn = candidate
-            break
-
-        self._torch = torch
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if candidate == "flash_attention_2":
+                try:
+                    import flash_attn  # noqa: F401
+                    attn = candidate
+                    break
+                except ImportError:
+                    continue
+            elif candidate == "sdpa":
+                # SDPA is built-in PyTorch 2.0+ — always available
+                attn = candidate
+                break
+            else:
+                attn = candidate
+                break
 
         load_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            device_map="cuda:0",
+            dtype=torch.bfloat16,         # NOT torch_dtype — deprecated in transformers 4.45+
+            device_map=self._device,      # NOT "cuda:0" literal — uses 1151809's extracted attr
             attn_implementation=attn,
         )
         if self._USE_4BIT_QUANT:
@@ -200,7 +234,8 @@ class TorchLocalLlmPolisher(TextPostProcessor):
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_quant_type="nf4",
             )
-            load_kwargs.pop("torch_dtype")  # quant config overrides
+            # quantization_config overrides dtype — drop to avoid transformers warning
+            load_kwargs.pop("dtype")
 
         self._model = AutoModelForCausalLM.from_pretrained(
             model_name, **load_kwargs,
@@ -208,25 +243,29 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         self._model.eval()
 
         if self._USE_TORCH_COMPILE:
-            # mode="reduce-overhead" for decode workloads;
-            # falls back gracefully if unsupported.
+            # mode="reduce-overhead" optimised for autoregressive decode;
+            # falls back to default mode if unsupported by the model.
             self._model = torch.compile(self._model, mode="reduce-overhead")
+        # ↑ v0.7.0 新增區段 ↑
 
-        self._system_prompt = system_prompt
-        self._max_tokens = max_tokens
-        self._model_name = model_name
+        # ... (following lines unchanged: self._system_prompt, self._max_tokens,
+        #      self._model_name, self._pad_token_id = self._resolve_pad_token_id(),
+        #      device_label building)
+```
 
-        try:
-            gpu_name = torch.cuda.get_device_name(0)
-        except Exception:
-            gpu_name = "CUDA device"
+**改 `device_label` 組裝**(讓 log 反映 attention impl + quant + compile 狀態):
+
+```python
+        # Replace the existing self._device_label assignment with:
         quant_label = "INT4-NF4" if self._USE_4BIT_QUANT else "bfloat16"
         compile_label = " + torch.compile" if self._USE_TORCH_COMPILE else ""
-        self.device_label = (
+        self._device_label = (
             f"{model_name} (PyTorch {quant_label} + {attn}{compile_label} "
-            f"@ NVIDIA {gpu_name}, ≤{max_tokens} tok)"
+            f"@ {gpu_name}, ≤{max_tokens} tok)"
         )
 ```
+
+**`polish()` 完全不動** — 1151809 加的 `add_special_tokens=False` + `self._pad_token_id` + `self._device` 都保留。
 
 ### 改動 2:`__version__` bump
 
@@ -234,18 +273,49 @@ class TorchLocalLlmPolisher(TextPostProcessor):
 __version__ = "0.6.0"  → "0.7.0"
 ```
 
-### 改動 3:README updates(改動較少這次)
+### 改動 3:README updates(雙軌:v0.7.0 新功能 + v0.6.0 doc drift 清理)
 
+**新功能(v0.7.0)**:
 1. **Badge** v0.6.0 → v0.7.0
 2. **Windows GPU 加速套件表**:加 `flash-attn (optional)` + `bitsandbytes (optional)` 兩個可選項目,標清楚「不必裝,但裝了能加速 polish」
-3. **Windows 一鍵安裝**:加一個「v0.7.0 進階加速(選用)」小節,描述三個 toggle:
+3. **Windows 一鍵安裝**:加一個「v0.7.0 進階加速(選用)」小節,描述三個 toggle 跟 pre-flight check:
    ```powershell
-   # 進階:安裝 flash-attn 加速 polish(從 source 編譯,~30-60 分鐘)
+   # 進階 1:Flash Attention 2(先確認 Blackwell prebuilt wheel 有沒有)
    pip install flash-attn --no-build-isolation
-   # 進階:安裝 bitsandbytes 4-bit 量化
+   # 進階 2:bitsandbytes 4-bit 量化
    pip install bitsandbytes
+   # 進階 3:torch.compile — 不必裝套件,在 text_polisher.py 改 _USE_TORCH_COMPILE = True
    ```
 4. **疑難排解**:加一段 "Polish 在 Windows 比 macOS 慢" 的條目,引到 v0.7.0 toggle
+
+**v0.6.0 doc drift 清理**(發在 v0.7.0 順手做,不然 ship 完 README 仍對不上實際 default):
+README 仍多處說 Win/Linux polish 預設是 `Qwen3-4B-Instruct-2507` (~8 GB VRAM),
+但實際 code(commit `c1f0906` 後)是 `Qwen2.5-1.5B-Instruct` (~3 GB VRAM)。14 處需 sweep:
+
+| 行號 | 現狀 | 改成 |
+|------|------|------|
+| 7 | 「預設 Qwen3-4B-Instruct-2507」 | 「預設 Qwen2.5-1.5B-Instruct(Win/Linux);Mac 仍 4B MLX 4-bit」 |
+| 44 | 「≥ 10 GB VRAM ... + 4B polish (~8 GB)」 | 「≥ 5 GB VRAM ... + 1.5B polish (~3 GB)」 |
+| 115 | 「存放空間估算 15-20 GB」 | 「~10 GB(ASR 1.2 + polish 3 + torch wheel + cache)」 |
+| 159 | preset 表 Maximum ⭐ = 4B / ~10 GB | ⭐ 改在 Balanced(1.5B / ~5 GB);Maximum 變 opt-in「Quality+」tier |
+| 160 | Balanced 列無星號 | 加 ⭐(實際 v0.6.0+ ship default) |
+| 233 | Windows step 2「v0.6.0 預設 Maximum tier」 | 「v0.6.0+ 預設 = Balanced(1.5B)。要更高品質可切 Maximum (4B)」 |
+| 243 | step 3「下載 Maximum tier ~10 GB」 | 「下載 ~4.5 GB(ASR 1.2 + polish 1.5B 3 GB)」 |
+| 255 | log 範例 `polish: Qwen3-4B-Instruct-2507` | `polish: Qwen2.5-1.5B-Instruct` |
+| 413 | `POLISH_MODEL` 註解「Win/Linux → 4B」 | 「Win/Linux → Qwen2.5-1.5B-Instruct」 |
+| 433 | 「預設模型 Qwen3-4B-Instruct-2507」(雙平台) | 拆雙平台:「Mac → 4B MLX 4-bit;Win/Linux → 1.5B bf16」 |
+| 438 | Polish 平台表 Win/Linux row 4B / ~8 GB | 1.5B / ~3 GB |
+| 448 | 「Win VRAM ~10 GB」 | 「~5 GB」 |
+| 461-464 | 「Win < 10 GB VRAM 想保留 polish 改 1.5B」(本末倒置) | 改「想升級品質改 4B,需 ≥ 12 GB VRAM」 |
+| 624 | 跨平台設計「polish ID 都是 Qwen3-4B-Instruct-2507」 | 「Mac:4B MLX 4-bit / Win/Linux:1.5B bf16」 |
+
+**Preset 表結構重組**(行 157-162 整段):⭐(預設)從 Maximum 移到 Balanced 列,
+Balanced 列改名為「Default」或保留名稱但加註,Maximum 改名為「Quality(opt-in,需 12 GB+ VRAM)」。
+
+**附帶小修**:
+- 行 21:「核心管線(麥克風 → **Whisper** → 文字後處理)」→「→ **ASR** →」
+- 行 499-505:Windows troubleshoot「CUDA load failed ...」加註此 troubleshoot 適用於 `faster-whisper` fallback tier(qwen3-asr 預設不會出這個 log)
+- 行 269-279 確認狀態:可順手提一下 v0.6.0+ 加的 `[stt] zh raw -> ...` raw-diff log line
 
 ---
 
@@ -261,18 +331,33 @@ git pull origin main
 notepad plan-windows-polish-perf.md
 
 # 2. Baseline 量測 — 在不改任何東西的情況下 bench 一輪
-#    (建議寫個 scripts/bench-polish.ps1 之類的,測 10 個樣本平均延遲)
+#    別複製 POLISH_PROMPT 字串(會 drift),直接 importlib 從 stt-daemon.py 讀:
 python -c "
-import time, sys
+import time, sys, importlib.util
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.path.insert(0, 'scripts')
+# Import POLISH_PROMPT + POLISH_MODEL from the daemon source — no copy-drift
+spec = importlib.util.spec_from_file_location('stt_daemon', 'scripts/stt-daemon.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
 from text_polisher import build_polisher
-prompt = '...'  # 從 stt-daemon.py 複製 POLISH_PROMPT
-p = build_polisher(True, 'Qwen/Qwen2.5-1.5B-Instruct', prompt)
-samples = ['短文','...','長文(200字)']
-for s in samples:
-    t0 = time.time()
-    out = p.polish(s)
-    print(f'{time.time()-t0:.2f}s | len(in)={len(s)} len(out)={len(out)}')
+p = build_polisher(True, mod.POLISH_MODEL, mod.POLISH_PROMPT)
+print('polish:', p.device_label)
+samples = {
+    '短': '那個我們等等就是說要去吃飯吧',
+    '中': '呃我覺得這個 Python function 的設計可以再優化一下，然後就是說標點的部分也想要 polish 一下',
+    '長': '...貼一段 ~200 字的長文,可從 v0.6.0 log 撈',
+}
+for label, s in samples.items():
+    times = []
+    outs = []
+    for _ in range(3):
+        t0 = time.time(); out = p.polish(s); times.append(time.time()-t0); outs.append(out)
+    avg = sum(times)/len(times)
+    # baseline diff metric: when same input is run 3x with greedy decode, output
+    # should be identical; if not, model has non-determinism (rare for do_sample=False)
+    consistent = len(set(outs)) == 1
+    print(f'{label}: avg {avg:.2f}s | len(in)={len(s)} len(out)={len(outs[0])} | consistent={consistent}')
 "
 # 記下 baseline 數字,例如 '長文 baseline = 3.2s'
 
@@ -323,15 +408,19 @@ pip install bitsandbytes
 
 ### Benchmark 表格(實作時填)
 
-| 階段 | 配置 | 短文 polish | 中文 polish | 長文 polish | warmup time | VRAM peak | 品質感受 |
-|------|------|-----------|------------|------------|------------|-----------|---------|
-| 0 | baseline (v0.6.0,eager attention) | ? s | ? s | ? s | ? s | ? GB | OK |
-| 1 | +sdpa | ? | ? | ? | ? | ? | OK |
-| 2 | +sdpa +compile | ? | ? | ? | ? | ? | OK |
-| 3 | +flash-attn +compile | ? | ? | ? | ? | ? | OK |
-| 4 | +flash-attn +compile +4bit | ? | ? | ? | ? | ? | 確認沒退步 |
+「品質 diff」= 跟 baseline (階段 0) 同樣輸入下,輸出**完全相同字串的比率**(0/3, 1/3, 2/3, 3/3)。
+greedy decode (do_sample=False) 對同輸入該完全 deterministic,bf16 vs INT4 可能會有微小數值差。
+此欄替代主觀「品質感受」,可事後 audit。
 
-**目標**:長文 polish < 1.5s,理想 < 1.0s。
+| 階段 | 配置 | 短文 polish | 中文 polish | 長文 polish | warmup time | VRAM peak | 品質 diff vs baseline |
+|------|------|-----------|------------|------------|------------|-----------|---------|
+| 0 | baseline (v0.6.0,eager attention) | ? s | ? s | ? s | ? s | ? GB | 3/3(自己比) |
+| 1 | +sdpa | ? | ? | ? | ? | ? | ?/3 |
+| 2 | +sdpa +compile | ? | ? | ? | ? | ? | ?/3 |
+| 3 | +flash-attn +compile | ? | ? | ? | ? | ? | ?/3 |
+| 4 | +flash-attn +compile +4bit | ? | ? | ? | ? | ? | ?/3(預期 < 3/3,可接受需人工判) |
+
+**目標**:長文 polish < 1.5s,理想 < 1.0s;短/中文 polish < 0.5s。
 
 ### 達標後再做
 
