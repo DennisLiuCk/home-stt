@@ -39,4 +39,4 @@ $proc.Id | Set-Content -LiteralPath $pidPath -Encoding ascii
 
 Write-Host "STT daemon started (PID $($proc.Id))."
 Write-Host "Log: $logPath"
-Write-Host "Allow ~30s for model load + GPU warmup before first trigger key (v0.6.0+ loads both ASR and polish models)."
+Write-Host "Allow ~45s for model load + GPU warmup before first trigger key (v0.7.0+ loads Qwen3-ASR-0.6B + Qwen3-4B-Instruct-2507)."

@@ -71,7 +71,7 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 # ---------------------------------------------------------------------------
@@ -110,27 +110,37 @@ if sys.platform == "darwin":
 else:
     _DEFAULT_BACKEND = "qwen3-asr"
     _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
-    # Default polish model for Win/Linux: Qwen2.5-1.5B-Instruct (~3 GB VRAM).
-    # Picked empirically over Qwen3-4B-Instruct-2507 (~8 GB) on bf16 because
-    # the 4B has two real problems on this task:
-    #   (a) decode-bound — long inputs (~100-char Chinese) take ~5-6 s polish
-    #       on RTX 5080 (memory-bandwidth limited at 8 GB of weights);
-    #   (b) over-eager edits — the 2507 SFT recipe translates EN keywords
-    #       (commit→提交, push→推送) and substitutes plausible Chinese for
-    #       words it doesn't recognise (ASR mistake 拷滅 → 拷貝), despite
-    #       explicit prompt rules.
-    # Qwen2.5-1.5B attacks both: ~2.5× faster decode + older more conservative
-    # SFT recipe + smaller capacity (less ingrained EN↔zh association). Pure
-    # instruct, no hybrid-thinking — sidesteps the <think>-tag-leak risk of
-    # the entire Qwen3-Instruct family. Alternatives if quality regresses
-    # for your usage (override POLISH_MODEL below):
-    #   - "Qwen/Qwen3-4B-Instruct-2507" — original v0.6.0 plan default;
-    #     stronger but suffers (a) + (b) above.
-    #   - "Qwen/Qwen3-1.7B" with enable_thinking=False — better than 1.5B on
-    #     C-Eval/IFEval, thinking-tag-leak risk inherited.
-    #   - "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4" — ~1 GB VRAM (needs
-    #     auto-gptq). Day-3 production target once bf16 quality validated.
-    _DEFAULT_POLISH_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+    # Default polish model for Win/Linux: Qwen3-4B-Instruct-2507 (~8 GB
+    # VRAM bf16). Aligned with macOS default (same model in MLX 4-bit)
+    # so polish output is consistent cross-platform.
+    #
+    # v0.6.0 shipped Qwen2.5-1.5B-Instruct as an intermediate diagnostic
+    # default while characterising latency vs quality trade-offs. v0.7.0
+    # reverts to Qwen3-4B-Instruct-2507 after a structured 18-case bench
+    # against Qwen2.5-{0.5B, 1.5B}-Instruct + Qwen3-4B-Instruct-2507
+    # found that Qwen3-4B:
+    #   - Faithfully preserves English keywords (Qwen2.5-1.5B silently
+    #     swapped `commit` → `push` — a wrong-verb production bug)
+    #   - Does NOT mutate facts (Qwen2.5-1.5B flipped "INT4 反而更慢"
+    #     to "INT4 反而更快" — semantic-reversal hallucination)
+    #   - Preserves identifiers (Qwen2.5-0.5B dropped the `_` prefix
+    #     from `_USE_TORCH_COMPILE`)
+    #   - Preserves subjects (Qwen2.5-0.5B swapped 「幫我」→「幫你」)
+    # Cost: ~50% slower per-call (long polish ~3.6 s vs ~2.3 s on RTX 5080),
+    # ~5 GB more VRAM. Acceptable trade for these quality wins on
+    # NVIDIA ≥ 12 GB cards. v0.7.0 release notes carry the full
+    # investigation; bnb-INT4 + torch.compile + flash-attn were also
+    # measured (all neutral-to-negative on Windows for this workload —
+    # see TorchLocalLlmPolisher class-level toggles in text_polisher.py).
+    #
+    # Alternatives if VRAM-constrained or latency-sensitive (override
+    # POLISH_MODEL below):
+    #   - "Qwen/Qwen2.5-1.5B-Instruct" — ~3 GB VRAM, faster but
+    #     instruction-following weaker (see Balanced preset in README)
+    #   - "Qwen/Qwen2.5-0.5B-Instruct" — ~1 GB VRAM, fastest but
+    #     identifier/subject errors observed
+    #   - POLISH_ENABLED = False — disable entirely
+    _DEFAULT_POLISH_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
 STT_BACKEND      = _DEFAULT_BACKEND
 # Model identifier passed to the backend. Interpretation is backend-specific:
@@ -149,13 +159,17 @@ STT_MODEL        = _DEFAULT_MODEL
 # fixes immediate repetitions (「我我我覺得」→「我覺得」), and otherwise
 # preserves the speaker's meaning. The polished text is what gets pasted.
 #
-# Defaults to Qwen3-4B-Instruct-2507-MLX-4bit (~2.5 GB on disk, ~3-4 GB
-# RSS once loaded). The 2507 build is a pure instruction-tuned variant
-# (no chain-of-thought trace) — newer Qwen3.5 thinking models are not a
-# good fit for this single-step polish task. POLISH_LANGUAGES gates which
-# detected-language transcripts get polished, because small Chinese-strong
-# instruction LLMs eagerly translate pure-English text into Chinese even
-# with an explicit "preserve English" instruction.
+# Default polish models per platform (v0.7.0+ unified on Qwen3-4B-Instruct-2507):
+#   macOS Apple Silicon: lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit
+#                        (~2.5 GB disk, ~3-4 GB RSS via MLX/Metal)
+#   Windows / Linux:     Qwen/Qwen3-4B-Instruct-2507
+#                        (~8 GB disk, ~8 GB VRAM bf16 via PyTorch CUDA)
+# The 2507 build is a pure instruction-tuned variant (no chain-of-thought
+# trace) — Qwen3.5 thinking models are not a good fit for this single-step
+# polish task. POLISH_LANGUAGES gates which detected-language transcripts
+# get polished, because small Chinese-strong instruction LLMs eagerly
+# translate pure-English text into Chinese even with an explicit "preserve
+# English" instruction.
 #
 # Failure modes (mlx-lm missing, model load OOM) degrade silently to a
 # NoopPolisher — the daemon continues to work with raw ASR output.

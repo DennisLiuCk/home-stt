@@ -160,6 +160,34 @@ class TorchLocalLlmPolisher(TextPostProcessor):
     catches CUDA OOM at init and prints the actionable swap-or-disable hint.
     """
 
+    # v0.7.0: attention impl preference order. Auto-falls back if a higher
+    # candidate isn't available. flash_attention_2 needs `pip install
+    # flash-attn`; sdpa is PyTorch 2.0+ built-in; eager is the last-resort
+    # legacy path.
+    _PREFERRED_ATTN = ("flash_attention_2", "sdpa", "eager")
+
+    # v0.7.0: 4-bit NF4 quantization via bitsandbytes. Toggle True after
+    # `pip install bitsandbytes` is confirmed working. Cuts VRAM ~75%
+    # nominally. Measured 2026-05-23 on RTX 5080 + Qwen2.5-1.5B-Instruct:
+    # **67% SLOWER** on long polish (5.44s → 9.07s) and quality drift vs
+    # bf16 baseline. Root cause: per-layer dequant kernel overhead exceeds
+    # memory-bandwidth savings on small-model + fast-GPU + short-batch
+    # workloads (INT4's sweet spot is big-model + slow-GPU). bnb's
+    # Blackwell sm_120 kernels are also not yet tuned (FutureWarning on
+    # init re: deprecated torch APIs). Keep False until either model is
+    # larger (≥7B) or bnb gets Blackwell-aware kernels.
+    _USE_4BIT_QUANT = False
+
+    # v0.7.0: torch.compile the model after load. On LINUX adds ~30-60s
+    # startup warmup but ~20-30% decode improvement once warm. On WINDOWS
+    # this is silently no-op: torch.compile's inductor backend depends on
+    # `triton`, which has no official Windows wheel (only the community
+    # `triton-windows` fork). Without triton, inductor falls back to
+    # aot_eager / no-op — measured 2026-05-23 on RTX 5080: 0% improvement,
+    # load +1.7s. Keep False on Windows; experiment on Linux in a v0.7.x
+    # followup.
+    _USE_TORCH_COMPILE = False
+
     def __init__(
         self,
         model_name: str,
@@ -190,12 +218,48 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         # (remaps the chosen GPU to cuda:0 inside the process).
         self._device = "cuda:0"
         self._tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            model_name,
+
+        # v0.7.0: Resolve best available attention impl. Use try/import,
+        # not the transformers helper — helper's API path varies across
+        # versions. flash_attention_2 needs `pip install flash-attn`;
+        # sdpa is PyTorch 2.0+ built-in.
+        attn = "eager"
+        for candidate in self._PREFERRED_ATTN:
+            if candidate == "flash_attention_2":
+                try:
+                    import flash_attn  # noqa: F401
+                    attn = candidate
+                    break
+                except ImportError:
+                    continue
+            else:
+                attn = candidate
+                break
+
+        load_kwargs = dict(
             dtype=torch.bfloat16,
             device_map=self._device,
+            attn_implementation=attn,
+        )
+        if self._USE_4BIT_QUANT:
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
+            # quantization_config overrides dtype — drop to avoid warning
+            load_kwargs.pop("dtype")
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_name, **load_kwargs,
         )
         self._model.eval()
+
+        if self._USE_TORCH_COMPILE:
+            # mode="reduce-overhead" tuned for autoregressive decode;
+            # falls back to default mode if unsupported by the model.
+            self._model = torch.compile(self._model, mode="reduce-overhead")
+
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
         self._model_name = model_name
@@ -212,9 +276,11 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             gpu_name = torch.cuda.get_device_name(0)
         except Exception:
             gpu_name = "CUDA device"
+        quant_label = "INT4-NF4" if self._USE_4BIT_QUANT else "bfloat16"
+        compile_label = " + torch.compile" if self._USE_TORCH_COMPILE else ""
         self._device_label = (
-            f"{model_name} (PyTorch bfloat16 @ {gpu_name}, "
-            f"≤{max_tokens} tok)"
+            f"{model_name} (PyTorch {quant_label} + {attn}{compile_label} "
+            f"@ {gpu_name}, ≤{max_tokens} tok)"
         )
 
     def _resolve_pad_token_id(self) -> int:
