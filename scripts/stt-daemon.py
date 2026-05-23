@@ -110,10 +110,27 @@ if sys.platform == "darwin":
 else:
     _DEFAULT_BACKEND = "qwen3-asr"
     _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
-    # HF original (non-MLX) — transformers loads it directly with bfloat16
-    # on CUDA. ~8 GB VRAM. Low-VRAM cards: set POLISH_ENABLED = False, or
-    # swap to "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB VRAM).
-    _DEFAULT_POLISH_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+    # Default polish model for Win/Linux: Qwen2.5-1.5B-Instruct (~3 GB VRAM).
+    # Picked empirically over Qwen3-4B-Instruct-2507 (~8 GB) on bf16 because
+    # the 4B has two real problems on this task:
+    #   (a) decode-bound — long inputs (~100-char Chinese) take ~5-6 s polish
+    #       on RTX 5080 (memory-bandwidth limited at 8 GB of weights);
+    #   (b) over-eager edits — the 2507 SFT recipe translates EN keywords
+    #       (commit→提交, push→推送) and substitutes plausible Chinese for
+    #       words it doesn't recognise (ASR mistake 拷滅 → 拷貝), despite
+    #       explicit prompt rules.
+    # Qwen2.5-1.5B attacks both: ~2.5× faster decode + older more conservative
+    # SFT recipe + smaller capacity (less ingrained EN↔zh association). Pure
+    # instruct, no hybrid-thinking — sidesteps the <think>-tag-leak risk of
+    # the entire Qwen3-Instruct family. Alternatives if quality regresses
+    # for your usage (override POLISH_MODEL below):
+    #   - "Qwen/Qwen3-4B-Instruct-2507" — original v0.6.0 plan default;
+    #     stronger but suffers (a) + (b) above.
+    #   - "Qwen/Qwen3-1.7B" with enable_thinking=False — better than 1.5B on
+    #     C-Eval/IFEval, thinking-tag-leak risk inherited.
+    #   - "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4" — ~1 GB VRAM (needs
+    #     auto-gptq). Day-3 production target once bf16 quality validated.
+    _DEFAULT_POLISH_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 STT_BACKEND      = _DEFAULT_BACKEND
 # Model identifier passed to the backend. Interpretation is backend-specific:
@@ -144,23 +161,7 @@ STT_MODEL        = _DEFAULT_MODEL
 # NoopPolisher — the daemon continues to work with raw ASR output.
 # ---------------------------------------------------------------------------
 POLISH_ENABLED   = True
-# Local override: Qwen2.5-1.5B-Instruct (~3 GB VRAM) instead of the 4B-2507
-# default (~8 GB). On the bf16 Win/Linux path the 4B-2507 has two problems:
-#   (a) decode-bound — long inputs (~100-char Chinese) take 5-6 s polish on
-#       RTX 5080 (memory-bandwidth limited at 8 GB weights).
-#   (b) over-eager edits — 2507's "make text more natural" SFT recipe
-#       translates EN keywords (commit→提交, push→推送) and substitutes
-#       "looks-similar" words even with explicit prompt rules.
-# Qwen2.5-1.5B-Instruct attacks both: 2.5x faster decode + older more
-# conservative SFT recipe + fewer params (less ingrained EN↔zh association).
-# Pure instruct, no hybrid-thinking — sidesteps the <think>-tag-leak risk
-# of the entire Qwen3 family. If quality drops too much, options:
-#   - revert to _DEFAULT_POLISH_MODEL (Qwen3-4B-Instruct-2507)
-#   - try Qwen/Qwen3-1.7B with enable_thinking=False (better quality,
-#     thinking-tag-leak risk inherited)
-# For more speed at this size, try the official GPTQ-Int4 variant:
-#   "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4" — ~1 GB VRAM, needs auto-gptq.
-POLISH_MODEL     = "Qwen/Qwen2.5-1.5B-Instruct"
+POLISH_MODEL     = _DEFAULT_POLISH_MODEL
 POLISH_LANGUAGES = {"zh", "ja", "ko"}
 # Polish prompt — lean version. The bf16 4B Qwen3-Instruct over-edits when
 # given loose instructions (translates English keywords, substitutes
@@ -637,6 +638,51 @@ def build_backend(name: str, model: str) -> STTBackend:
     raise ValueError(f"Unknown STT backend: {name!r}")
 
 
+def build_backend_with_fallback() -> STTBackend:
+    """Try the configured STT backend; on ImportError (missing package) or
+    CUDA OOM, fall back to faster-whisper with a loud actionable stderr
+    message. If that also fails, exit cleanly — the daemon can't run
+    without an STT backend, and a half-initialised state is worse than a
+    clear-cut exit. Mirrors build_polisher's degrade-gracefully pattern."""
+    try:
+        return build_backend(STT_BACKEND, STT_MODEL)
+    except (ImportError, ModuleNotFoundError) as e:
+        print(
+            f"[stt] backend '{STT_BACKEND}' missing required package: "
+            f"{e}. Falling back to faster-whisper. To enable "
+            f"{STT_BACKEND}, see README -> Windows 安裝步驟 (install "
+            f"torch+CUDA wheel before `pip install qwen-asr`).",
+            file=sys.stderr, flush=True,
+        )
+    except Exception as e:
+        msg = str(e)
+        is_oom = (
+            "out of memory" in msg.lower()
+            or type(e).__name__ == "OutOfMemoryError"
+        )
+        hint = (
+            " (CUDA OOM — try POLISH_ENABLED = False to free ~3-8 GB, "
+            "or pick a smaller STT_MODEL)"
+            if is_oom else ""
+        )
+        print(
+            f"[stt] backend '{STT_BACKEND}' init failed: {e}{hint}. "
+            f"Falling back to faster-whisper.",
+            file=sys.stderr, flush=True,
+        )
+
+    try:
+        return build_backend("faster-whisper", "large-v3-turbo")
+    except Exception as e:
+        print(
+            f"[stt] fatal: faster-whisper fallback also failed: {e}. "
+            f"Daemon cannot continue — install dependencies per README "
+            f"-> Windows 安裝步驟 and restart.",
+            file=sys.stderr, flush=True,
+        )
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # Audio capture state
 # ---------------------------------------------------------------------------
@@ -801,7 +847,7 @@ def main() -> None:
     _polisher = build_polisher(POLISH_ENABLED, POLISH_MODEL, POLISH_PROMPT)
     print(f"[stt] polish: {_polisher.device_label}", flush=True)
 
-    _backend = build_backend(STT_BACKEND, STT_MODEL)
+    _backend = build_backend_with_fallback()
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
