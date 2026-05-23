@@ -212,6 +212,11 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             )
 
         self._torch = torch
+        # v0.7.1: cuDNN benchmark mode picks fastest kernel per shape on
+        # first use, then reuses. Decode steps all share the same kernel
+        # shape (1 token forward) so benefit accrues fast. Marginal but
+        # free; harmless if shapes vary because cuDNN just re-picks.
+        torch.backends.cudnn.benchmark = True
         # Pinned device id used by from_pretrained AND polish's input
         # tensor move — kept in one place so they stay in sync. To run
         # on a different physical GPU, set CUDA_VISIBLE_DEVICES env var
@@ -280,8 +285,56 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         compile_label = " + torch.compile" if self._USE_TORCH_COMPILE else ""
         self._device_label = (
             f"{model_name} (PyTorch {quant_label} + {attn}{compile_label} "
-            f"@ {gpu_name}, ≤{max_tokens} tok)"
+            f"@ {gpu_name}, ≤{max_tokens} tok, PLD+prefix-cache)"
         )
+
+        # v0.7.1: pre-build GenerationConfig once. Per-call construction
+        # is ~1-2 ms overhead; we run polish many times. Also enables
+        # Prompt Lookup Decoding (PLD) — for "output ≈ input with
+        # minimal edits" tasks (polish is the textbook case), PLD
+        # typically delivers 1.8-2.5x decode speedup on Chinese-tokenized
+        # text. Lossless: the verifier is still the full model.
+        # `prompt_lookup_num_tokens=10` is the apoorvumang reference
+        # sweet spot; lower (5) is safer on adversarial inputs, higher
+        # (15) wins more on long unchanged spans.
+        from transformers import GenerationConfig
+        self._gen_config = GenerationConfig(
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=self._pad_token_id,
+            prompt_lookup_num_tokens=10,
+        )
+
+        # v0.7.1: pre-compute KV cache for the static system block. The
+        # POLISH_PROMPT (+ chat template scaffolding around it) is
+        # identical across every polish call, so paying its ~200-token
+        # prefill cost once at startup saves it on every subsequent call
+        # (~30-50 ms per call on RTX 5080). Cache is deep-copied per
+        # request because DynamicCache mutates during decode.
+        self._build_prefix_cache()
+
+    def _build_prefix_cache(self) -> None:
+        """Pre-fill DynamicCache with the static system message + chat
+        template overhead. Stores `self._prefix_cache` and
+        `self._prefix_len` for reuse in `polish()`. Idempotent if called
+        multiple times (overwrites previous cache)."""
+        from transformers import DynamicCache
+        sys_msg = [{"role": "system", "content": self._system_prompt}]
+        prefix_text = self._tokenizer.apply_chat_template(
+            sys_msg, tokenize=False, add_generation_prompt=False,
+        )
+        prefix_inputs = self._tokenizer(
+            prefix_text, return_tensors="pt", add_special_tokens=False,
+        ).to(self._device)
+        cache = DynamicCache()
+        with self._torch.no_grad():
+            result = self._model(
+                input_ids=prefix_inputs.input_ids,
+                past_key_values=cache,
+                use_cache=True,
+            )
+        self._prefix_cache = result.past_key_values
+        self._prefix_len = prefix_inputs.input_ids.shape[1]
 
     def _resolve_pad_token_id(self) -> int:
         """Pin pad/stop to <|im_end|> when present (Qwen2/3 chat models all
@@ -302,6 +355,7 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         return self._device_label
 
     def polish(self, text: str) -> str:
+        import copy
         text = text.strip()
         if not text:
             return text
@@ -328,14 +382,18 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             inputs = self._tokenizer(
                 prompt, return_tensors="pt", add_special_tokens=False,
             ).to(self._device)
+            # v0.7.1: reuse pre-built prefix KV cache for the static
+            # system block. generate() infers cached length from
+            # past_key_values.get_seq_length() and only forwards the
+            # new (user + assistant_prompt + generated) tokens.
+            # deepcopy is required — DynamicCache mutates during decode,
+            # so each call needs its own copy to keep the prefix pristine.
+            pkv = copy.deepcopy(self._prefix_cache)
             with self._torch.no_grad():
                 outputs = self._model.generate(
                     **inputs,
-                    max_new_tokens=self._max_tokens,
-                    # Greedy (do_sample=False) is deterministic + ~30%
-                    # faster than sampling for this single-step polish task.
-                    do_sample=False,
-                    pad_token_id=self._pad_token_id,
+                    past_key_values=pkv,
+                    generation_config=self._gen_config,
                 )
             new_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
             polished = self._tokenizer.decode(

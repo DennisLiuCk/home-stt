@@ -39,12 +39,20 @@ Platform abstraction
 """
 from __future__ import annotations
 
+import os
 import platform as _host_platform
 import re
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+
+# v0.7.1: PyTorch CUDA allocator hint — reduces fragmentation from the
+# polish KV cache + tokenizer scratch allocations that happen on every
+# polish call. Must be set BEFORE torch loads via build_polisher /
+# build_backend (both lazy-import torch). `setdefault` so explicit
+# environment override still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ---------------------------------------------------------------------------
 # Stdout: force UTF-8 — Whisper may output simplified Chinese before OpenCC
@@ -71,7 +79,7 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 
 # ---------------------------------------------------------------------------
