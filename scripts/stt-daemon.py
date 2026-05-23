@@ -3,8 +3,9 @@ Hold-to-talk voice → text daemon.
 
 Hold the trigger key (Right Alt/AltGr or Right Ctrl on Windows; Right Option
 on macOS) to record from the default microphone. Release to:
-  1. Transcribe via the active STT backend (default: faster-whisper on
-     Windows/Linux, mlx-whisper on Apple Silicon).
+  1. Transcribe via the active STT backend (default: qwen3-asr on both
+     Apple Silicon (v0.3.0+) and Windows/Linux (v0.6.0+); faster-whisper
+     and mlx-whisper remain available as switchable fallbacks).
   2. Convert simplified Chinese to Taiwan-traditional via OpenCC.
   3. Insert spaces at zh ↔ en/digit boundaries.
   4. Place the text on the system clipboard AND simulate Ctrl+V / Cmd+V to
@@ -70,7 +71,7 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +86,11 @@ MIN_AUDIO_SEC    = 0.3                 # taps shorter than this are ignored
 #       turbo for our 80%-zh + tech-loanword usage. Default since v0.3.0;
 #       v0.2.x default was mlx-whisper large-v3-turbo, still available via
 #       STT_BACKEND="mlx-whisper".
-#   Windows / Linux: faster-whisper large-v3-turbo (CUDA float16 when
-#       available, CPU int8 fallback).
+#   Windows / Linux (v0.6.0+): Qwen3-ASR-0.6B via qwen-asr (PyTorch +
+#       transformers, CUDA bfloat16). Same model as macOS for consistent
+#       behaviour. faster-whisper large-v3-turbo remains available as a
+#       fallback for low-VRAM machines or when the PyTorch CUDA wheel is
+#       not installed — set STT_BACKEND="faster-whisper" to use it.
 # Intel Mac (darwin x86_64) support was dropped in v0.4.0 — the platform is
 # rare enough now that the maintenance + docs cost outweighs the benefit.
 # Pin to v0.3.0 or earlier for Intel Mac.
@@ -101,9 +105,15 @@ if sys.platform == "darwin":
         )
     _DEFAULT_BACKEND = "qwen3-asr"
     _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
+    # MLX 4-bit quantised variant — ~2.5 GB disk / ~4 GB RSS on Apple Silicon.
+    _DEFAULT_POLISH_MODEL = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit"
 else:
-    _DEFAULT_BACKEND = "faster-whisper"
-    _DEFAULT_MODEL = "large-v3-turbo"
+    _DEFAULT_BACKEND = "qwen3-asr"
+    _DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
+    # HF original (non-MLX) — transformers loads it directly with bfloat16
+    # on CUDA. ~8 GB VRAM. Low-VRAM cards: set POLISH_ENABLED = False, or
+    # swap to "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB VRAM).
+    _DEFAULT_POLISH_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
 STT_BACKEND      = _DEFAULT_BACKEND
 # Model identifier passed to the backend. Interpretation is backend-specific:
@@ -134,16 +144,41 @@ STT_MODEL        = _DEFAULT_MODEL
 # NoopPolisher — the daemon continues to work with raw ASR output.
 # ---------------------------------------------------------------------------
 POLISH_ENABLED   = True
-POLISH_MODEL     = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit"
+# Local override: Qwen2.5-1.5B-Instruct (~3 GB VRAM) instead of the 4B-2507
+# default (~8 GB). On the bf16 Win/Linux path the 4B-2507 has two problems:
+#   (a) decode-bound — long inputs (~100-char Chinese) take 5-6 s polish on
+#       RTX 5080 (memory-bandwidth limited at 8 GB weights).
+#   (b) over-eager edits — 2507's "make text more natural" SFT recipe
+#       translates EN keywords (commit→提交, push→推送) and substitutes
+#       "looks-similar" words even with explicit prompt rules.
+# Qwen2.5-1.5B-Instruct attacks both: 2.5x faster decode + older more
+# conservative SFT recipe + fewer params (less ingrained EN↔zh association).
+# Pure instruct, no hybrid-thinking — sidesteps the <think>-tag-leak risk
+# of the entire Qwen3 family. If quality drops too much, options:
+#   - revert to _DEFAULT_POLISH_MODEL (Qwen3-4B-Instruct-2507)
+#   - try Qwen/Qwen3-1.7B with enable_thinking=False (better quality,
+#     thinking-tag-leak risk inherited)
+# For more speed at this size, try the official GPTQ-Int4 variant:
+#   "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4" — ~1 GB VRAM, needs auto-gptq.
+POLISH_MODEL     = "Qwen/Qwen2.5-1.5B-Instruct"
 POLISH_LANGUAGES = {"zh", "ja", "ko"}
+# Polish prompt — lean version. The bf16 4B Qwen3-Instruct over-edits when
+# given loose instructions (translates English keywords, substitutes
+# "looks-similar" words, restructures sentences). Earlier iteration loaded
+# the prompt with detailed rules + 3 few-shot examples (~600 chars) which
+# fixed correctness but tripled prefill cost on every polish call. This
+# lean form keeps the essential bans + one example. Trade-off accepted:
+# polish may occasionally over-edit on edge cases, but per-call prefill
+# is much cheaper (~150 chars → ~100 tokens vs 600 → 400 tokens).
 POLISH_PROMPT    = (
-    "你是一個將口語逐字稿轉成精煉文字的助手。請依照以下原則修飾輸入文字:\n"
-    "1. 移除冗字、填充詞 (呃、嗯、就是、那個、然後)\n"
-    "2. 修正口誤、立即重複 (例如「我我我覺得」→「我覺得」)\n"
-    "3. 保持原始語意，不增加新資訊\n"
-    "4. 不過度改寫，保留說話者的句式風格\n"
-    "5. 中文使用繁體；英文保留原英文，不要翻譯英文單字或專有名詞\n"
-    "6. 只輸出修飾後的文字本身，不要解釋、引號、前綴"
+    "把口語逐字稿做最小修飾。\n"
+    "只移除贅字(呃、嗯、就是、那個、然後、嘛、啊)、修立即重複(我我我→我)、補必要標點。\n"
+    "嚴禁:翻譯英文(commit/push/function 等保留)、改動詞、替換陌生詞(看似錯字也照樣輸出)、加新詞、改句式。\n"
+    "中文一律繁體。只輸出修飾後文字,不解釋、不加引號、不加前綴。\n"
+    "\n"
+    "範例:\n"
+    "輸入:呃我覺得這個 Python function 可以再優化\n"
+    "輸出:我覺得這個 Python function 可以再優化"
 )
 
 # Set of pynput Key/character triggers to listen for as hold-to-record keys.
@@ -163,15 +198,33 @@ BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 
 # ---------------------------------------------------------------------------
 # Text post-processing (backend-agnostic)
+#
+# `s2twp` (not plain `s2tw`) does character-level Simplified→Traditional
+# conversion PLUS phrase-level mapping to Taiwan vocabulary:
+#   软件→軟體 (not 軟件), 视频→影片 (not 視頻), 异步→非同步 (not 異步),
+#   函数→函式 (not 函數), 代码→程式碼 (not 代碼). For a TW-target daemon
+# this is strictly better than s2tw. Cost difference is ~0.1ms (microsecond
+# range either way).
+#
+# post_process() is called TWICE per transcribe:
+#   1. on raw ASR output (Qwen3-ASR-0.6B outputs simplified natively — so
+#      polish always sees clean traditional + TW-vocab input, less risk of
+#      the small polish model being primed into a simplified output register)
+#   2. on polish output (deterministic backstop — polish models occasionally
+#      leak simplified glyphs back in despite the prompt rule; OpenCC is
+#      cheaper and more reliable than fighting that with prompt engineering)
+# Both calls are idempotent: re-running on already-traditional+spaced text
+# is a no-op.
 # ---------------------------------------------------------------------------
-_s2tw = OpenCC("s2tw")
-_CJK  = r"[㐀-鿿]"
-_AW   = r"[A-Za-z0-9]"
+_s2twp = OpenCC("s2twp")
+_CJK   = r"[㐀-鿿]"
+_AW    = r"[A-Za-z0-9]"
 
 
 def post_process(text: str) -> str:
-    """Simplified → Taiwan-traditional, then add spaces at CJK ↔ ASCII edges."""
-    text = _s2tw.convert(text)
+    """Simplified → Taiwan-traditional (with TW phrase mapping via s2twp),
+    then add spaces at CJK ↔ ASCII edges. Idempotent."""
+    text = _s2twp.convert(text)
     text = re.sub(f"({_CJK})({_AW})", r"\1 \2", text)
     text = re.sub(f"({_AW})({_CJK})", r"\1 \2", text)
     return text
@@ -384,7 +437,8 @@ class MlxWhisperBackend(STTBackend):
 
 
 class Qwen3AsrBackend(STTBackend):
-    """Qwen3-ASR via mlx-qwen3-asr (Apple Silicon Metal-native).
+    """Qwen3-ASR — Apple Silicon goes via mlx-qwen3-asr (Metal-native);
+    Windows / Linux go via qwen-asr (PyTorch + transformers + NVIDIA CUDA).
 
     Alibaba's Qwen3-ASR, released 2026-01 under Apache-2.0. Two model sizes:
         Qwen/Qwen3-ASR-0.6B  — default, ~1.2 GB fp16, 92ms TTFT
@@ -409,8 +463,9 @@ class Qwen3AsrBackend(STTBackend):
 
     name = "qwen3-asr"
 
-    # Map mlx-qwen3-asr's human-readable language names back to the ISO-ish
-    # short codes used elsewhere in the daemon log ("zh", "en", ...).
+    # Map upstream's human-readable language names back to the ISO-ish short
+    # codes used elsewhere in the daemon log ("zh", "en", ...). Both the
+    # MLX and Torch impls go through this normaliser via the outer class.
     _LANG_NORM = {
         "chinese":    "zh",
         "english":    "en",
@@ -426,11 +481,11 @@ class Qwen3AsrBackend(STTBackend):
     }
 
     def __init__(self, model_name: str):
-        import mlx_qwen3_asr  # lazy import (Apple Silicon only)
-
-        self._mqa = mlx_qwen3_asr
         self._model_name = self._resolve_model_name(model_name)
-        self._device_label = "Apple Silicon (Metal, MLX) — Qwen3-ASR"
+        if sys.platform == "darwin" and _host_platform.machine() == "arm64":
+            self._impl = _Qwen3MlxImpl(self._model_name)
+        else:
+            self._impl = _Qwen3TorchImpl(self._model_name)
 
     @staticmethod
     def _resolve_model_name(model_name: str) -> str:
@@ -448,21 +503,42 @@ class Qwen3AsrBackend(STTBackend):
 
     @property
     def device_label(self) -> str:
-        return self._device_label
+        return self._impl.device_label
 
     def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        result = self._mqa.transcribe(
-            samples,
-            model=self._model_name,
-            verbose=False,
-        )
-        text = (getattr(result, "text", "") or "").strip()
-        raw_lang = (getattr(result, "language", "") or "").strip().lower()
+        result = self._impl.transcribe(samples)
+        text = (result.get("text") or "").strip()
+        raw_lang = (result.get("language") or "").strip().lower()
         # Normalise "Chinese" → "zh", "English" → "en", etc. Falls back to
         # the first two letters of whatever the model returned so unknown
         # languages still produce something sensible in the log line.
         language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
         return text, language
+
+    def warmup(self) -> None:
+        self._impl.warmup()
+
+
+class _Qwen3MlxImpl:
+    """Apple Silicon path — mlx-qwen3-asr (Metal native)."""
+
+    def __init__(self, model_name: str):
+        import mlx_qwen3_asr  # lazy import (Apple Silicon only)
+
+        self._mqa = mlx_qwen3_asr
+        self._model_name = model_name
+        self.device_label = "Apple Silicon (Metal, MLX) — Qwen3-ASR"
+
+    def transcribe(self, samples: np.ndarray) -> dict:
+        result = self._mqa.transcribe(
+            samples,
+            model=self._model_name,
+            verbose=False,
+        )
+        return {
+            "text": getattr(result, "text", "") or "",
+            "language": getattr(result, "language", "") or "",
+        }
 
     def warmup(self) -> None:
         # First call downloads weights (~1.2 GB for 0.6B) on first run and
@@ -474,6 +550,73 @@ class Qwen3AsrBackend(STTBackend):
             warm_audio,
             model=self._model_name,
             verbose=False,
+        )
+
+
+class _Qwen3TorchImpl:
+    """Windows / Linux path — qwen-asr (PyTorch + transformers + NVIDIA CUDA).
+
+    Picks the device once at init: CUDA bfloat16 when a GPU is visible,
+    CPU float32 otherwise. CPU mode is functional but ~30-60× slower per
+    transcribe — well outside the hold-to-talk budget. We log a loud
+    warning rather than silently falling back inside transcribe(), so the
+    user can fix the install or switch STT_BACKEND="faster-whisper".
+    """
+
+    def __init__(self, model_name: str):
+        # Heavy lazy imports — only paid on Win/Linux + qwen3-asr backend.
+        import torch
+        from qwen_asr import Qwen3ASRModel
+
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            dtype = torch.bfloat16
+            try:
+                # torch returns e.g. "NVIDIA GeForce RTX 5080" — already has
+                # vendor prefix; don't add a second "NVIDIA ".
+                gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                gpu_name = "CUDA device"
+            self.device_label = f"{gpu_name} (bfloat16) — Qwen3-ASR"
+        else:
+            device = "cpu"
+            dtype = torch.float32
+            self.device_label = (
+                "CPU (float32) — Qwen3-ASR (no CUDA detected)"
+            )
+            print(
+                "[stt] qwen-asr fell back to CPU — install torch with CUDA "
+                "support for GPU acceleration (see README → Windows 安裝).",
+                file=sys.stderr, flush=True,
+            )
+
+        self._model = Qwen3ASRModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            device_map=device,
+            max_inference_batch_size=1,
+            max_new_tokens=256,
+        )
+        self._model_name = model_name
+
+    def transcribe(self, samples: np.ndarray) -> dict:
+        results = self._model.transcribe(
+            audio=(samples, SAMPLE_RATE),
+            language=None,
+        )
+        if not results:
+            return {"text": "", "language": ""}
+        r = results[0]
+        return {
+            "text": getattr(r, "text", "") or "",
+            "language": getattr(r, "language", "") or "",
+        }
+
+    def warmup(self) -> None:
+        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        self._model.transcribe(
+            audio=(warm_audio, SAMPLE_RATE),
+            language=None,
         )
 
 
@@ -543,6 +686,7 @@ def _transcribe_and_emit() -> None:
             print(f"[stt] empty ({language}, {elapsed:.2f}s)", flush=True)
             return
         text = post_process(raw)
+        pre_polish = text  # captured to log diff when polish edits substantively
 
         # Optional polish stage (text → text). Gated on detected language
         # because small Chinese-strong instruction LLMs translate pure-
@@ -553,6 +697,13 @@ def _transcribe_and_emit() -> None:
             t1 = time.time()
             text = _polisher.polish(text)
             polish_elapsed = time.time() - t1
+            # Polish models can leak simplified glyphs back in despite the
+            # "中文一律繁體" prompt rule (especially smaller models with
+            # weaker instruction following). Re-run post_process as a
+            # deterministic μs-cost backstop — guarantees clipboard output
+            # is always TW-traditional with consistent CJK/ASCII spacing,
+            # regardless of which polish model is loaded or how strict it is.
+            text = post_process(text)
 
         # Set clipboard, then paste — atomic, no per-char IME drama.
         # Tiny sleep lets the clipboard write settle before the keystroke
@@ -574,6 +725,13 @@ def _transcribe_and_emit() -> None:
             timing = f"{elapsed:.2f}s"
             if polish_elapsed > 0:
                 timing += f"+polish {polish_elapsed:.2f}s"
+            # When polish substantively edited the text, print the raw
+            # (post-process'd, pre-polish) text on a preceding line so
+            # the user can diff polish's changes against ASR's output.
+            # No raw line when polish made no edit — keeps the common
+            # case quiet.
+            if polish_elapsed > 0 and text != pre_polish:
+                print(f"[stt] {language} raw   -> {pre_polish}", flush=True)
             if paste_ok:
                 print(f"[stt] {language} {timing} -> {text}", flush=True)
             else:
