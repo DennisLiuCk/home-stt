@@ -43,7 +43,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: 'pip'
+          # NO `cache: 'pip'` — actions/setup-python requires a
+          # requirements.txt / pyproject.toml manifest to compute the
+          # cache key. We intentionally don't ship either: runtime
+          # dependencies are platform-conditional (torch+CUDA Win,
+          # mlx-lm Mac) and the README documents the per-platform
+          # install commands as the source of truth. Test deps are
+          # tiny (~5 packages, <10s install) so the cache savings
+          # don't justify a duplicate manifest.
 
       - name: Install runtime + test deps
         # Lean install — only what the state-machine tests actually
