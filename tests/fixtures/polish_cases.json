@@ -1,0 +1,170 @@
+{
+  "_meta": {
+    "purpose": "Regression fixture for the v0.7.0 polish-quality investigation.",
+    "context": "These are the failure modes that pushed home-stt back from Qwen2.5-1.5B to Qwen3-4B-Instruct-2507 as the default polish model. Each case captures one class of error that smaller / less-instruction-following models produced, with assertion rules the *correct* (current) polish output must satisfy.",
+    "source": "README.md §'v0.7.x 效能與品質投資紀錄' + commits 676553a, 3d7ae7d, 23c8d07.",
+    "schema": {
+      "id": "stable case id",
+      "category": "one of: english_keyword | identifier_fidelity | semantic_fidelity | subject_preservation | overformalization | no_english_translation | filler_removal | repetition_fix",
+      "input": "raw ASR output (post-OpenCC TW, pre-polish)",
+      "must_contain": "substrings the polished output MUST contain (English keywords, identifiers, etc.)",
+      "must_not_contain": "substrings that MUST NOT appear (translations, wrong subjects, fact reversals, etc.)",
+      "max_edit_ratio": "optional: ceiling on Levenshtein distance / input length. 0.3 = output should differ by ≤30% chars from input. Catches over-rewrites.",
+      "note": "human-readable rationale"
+    },
+    "running": "pytest tests/test_polish_bench.py — requires actual polish model loaded (~8 GB VRAM on Win, ~4 GB RSS on Mac). Skip-by-default in CI."
+  },
+  "cases": [
+    {
+      "id": "kw_commit_preservation",
+      "category": "english_keyword",
+      "input": "幫我 review 這個 commit 然後 push 到 main",
+      "must_contain": ["commit", "push", "main", "review"],
+      "must_not_contain": ["提交", "推送", "推上"],
+      "max_edit_ratio": 0.3,
+      "note": "Qwen2.5-1.5B silently swapped commit→push (wrong verb production bug). Qwen3-4B preserves all English tech verbs."
+    },
+    {
+      "id": "kw_python_function",
+      "category": "english_keyword",
+      "input": "呃這個 Python function 的 async 部分需要改",
+      "must_contain": ["Python", "function", "async"],
+      "must_not_contain": ["函式", "函數", "非同步", "異步"],
+      "max_edit_ratio": 0.25,
+      "note": "English tech keywords must not be translated, even though OpenCC has 函式 in its TW vocab dict — polish should respect verbatim English."
+    },
+    {
+      "id": "id_underscore_prefix",
+      "category": "identifier_fidelity",
+      "input": "把 _USE_TORCH_COMPILE 設成 True 試試",
+      "must_contain": ["_USE_TORCH_COMPILE"],
+      "must_not_contain": ["USE_TORCH_COMPILE 設成"],
+      "note": "Qwen2.5-0.5B dropped the underscore prefix. Identifiers are opaque tokens — must be preserved byte-for-byte."
+    },
+    {
+      "id": "id_snake_case",
+      "category": "identifier_fidelity",
+      "input": "改一下 build_polisher 跟 build_backend_with_fallback 這兩個",
+      "must_contain": ["build_polisher", "build_backend_with_fallback"],
+      "max_edit_ratio": 0.2,
+      "note": "snake_case identifiers must survive polish unchanged."
+    },
+    {
+      "id": "fact_int4_slower",
+      "category": "semantic_fidelity",
+      "input": "INT4 量化在這台機器上反而更慢",
+      "must_contain": ["更慢"],
+      "must_not_contain": ["更快"],
+      "note": "Qwen2.5-1.5B flipped 更慢→更快 (semantic reversal hallucination). Polish must never invert the speaker's claim."
+    },
+    {
+      "id": "fact_number_preserved",
+      "category": "semantic_fidelity",
+      "input": "polish 從 4.26 秒降到 1.9 秒",
+      "must_contain": ["4.26", "1.9"],
+      "max_edit_ratio": 0.2,
+      "note": "Numerical facts must survive — silent number mutation is fatal for technical dictation."
+    },
+    {
+      "id": "subj_help_me",
+      "category": "subject_preservation",
+      "input": "嗯幫我改一下這段程式碼",
+      "must_contain": ["幫我"],
+      "must_not_contain": ["幫你"],
+      "note": "Qwen2.5-0.5B swapped 幫我→幫你 (subject swap). Polish must preserve pronoun roles."
+    },
+    {
+      "id": "subj_you_not_them",
+      "category": "subject_preservation",
+      "input": "你那邊的 daemon 跟我這邊的版本應該一樣",
+      "must_contain": ["你", "我"],
+      "max_edit_ratio": 0.25,
+      "note": "Both 你 and 我 must survive — small models sometimes collapse them."
+    },
+    {
+      "id": "overformal_want_to_solve",
+      "category": "overformalization",
+      "input": "我想要解決這個 latency 問題",
+      "must_contain": ["想要解決", "latency"],
+      "must_not_contain": ["目的是為了解決", "目的在於解決"],
+      "max_edit_ratio": 0.25,
+      "note": "Qwen2.5-1.5B over-formalised 想要解決→目的是為了解決. Polish should preserve conversational tone."
+    },
+    {
+      "id": "overformal_easy_to_impl",
+      "category": "overformalization",
+      "input": "這個應該很容易實作",
+      "must_contain": ["容易實作"],
+      "must_not_contain": ["容易實現"],
+      "note": "Qwen2.5-1.5B swapped 實作→實現 (mainland register). TW vocab should be preserved."
+    },
+    {
+      "id": "no_translate_prebuilt_wheel",
+      "category": "no_english_translation",
+      "input": "找不到 prebuilt wheel 只好自己 compile",
+      "must_contain": ["prebuilt wheel", "compile"],
+      "must_not_contain": ["預建的輪子", "預編譯的輪子", "編譯"],
+      "note": "Qwen2.5-1.5B translated prebuilt wheel→預建的輪子 (literal noun translation). English jargon must stay English."
+    },
+    {
+      "id": "no_translate_pytorch",
+      "category": "no_english_translation",
+      "input": "PyTorch 跟 transformers 都要先裝好",
+      "must_contain": ["PyTorch", "transformers"],
+      "max_edit_ratio": 0.2,
+      "note": "Library / brand names must survive verbatim."
+    },
+    {
+      "id": "filler_uh_um",
+      "category": "filler_removal",
+      "input": "呃我覺得這個 design 還可以",
+      "must_not_contain": ["呃"],
+      "must_contain": ["design"],
+      "note": "Core polish duty: remove 呃/嗯/那個/就是/然後 fillers."
+    },
+    {
+      "id": "filler_then_just",
+      "category": "filler_removal",
+      "input": "然後就是那個 commit 之後直接 push",
+      "must_not_contain": ["然後就是那個"],
+      "must_contain": ["commit", "push"],
+      "max_edit_ratio": 0.5,
+      "note": "Multi-filler removal — 然後 + 就是 + 那個 stacked, all must go."
+    },
+    {
+      "id": "repeat_immediate",
+      "category": "repetition_fix",
+      "input": "我我我覺得這樣比較好",
+      "must_not_contain": ["我我我"],
+      "must_contain": ["我覺得"],
+      "max_edit_ratio": 0.3,
+      "note": "Immediate-repetition fix — 我我我→我."
+    },
+    {
+      "id": "repeat_with_filler",
+      "category": "repetition_fix",
+      "input": "這個這個那個 function 寫得不太對",
+      "must_not_contain": ["這個這個", "那個 function"],
+      "must_contain": ["function"],
+      "max_edit_ratio": 0.5,
+      "note": "Repeated demonstratives + filler before noun, all must collapse."
+    },
+    {
+      "id": "mixed_long_realistic",
+      "category": "filler_removal",
+      "input": "呃所以我剛剛在想說那個 polish 的 prompt 是不是太長了然後 latency 就會上升",
+      "must_contain": ["polish", "prompt", "latency"],
+      "must_not_contain": ["呃", "就是說那個"],
+      "max_edit_ratio": 0.5,
+      "note": "Realistic mid-length dictation — preserve technical content, remove the dictation-ish filler pattern."
+    },
+    {
+      "id": "short_clean_passthrough",
+      "category": "filler_removal",
+      "input": "好",
+      "must_contain": ["好"],
+      "max_edit_ratio": 0.5,
+      "note": "v0.7.2 O7: short responses like 「好」 must now reach polish (they were silent-rejected by MIN_AUDIO_SEC=0.3 before). Already-clean input should pass through near-untouched."
+    }
+  ]
+}

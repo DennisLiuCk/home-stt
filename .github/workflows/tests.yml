@@ -1,0 +1,63 @@
+name: tests
+
+# State-machine + silence-trim + config-regression tests. No GPU, no
+# model loading — runs in ~5s per OS. The polish-quality bench
+# (tests/test_polish_bench.py) auto-skips here (requires HOME_STT_RUN_
+# POLISH_BENCH=1 or --run-polish-bench to load the ~8 GB model); run
+# that bench locally before any commit that touches text_polisher.py
+# or bumps POLISH_MODEL.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/tests.yml'
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows + macOS — the two daemon-target platforms. Linux is on
+        # the roadmap but the Pasteboard implementation isn't shipped, so
+        # CI on Linux would force importing stt_platform_linux which
+        # doesn't exist. Add Linux to the matrix when the Pasteboard
+        # subclass lands.
+        os: [windows-latest, macos-latest]
+        # Match the README "Python 3.10+" stated minimum and the locally-
+        # tested 3.12. Skip 3.11 to keep CI fast; cover the boundaries.
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install runtime + test deps
+        # Lean install — only what the state-machine tests actually
+        # exercise. transformers / mlx-lm / qwen-asr / torch are excluded
+        # because the polish bench skip-by-default keeps them out of
+        # the test import path. pynput on macOS pulls pyobjc transitively;
+        # on Windows it's a single wheel.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy sounddevice pynput opencc-python-reimplemented
+
+      - name: Run tests (state machine + config regression)
+        # -v for per-test status. --no-header to keep CI logs tight.
+        # The 18 polish-bench cases will SKIP because HOME_STT_RUN_POLISH_BENCH
+        # is unset — that's intentional, see comment at top of file.
+        run: |
+          python -m pytest tests/ -v --no-header
