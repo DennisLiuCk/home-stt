@@ -222,16 +222,21 @@ STT_MODEL        = "large-v3-turbo"   # 或 medium / small / base
 POLISH_ENABLED   = False
 ```
 
-然後 stop + start:
+然後 restart(雙平台同指令):
 
-Windows：
+```bash
+home-stt restart
+```
+
+或底層腳本(power user):
+
 ```powershell
+# Windows
 .\scripts\stt-stop.ps1
 .\scripts\stt-start.ps1
 ```
-
-macOS：
 ```bash
+# macOS
 bash scripts/stt-stop.sh
 bash scripts/stt-start.sh
 ```
@@ -255,6 +260,7 @@ cd home-stt
 scripts/
 ├── stt-daemon.py         # daemon 主程式
 ├── stt_platform*.py      # 平台抽象（Pasteboard）
+├── home_stt.py           # 統一 CLI（v0.7.6+,pip install -e . 安裝後變 `home-stt` 指令）
 ├── stt-start.ps1         # Windows 啟動
 └── stt-stop.ps1          # Windows 停止
 ```
@@ -266,6 +272,17 @@ v0.7.0+ 預設 **Maximum tier** — `Qwen3-ASR-0.6B` + `Qwen3-4B-Instruct-2507` 
 如果你的卡 < 10 GB VRAM(RTX 3060 / 4060 / 筆電 GPU)、或不想裝 PyTorch CUDA,先去 [依硬體選擇 Preset](#依硬體選擇-preset) 挑 Balanced / Light / Mini tier,編輯 `scripts/stt-daemon.py` 把 `STT_BACKEND` / `STT_MODEL` / `POLISH_ENABLED` / `POLISH_MODEL` 改掉再啟動。
 
 ### 3. 啟動 daemon
+
+**建議**先一次性安裝 `home-stt` CLI(跨目錄、跨平台統一指令):
+
+```powershell
+pip install -e .       # 在 home-stt repo 根目錄執行一次
+home-stt start
+```
+
+之後 `home-stt {start,stop,restart,status,log,config}` 在任何目錄都能跑,雙平台語法一致。
+
+也可以直接執行底層腳本(不想 pip install / 偏好顯式呼叫):
 
 ```powershell
 .\scripts\stt-start.ps1
@@ -387,6 +404,17 @@ python3 -c "import sys; print(sys.executable)"
 
 ### 5. 啟動 daemon
 
+**建議**先一次性安裝 `home-stt` CLI(跨目錄、跨平台統一指令):
+
+```bash
+pip install -e .       # 在 home-stt repo 根目錄執行一次
+home-stt start
+```
+
+之後 `home-stt {start,stop,restart,status,log,config}` 在任何目錄都能跑,雙平台語法一致。
+
+也可以直接執行底層腳本(不想 pip install / 偏好顯式呼叫):
+
 ```bash
 bash scripts/stt-start.sh
 ```
@@ -429,9 +457,32 @@ Allow ~10-30s for model load + Metal warmup before first trigger key.
 
 ### 7. 確認狀態
 
-看 log（`$TMPDIR` 通常是 `/var/folders/.../T/`）：
+裝了 `home-stt` CLI 後一個指令看完(PID / uptime / RSS / backend / polish / paste path / triggers / 最近 3 筆 transcribe):
+
 ```bash
-tail -n 20 "$TMPDIR/stt-daemon.log"
+home-stt status
+```
+
+範例輸出:
+```
+home-stt v0.7.5 -- running
+  PID:      67289 (uptime 2h 5m)
+  RSS:      2.77 GB
+  log:      /var/folders/.../T/stt-daemon.log (last write 30m ago)
+  err.log:  (clean)
+
+  backend:  qwen3-asr (Qwen/Qwen3-ASR-0.6B)
+  polish:   Qwen3-4B-Instruct-2507-MLX-4bit (MLX, <=512 tok)
+  paste:    Quartz CGEvent @ AnnotatedSessionEventTap (IME-safe)
+  triggers: hold Key.alt_r to dictate, hold Key.cmd_r to voice-edit
+```
+
+或直接看 log:
+```bash
+home-stt log               # 最後 30 行
+home-stt log --tail 100    # 最後 100 行
+home-stt log -f            # follow 模式(Ctrl+C 結束)
+home-stt log --err         # err.log
 ```
 
 每次說話 daemon 會 log 一行（跟 Windows 相同格式）：
@@ -443,13 +494,17 @@ tail -n 20 "$TMPDIR/stt-daemon.log"
 
 ## 停止
 
-Windows：
-```powershell
-.\scripts\stt-stop.ps1
+```bash
+home-stt stop
 ```
 
-macOS：
+或底層腳本:
+```powershell
+# Windows
+.\scripts\stt-stop.ps1
+```
 ```bash
+# macOS
 bash scripts/stt-stop.sh
 ```
 
