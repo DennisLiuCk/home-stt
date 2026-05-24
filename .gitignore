@@ -44,3 +44,9 @@ desktop.ini
 # this from ~/.claude; if a hook misfires and drops it here instead, don't
 # accidentally commit transcript snippets).
 tts-summary-now.txt
+
+# --- Spike / scratch ---
+# v0.8.0 encoder-pipelining spike (throwaway A/B scripts that load real
+# models). Per plan-v0.8.0 Day 1-2 gate, this should NEVER be committed —
+# production code goes in scripts/.
+tmp/
