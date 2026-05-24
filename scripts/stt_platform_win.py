@@ -71,11 +71,118 @@ def _register_nvidia_dlls() -> int:
 # after CJK punctuation like 、.
 # ---------------------------------------------------------------------------
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _INPUT_KEYBOARD    = 1
 _KEYEVENTF_UNICODE = 0x0004
 _KEYEVENTF_KEYUP   = 0x0002
 _ULONG_PTR = (ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8
               else ctypes.c_ulong)
+
+# ---------------------------------------------------------------------------
+# v0.7.2: direct Win32 clipboard API. Replaces the v0.7.1 path that spawned
+# `powershell.exe -Command "Set-Clipboard ..."` per paste — cold powershell
+# startup was 100-300 ms per call, plus the daemon then slept 150 ms
+# afterwards to let the clipboard publish settle. Total ~250-450 ms of
+# pure latency per dictation, dominating short-utterance UX.
+#
+# Direct API: ~1-5 ms. Synchronous — SetClipboardData returns only after
+# the OS-side clipboard daemon publishes the new contents, so no
+# settle-sleep needed (daemon trims sleep to 20 ms for keystroke timing).
+#
+# CF_UNICODETEXT contract: data must be a GMEM_MOVEABLE handle to a
+# UTF-16 LE buffer with a terminating null wchar. Clipboard takes
+# ownership of the handle on successful SetClipboardData — so we MUST
+# GlobalFree on the failure path but NOT on success. Mixing this up
+# either leaks one handle per paste (success path freeing) or causes the
+# clipboard daemon to read freed memory on the failure path. The retry
+# loop on OpenClipboard handles the common case where another process
+# (clipboard manager, paste helper) holds the lock briefly.
+# ---------------------------------------------------------------------------
+_GMEM_MOVEABLE  = 0x0002
+_CF_UNICODETEXT = 13
+
+_kernel32.GlobalAlloc.restype  = ctypes.c_void_p
+_kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+_kernel32.GlobalLock.restype   = ctypes.c_void_p
+_kernel32.GlobalLock.argtypes  = [ctypes.c_void_p]
+_kernel32.GlobalUnlock.restype = ctypes.c_int
+_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalFree.restype   = ctypes.c_void_p
+_kernel32.GlobalFree.argtypes  = [ctypes.c_void_p]
+
+_user32.OpenClipboard.restype     = ctypes.c_int
+_user32.OpenClipboard.argtypes    = [wintypes.HWND]
+_user32.EmptyClipboard.restype    = ctypes.c_int
+_user32.EmptyClipboard.argtypes   = []
+_user32.SetClipboardData.restype  = ctypes.c_void_p
+_user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+_user32.CloseClipboard.restype    = ctypes.c_int
+_user32.CloseClipboard.argtypes   = []
+
+
+def _set_clipboard_text(text: str, *, retries: int = 5,
+                        retry_delay_s: float = 0.01) -> bool:
+    """Write text to the system clipboard via direct Win32 API.
+
+    Returns True iff the clipboard now contains exactly `text`. False on
+    any failure — caller (WindowsPasteboard.set_text) prints the
+    user-facing error line; this helper logs the low-level errno to
+    stderr for debugging without polluting the main log.
+    """
+    # UTF-16 LE + terminating null wchar. Encode then append two null
+    # bytes (one null wchar = two bytes in UTF-16). Python encodes
+    # surrogate pairs correctly for chars outside the BMP.
+    encoded = text.encode("utf-16-le") + b"\x00\x00"
+    size = len(encoded)
+
+    h_mem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, size)
+    if not h_mem:
+        err = ctypes.get_last_error()
+        print(f"[stt] clipboard: GlobalAlloc({size}) failed (errno={err})",
+              file=sys.stderr, flush=True)
+        return False
+
+    ptr = _kernel32.GlobalLock(h_mem)
+    if not ptr:
+        err = ctypes.get_last_error()
+        _kernel32.GlobalFree(h_mem)
+        print(f"[stt] clipboard: GlobalLock failed (errno={err})",
+              file=sys.stderr, flush=True)
+        return False
+    try:
+        ctypes.memmove(ptr, encoded, size)
+    finally:
+        _kernel32.GlobalUnlock(h_mem)
+
+    # OpenClipboard can transiently fail when another process holds the
+    # clipboard (clipboard managers, paste tools). Brief retry — the
+    # contention window is typically <10 ms.
+    import time as _time
+    opened = False
+    for attempt in range(retries):
+        if _user32.OpenClipboard(None):
+            opened = True
+            break
+        _time.sleep(retry_delay_s)
+    if not opened:
+        err = ctypes.get_last_error()
+        _kernel32.GlobalFree(h_mem)
+        print(f"[stt] clipboard: OpenClipboard failed after {retries} "
+              f"attempts (errno={err})", file=sys.stderr, flush=True)
+        return False
+
+    try:
+        _user32.EmptyClipboard()
+        if not _user32.SetClipboardData(_CF_UNICODETEXT, h_mem):
+            err = ctypes.get_last_error()
+            _kernel32.GlobalFree(h_mem)  # ownership not transferred on failure
+            print(f"[stt] clipboard: SetClipboardData failed (errno={err})",
+                  file=sys.stderr, flush=True)
+            return False
+        # Success — clipboard now owns h_mem. Do NOT GlobalFree.
+        return True
+    finally:
+        _user32.CloseClipboard()
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -141,22 +248,16 @@ class WindowsPasteboard(Pasteboard):
         return _register_nvidia_dlls()
 
     def set_text(self, text: str) -> bool:
-        """Place text on the Windows clipboard. PowerShell 5.1 reads stdin in
-        cp950 on zh-TW locale by default — force UTF-8 or unicode comes out
-        as mojibake."""
-        cmd = ("[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
-               "$in = [Console]::In.ReadToEnd(); Set-Clipboard -Value $in")
-        proc = subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            stdin=subprocess.PIPE,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        )
-        proc.communicate(input=text.encode("utf-8"))
-        if proc.returncode != 0:
-            print(f"[stt] Set-Clipboard failed (rc={proc.returncode})",
-                  file=sys.stderr, flush=True)
-            return False
-        return True
+        """Place text on the Windows clipboard via direct Win32 API.
+
+        v0.7.2: replaced PowerShell `Set-Clipboard` subprocess (100-300
+        ms cold start, async publish) with `_set_clipboard_text` ctypes
+        path (~1-5 ms, synchronous). UTF-16 LE encoding native to the
+        CF_UNICODETEXT contract — no cp950 / zh-TW locale mojibake risk
+        that the PowerShell path needed `[Console]::InputEncoding =
+        UTF8` to work around.
+        """
+        return _set_clipboard_text(text)
 
     def paste(self) -> bool:
         """Send Ctrl+V via raw SendInput. Ctrl is a system modifier and IMEs

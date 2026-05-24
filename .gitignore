@@ -38,3 +38,9 @@ desktop.ini
 .env
 .env.*
 !.env.example
+
+# --- Editor / agent integrations ---
+# Claude Code TTS-summary scratch file (Stop hook writes / reads / deletes
+# this from ~/.claude; if a hook misfires and drops it here instead, don't
+# accidentally commit transcript snippets).
+tts-summary-now.txt

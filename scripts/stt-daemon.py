@@ -79,14 +79,24 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 SAMPLE_RATE      = 16000
-MIN_AUDIO_SEC    = 0.3                 # taps shorter than this are ignored
+# v0.7.2: lowered from 0.3 → 0.15. Mandarin one-syllable replies
+# (「好」「對」「是」, ~0.25 s) were being silent-rejected by the 0.3 s
+# threshold. 0.15 s sits above typical key-bounce (~10-20 ms) and the
+# minimum deliberate human press (~80 ms) while preserving short
+# affirmatives.
+MIN_AUDIO_SEC    = 0.15                # taps shorter than this are ignored
+# v0.7.2: cap on a single recording. Stuck triggers (key-repeat anomaly,
+# RDP disconnect mid-hold, kernel hang) would otherwise grow _buffer
+# unbounded. 120 s is well past any reasonable hold-to-talk session;
+# beyond this, _audio_callback force-releases and spawns transcribe.
+MAX_AUDIO_SEC    = 120                 # hard ceiling — auto-release on stuck key
 
 # STT backend + model defaults per platform.
 #   macOS (Apple Silicon only as of v0.4.0): Qwen3-ASR-0.6B via mlx-qwen3-asr.
@@ -184,7 +194,15 @@ STT_MODEL        = _DEFAULT_MODEL
 # ---------------------------------------------------------------------------
 POLISH_ENABLED   = True
 POLISH_MODEL     = _DEFAULT_POLISH_MODEL
-POLISH_LANGUAGES = {"zh", "ja", "ko"}
+# v0.7.2: narrowed from {zh, ja, ko} to {zh} only. POLISH_PROMPT is
+# written entirely in Chinese and only anchors Chinese behaviour
+# (「中文一律繁體」「禁翻譯英文」). A ja or ko transcript through the
+# same prompt has zero rule-level constraint — the 4B model is free to
+# rewrite, translate, or hallucinate without violating any instruction
+# it can parse. Restrict to zh until a per-language prompt path lands.
+# To re-enable ja/ko: write a per-language POLISH_PROMPT dispatch and
+# expand this set in lockstep.
+POLISH_LANGUAGES = {"zh"}
 # Polish prompt — lean version. The bf16 4B Qwen3-Instruct over-edits when
 # given loose instructions (translates English keywords, substitutes
 # "looks-similar" words, restructures sentences). Earlier iteration loaded
@@ -733,14 +751,78 @@ _buffer: list[np.ndarray] = []
 _recording = False
 _active_trigger = None   # which TRIGGER_KEYS member is currently held, or None
 _processing = False
+# v0.7.2: running sample count for the current _buffer. Tracked to enforce
+# MAX_AUDIO_SEC without re-summing every callback (which would be O(N) per
+# 50 ms tick on long recordings). Reset whenever _buffer is cleared / swapped.
+_recording_samples = 0
+
+
+# v0.7.2: RMS-based silence trimmer. Cheap (numpy-only, microseconds for
+# typical hold-to-talk clips) substitute for proper VAD. Two motivations:
+#
+#   1. Qwen3-ASR is LLM-backbone — the HF model card explicitly lists
+#      "silence hallucination, mispronunciations, long-form drift" as known
+#      edge cases. When the encoder sees significant silence the decoder
+#      can emit a learned phrase that "fits" silence in training data —
+#      Chinese voice-blog signoffs ("好好好好") or English "Thanks for
+#      watching"-type artefacts. Trimming leading/trailing silence kills
+#      this trigger before it reaches the model.
+#
+#   2. Trimmed audio is shorter → encoder forward is faster.
+#
+# Threshold -50 dBFS catches typical room tone (well below speech amplitude
+# ~-20 to -10 dBFS) while not flagging quiet speech onsets. 100 ms margin
+# preserves syllable attacks at the boundary.
+def _trim_silence(samples: np.ndarray,
+                  threshold_dbfs: float = -50.0,
+                  frame_ms: int = 30,
+                  margin_ms: int = 100) -> np.ndarray:
+    if len(samples) < SAMPLE_RATE * 0.1:
+        return samples  # too short to meaningfully trim
+    frame_size = max(1, int(SAMPLE_RATE * frame_ms / 1000))
+    n_frames = len(samples) // frame_size
+    if n_frames == 0:
+        return samples
+    frames = samples[:n_frames * frame_size].reshape(n_frames, frame_size)
+    # RMS per frame, vectorised.
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    threshold = 10.0 ** (threshold_dbfs / 20.0)
+    above = rms > threshold
+    if not above.any():
+        return samples[:0]  # all silence — return empty array (correct dtype)
+    first = int(above.argmax())
+    last = n_frames - int(above[::-1].argmax()) - 1
+    margin = int(SAMPLE_RATE * margin_ms / 1000)
+    start = max(0, first * frame_size - margin)
+    end = min(len(samples), (last + 1) * frame_size + margin)
+    return samples[start:end]
 
 
 def _audio_callback(indata, frames, time_info, status) -> None:
+    """PortAudio callback fired every ~50 ms with a fresh chunk of float32
+    samples. Cheap path: append under lock when capturing, else no-op.
+
+    Side effect (v0.7.2): on MAX_AUDIO_SEC overrun, force-releases recording
+    and spawns transcribe. Prevents a stuck trigger from growing _buffer
+    unbounded. Spawning a Python thread from PortAudio's audio thread is
+    safe (it's not realtime-blocking), and this path only fires on stuck
+    keys so the per-callback overhead is the addition + compare below.
+    """
+    global _recording, _recording_samples
     if status:
         print(f"[stt] audio status: {status}", file=sys.stderr, flush=True)
+    auto_stop = False
     with _state_lock:
         if _recording:
             _buffer.append(indata.copy())
+            _recording_samples += indata.shape[0]
+            if _recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
+                _recording = False
+                auto_stop = True
+    if auto_stop:
+        print(f"[stt] auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger",
+              file=sys.stderr, flush=True)
+        threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -752,21 +834,49 @@ _polisher: TextPostProcessor  # set in main()
 
 
 def _transcribe_and_emit() -> None:
-    global _processing, _buffer
+    global _processing, _buffer, _recording_samples
     with _state_lock:
         if _processing:
+            # v0.7.2: previously this was a silent early-return that left
+            # the captured audio in _buffer — where the NEXT successful
+            # transcribe would scoop it up and merge it with the next
+            # utterance ("I said A, then B during processing; my next
+            # transcript looks like B+C concatenated"). The user got no
+            # diagnostic. Now: explicitly drop, log, and clear.
+            dropped_chunks = len(_buffer)
+            dropped_sec = _recording_samples / SAMPLE_RATE
+            _buffer = []
+            _recording_samples = 0
+            if dropped_chunks > 0:
+                print(f"[stt] busy — dropped {dropped_sec:.2f}s of captured "
+                      f"audio ({dropped_chunks} blocks; previous transcribe "
+                      f"still running)", flush=True)
             return
         _processing = True
         chunks = _buffer
         _buffer = []
+        _recording_samples = 0
     try:
         if not chunks:
             return
         samples = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
-        if len(samples) < SAMPLE_RATE * MIN_AUDIO_SEC:
-            print(f"[stt] too short ({len(samples)/SAMPLE_RATE:.2f}s)",
-                  flush=True)
+        # v0.7.2: RMS silence trim before ASR. Qwen3-ASR is LLM-backbone
+        # and hallucinates on long silence (model card known issue). Also
+        # speeds the encoder forward marginally on clips with quiet heads/tails.
+        trimmed = _trim_silence(samples)
+        if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
+            # Could be (a) too-short tap or (b) all-silence after trim.
+            # Distinguish for the log so user can tell "I pressed too
+            # briefly" from "mic was muted / very quiet".
+            raw_sec = len(samples) / SAMPLE_RATE
+            trim_sec = len(trimmed) / SAMPLE_RATE
+            if trim_sec < raw_sec * 0.5 and raw_sec >= MIN_AUDIO_SEC:
+                print(f"[stt] silent — trimmed {raw_sec:.2f}s → "
+                      f"{trim_sec:.2f}s; mic muted or very quiet?", flush=True)
+            else:
+                print(f"[stt] too short ({raw_sec:.2f}s)", flush=True)
             return
+        samples = trimmed
         t0 = time.time()
         raw, language = _backend.transcribe(samples)
         elapsed = time.time() - t0
@@ -811,7 +921,15 @@ def _transcribe_and_emit() -> None:
                   f"'{text}' NOT inserted",
                   file=sys.stderr, flush=True)
             return
-        time.sleep(0.15)
+        # v0.7.2: was 0.15 s, dropped to 0.02 s. The original sleep was
+        # primarily compensating for PowerShell Set-Clipboard / pbcopy
+        # subprocess publishing the clipboard contents asynchronously —
+        # set_text could return before the OS-side clipboard daemon
+        # finished. v0.7.2 ships direct Win32 OpenClipboard / NSPasteboard
+        # paths that publish synchronously, so the dominant remaining
+        # need is letting the keyboard listener / paste keystroke synth
+        # land in a settled focus window. 20 ms is plenty.
+        time.sleep(0.02)
         paste_ok = _pasteboard.paste()
         if paste_ok:
             _play_beep(BEEP_END_HZ)
@@ -853,7 +971,7 @@ def _transcribe_and_emit() -> None:
 # Keyboard hooks
 # ---------------------------------------------------------------------------
 def _on_press(key) -> None:
-    global _recording, _active_trigger
+    global _recording, _active_trigger, _recording_samples
     if key not in TRIGGER_KEYS:
         return
     with _state_lock:
@@ -862,6 +980,10 @@ def _on_press(key) -> None:
         _active_trigger = key
         _recording = True
         _buffer.clear()
+        # v0.7.2: reset sample counter for MAX_AUDIO_SEC tracking. Without
+        # this, a previous transcribe that left a stale count + a new press
+        # could falsely trip the cap and auto-stop the new recording early.
+        _recording_samples = 0
     print(f"[stt] REC ({key})", flush=True)
     _play_beep(BEEP_START_HZ)
 
@@ -874,7 +996,35 @@ def _on_release(key) -> None:
         if _active_trigger != key:
             return  # releasing a non-active trigger (e.g. tap of the other one)
         _active_trigger = None
-        _recording = False
+        # v0.7.2: do NOT flip _recording=False here yet. PortAudio fires
+        # the callback every 50 ms; if we stop capture immediately, the
+        # in-flight 0-50 ms audio block that arrives between user release
+        # and the next callback gets discarded by the `if _recording:` gate.
+        # Real-world symptom: trailing phoneme clipped ("...這個 function"
+        # → "...這個 functio"). Drain below.
+    # Drain window: keep capturing for ~80 ms so the callback can land
+    # the post-release block. Sleep is outside the lock — audio callback
+    # continues to acquire the lock and append normally.
+    # Why 80 ms (not 50 ms = exactly one PortAudio period)? Windows
+    # time.sleep default resolution is ~15.6 ms (one multimedia timer
+    # tick) and `sleep(0.05)` can return as early as ~47 ms. Padding to
+    # 80 ms guarantees ≥ 1 callback period elapsed before we stop.
+    # On macOS sleep precision is sub-millisecond so the extra 30 ms is
+    # cheap perceived latency — bounded delay before transcribe starts.
+    time.sleep(0.08)
+    abort = False
+    with _state_lock:
+        # If user pressed a trigger again during the drain, _active_trigger
+        # is non-None. Leave _recording=True (the new press wants to
+        # continue capturing) and SKIP this release's transcribe spawn —
+        # the new press will spawn its own when it eventually releases.
+        if _active_trigger is not None:
+            abort = True
+        else:
+            _recording = False
+    if abort:
+        print("[stt] release aborted by new press during drain", flush=True)
+        return
     print("[stt] processing...", flush=True)
     threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 

@@ -98,7 +98,14 @@ class MlxLocalLlmPolisher(TextPostProcessor):
         self,
         model_name: str,
         system_prompt: str,
-        max_tokens: int = 256,
+        # v0.7.2: bumped 256 → 512. Old cap silent-truncated polish on the
+        # README "超長" stress case (~280-char zh, ~280 tokens with Qwen3
+        # tokenizer). 512 covers the realistic worst case while still
+        # acting as a runaway safety cap. Memory cost is negligible (~25
+        # MB extra KV during decode for the larger ceiling, vs 8 GB
+        # model weights). Per-call latency unchanged — max_new_tokens is
+        # a cap, the model stops at EOS naturally on short outputs.
+        max_tokens: int = 512,
     ) -> None:
         # Lazy import — keeps mlx_lm out of the import graph for users who
         # disabled polish or run on a non-Apple-Silicon platform.
@@ -192,7 +199,12 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         self,
         model_name: str,
         system_prompt: str,
-        max_tokens: int = 256,
+        # v0.7.2: bumped 256 → 512. See MlxLocalLlmPolisher comment for
+        # rationale. The dynamic budget calc in polish() also caps to
+        # this value, so it acts as the hard safety ceiling against
+        # runaway generation. Bump it higher (e.g. 1024) only if you
+        # routinely dictate multi-paragraph utterances.
+        max_tokens: int = 512,
     ) -> None:
         # Heavy lazy imports — only paid on Win/Linux + polish enabled.
         import torch
@@ -382,6 +394,28 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             inputs = self._tokenizer(
                 prompt, return_tensors="pt", add_special_tokens=False,
             ).to(self._device)
+            input_len = inputs["input_ids"].shape[-1]
+            # v0.7.2: dynamic max_new_tokens. Polish is a "minimum-edit"
+            # task — output length ≈ input length. The previous static
+            # 256-token cap silently truncated outputs on stress inputs
+            # (~280-char zh utterances, where Qwen3 tokenizes ~1
+            # token/char). Now: budget ~1.2× input tokens, floored at 64
+            # for short clips and ceilinged at the configured max_tokens
+            # (still acts as the hard safety cap against runaway).
+            #
+            # Reusing self._gen_config when the dynamic budget happens to
+            # equal the configured cap preserves the v0.7.1 micro-opt of
+            # not rebuilding GenerationConfig per call. Otherwise we copy
+            # + override — sub-millisecond cost, negligible vs decode.
+            target_max = max(64, min(int(input_len * 1.2), self._max_tokens))
+            if target_max == self._gen_config.max_new_tokens:
+                gen_cfg = self._gen_config
+            else:
+                from transformers import GenerationConfig
+                gen_cfg = GenerationConfig(
+                    **{**self._gen_config.to_dict(),
+                       "max_new_tokens": target_max},
+                )
             # v0.7.1: reuse pre-built prefix KV cache for the static
             # system block. generate() infers cached length from
             # past_key_values.get_seq_length() and only forwards the
@@ -393,9 +427,21 @@ class TorchLocalLlmPolisher(TextPostProcessor):
                 outputs = self._model.generate(
                     **inputs,
                     past_key_values=pkv,
-                    generation_config=self._gen_config,
+                    generation_config=gen_cfg,
                 )
-            new_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
+            new_tokens = outputs[0][input_len:]
+            n_new = int(new_tokens.shape[-1])
+            # v0.7.2: truncation detection. If generate() hit the budget
+            # AND the last emitted token isn't the chat terminator
+            # (<|im_end|> for Qwen), the polish output is cut off mid-
+            # sentence. Falling back to the raw ASR text is strictly
+            # better than pasting a truncated sentence.
+            last_token = int(new_tokens[-1].item()) if n_new > 0 else -1
+            if n_new >= target_max and last_token != self._pad_token_id:
+                print(f"[stt] polish truncated at {target_max} tok "
+                      f"(input {input_len} tok); using raw ASR text",
+                      file=sys.stderr, flush=True)
+                return text
             polished = self._tokenizer.decode(
                 new_tokens, skip_special_tokens=True,
             ).strip()

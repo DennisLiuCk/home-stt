@@ -57,6 +57,81 @@ _PASTE_APPLESCRIPT = (
 )
 
 
+# v0.7.2: cached NSPasteboard reference. Lazy-loaded on first set_text()
+# call rather than at module import — keeps the daemon startable on
+# systems where AppKit import is slow or fails (CI without graphics
+# stack, headless tests). If AppKit isn't available we fall through to
+# the pbcopy subprocess path used pre-v0.7.2.
+_NS_PASTEBOARD = None
+_NS_PASTEBOARD_TYPE = None
+_NS_PASTEBOARD_PROBED = False
+
+
+def _try_load_nspasteboard() -> bool:
+    """Probe whether NSPasteboard via PyObjC AppKit is available. Memoised.
+
+    PyObjC's AppKit is a transitive dep through Quartz (which the IME-safe
+    paste path imports), but AppKit specifically is its own subpackage and
+    may be missing on minimal installs. Falling back to pbcopy keeps the
+    daemon working on those — at the cost of the ~20-50 ms subprocess
+    spawn that NSPasteboard was meant to eliminate.
+    """
+    global _NS_PASTEBOARD, _NS_PASTEBOARD_TYPE, _NS_PASTEBOARD_PROBED
+    if _NS_PASTEBOARD_PROBED:
+        return _NS_PASTEBOARD is not None
+    _NS_PASTEBOARD_PROBED = True
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        _NS_PASTEBOARD = NSPasteboard.generalPasteboard()
+        _NS_PASTEBOARD_TYPE = NSPasteboardTypeString
+        return True
+    except Exception as e:
+        # Don't print at module import — only at first use, so users who
+        # never actually paste don't see noise.
+        print(f"[stt] clipboard: AppKit NSPasteboard unavailable ({e}); "
+              f"falling back to pbcopy subprocess (slower but functional)",
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _set_clipboard_via_pbcopy(text: str) -> bool:
+    """Legacy v0.7.1 path: pbcopy subprocess. Kept as fallback when
+    NSPasteboard / AppKit isn't available on the host."""
+    proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+    proc.communicate(input=text.encode("utf-8"))
+    if proc.returncode != 0:
+        print(f"[stt] pbcopy failed (rc={proc.returncode})",
+              file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+def _set_clipboard_via_nspasteboard(text: str) -> bool:
+    """v0.7.2 fast path: direct NSPasteboard via PyObjC.
+
+    setString_forType_ is synchronous — by the time it returns, the
+    pasteboard's changeCount has incremented and the OS-side pasteboard
+    daemon has the new contents. No settle-sleep needed.
+    """
+    try:
+        # clearContents() must precede setString_forType_ per Apple docs;
+        # without it, multiple representations from a prior write can
+        # linger and shadow the new value depending on paste-side query.
+        _NS_PASTEBOARD.clearContents()
+        ok = _NS_PASTEBOARD.setString_forType_(text, _NS_PASTEBOARD_TYPE)
+        if not ok:
+            print("[stt] clipboard: NSPasteboard setString returned False; "
+                  "falling back to pbcopy for this write",
+                  file=sys.stderr, flush=True)
+            return _set_clipboard_via_pbcopy(text)
+        return True
+    except Exception as e:
+        print(f"[stt] clipboard: NSPasteboard failed ({e}); "
+              f"falling back to pbcopy for this write",
+              file=sys.stderr, flush=True)
+        return _set_clipboard_via_pbcopy(text)
+
+
 class MacOSPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_r}
 
@@ -110,15 +185,17 @@ class MacOSPasteboard(Pasteboard):
         )
 
     def set_text(self, text: str) -> bool:
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        proc.communicate(input=text.encode("utf-8"))
-        if proc.returncode != 0:
-            print(
-                f"[stt] pbcopy failed (rc={proc.returncode})",
-                file=sys.stderr, flush=True,
-            )
-            return False
-        return True
+        """Place text on the system pasteboard.
+
+        v0.7.2: prefers NSPasteboard via PyObjC (~1 ms, synchronous).
+        Falls back to `pbcopy` subprocess (~20-50 ms, also synchronous
+        after process exit) when AppKit isn't importable — minimal installs,
+        custom Python builds without PyObjC, etc. Probe cost paid once
+        on first use, then memoised.
+        """
+        if _try_load_nspasteboard():
+            return _set_clipboard_via_nspasteboard(text)
+        return _set_clipboard_via_pbcopy(text)
 
     def paste(self) -> bool:
         if self._has_ax:

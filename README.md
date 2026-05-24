@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.7.1-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.7.2-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -501,6 +501,30 @@ v0.6.0 為了省 VRAM 暫用 Qwen2.5-1.5B-Instruct,後續 18-case bench 對照 `
 
 **根因觀察**:Polish 慢的不是模型運算量(8 GB weights / 960 GB/s = 8 ms 理論下限),而是 **per-token 固定 overhead**(Python loop + CUDA kernel launch + transformers internals 累計 ~22 ms/step,9x 高於理論)。v0.7.1 三招都是攤平這個 fixed overhead,**不碰模型也不量化** → quality 完全保留。
 
+#### v0.7.2 — Correctness sweep + clipboard direct API + dynamic budgets
+
+v0.7.2 是 multi-agent review (見 `review-v0.7.1.md`) 後的工程交付。三類修正:correctness bug、clipboard 開 subprocess 浪費的延遲、polish 對長輸入的 silent truncation。
+
+**3 個 correctness bug**:
+
+1. **尾音被丟** (`stt-daemon.py:_on_release`) — 鬆手後 PortAudio 還在處理 in-flight 50 ms audio block,但 `_recording = False` 已經被 flip,callback 的 `if _recording:` gate 拒絕該 block。實際症狀:講「...這個 function」會被切成「...這個 functio」(尾音 phoneme 缺一截)。修法:鬆手後 `time.sleep(0.08)` drain delay 再 flip。Windows `time.sleep` 預設解析度 ~15.6 ms (一個 multimedia timer tick),`sleep(0.05)` 可能 ~47 ms 就返回 → padding 到 80 ms 保證 ≥1 個 PortAudio 50 ms 週期 elapse。Drain 期間 re-press 會 abort 該 release 並讓新 press 繼續 capture。
+2. **`_processing` 沉默吞第二段語音** (`_transcribe_and_emit`) — 用戶在 transcribe 跑時再按一次,第二段 audio 留在 buffer 等下次按鍵時被 prepend 到第三段 transcript。用戶完全不知道發生什麼。修法:busy path 明確 `[stt] busy — dropped Xs of captured audio (previous transcribe still running)` log + clear buffer + reset `_recording_samples`。
+3. **無 `MAX_AUDIO_SEC` 上限** (`_audio_callback`) — stuck key / RDP 斷線 / kernel hang 會讓 buffer 無限長大。修法:120 s 硬上限,callback 內檢查 `_recording_samples`,超過就 force-release + spawn transcribe。
+
+**Polish silence hallucination 防護**:Qwen3-ASR 是 LLM-backbone,HF model card 明確列出「silence hallucination」為已知 edge case (decoder 在大段沉默上會生成 training data 中「fit silence」的習得片語,如中文 voice-blog 結尾「好好好好」)。新增 RMS-based silence trim 在 ASR 之前:30 ms frame、-50 dBFS threshold、100 ms margin。純 numpy 微秒成本,順帶縮短 encoder forward。
+
+**Polish 範圍收斂到 zh-only**:`POLISH_LANGUAGES` 從 `{zh, ja, ko}` 改 `{zh}`。`POLISH_PROMPT` 全程中文、只 anchor 中文行為(「中文一律繁體」「禁翻譯英文」),ja/ko transcript 透過同一個 prompt 等於 **0 規則約束**,4B 模型可任意改寫。等 per-language prompt dispatch 路徑就緒再開回 ja/ko。
+
+**Clipboard 從 subprocess 改成直接 API**:
+- **Windows**:`powershell.exe -Command "Set-Clipboard"` (冷啟動 100-300 ms + async 發佈需要 150 ms settle sleep) 換成 ctypes 直接呼叫 `OpenClipboard` + `EmptyClipboard` + `SetClipboardData(CF_UNICODETEXT, GMEM_MOVEABLE handle)` + `CloseClipboard`。**~1-5 ms 同步寫**,SetClipboardData 返回就代表 OS-side clipboard daemon 已發佈。settle sleep 從 150 ms 降到 20 ms (只留 keystroke timing margin)。每次 paste 累計省 **~250-450 ms**。OpenClipboard 含 5×10 ms retry 處理 clipboard manager 短暫鎖住。
+- **macOS**:`pbcopy` subprocess (~20-50 ms) 換成 PyObjC `NSPasteboard.generalPasteboard().setString_forType_(text, NSPasteboardTypeString)`,~1 ms 同步。AppKit 沒裝時自動 fallback 到 `pbcopy`(不會 crash)。
+
+**Polish `max_tokens` dynamic budget + truncation detection**:固定 256 token cap 對 README 的「超長」測試(~280 字 zh,~280 token)會默默截斷句尾,paste 出去是斷句。改成 `max(64, min(input_tokens * 1.2, ceiling))`,ceiling 從 256 提到 **512**(memory 成本 ~25 MB 額外 KV cache,可忽略對 8 GB 模型)。Truncation detection:若 output token 數撞到 budget **且** last token != `<|im_end|>` (chat terminator),log warning 並 fallback 到原 ASR 文字 — 「truncated polish」嚴格 worse than 「raw ASR」。
+
+**`MIN_AUDIO_SEC` 0.3 → 0.15**:中文「好」「對」「是」典型發音 ~0.25 s,原本被 silent reject (`[stt] too short`)。0.15 s 仍在 key-bounce (~20 ms) 跟最短意圖按鍵 (~80 ms) 之上,但低於最短單音節回應。
+
+**Tests + CI** (v0.7.3 同步交付):新增 `tests/` (state machine + silence trim + 設定回歸 18 個 test,純 mock 不需 GPU) + 18 個 polish quality 回歸 case (v0.7.0 投資發現的 failure mode 全部變成 fixture) + `.github/workflows/tests.yml` Win + Mac × py3.10/3.12 matrix。Polish bench skip-by-default,本地跑 `pytest tests/ --run-polish-bench`。
+
 ### 提示音說明
 
 預設兩個音：
@@ -667,7 +691,15 @@ Windows %TEMP%\ 或 macOS $TMPDIR (/var/folders/.../T/)
 | macOS beep 用 16kHz 取樣率送 sd.play 在 48kHz 輸出裝置上 resample 產生「叮叮」破碎感 | 啟動時用 `sd.query_devices(kind='output')['default_samplerate']` 取得原生取樣率、改用 raised-cosine fade、前面墊 5ms 靜音吸收開 stream 的 click |
 | 小 LLM(Qwen2.5-1.5B)不老實聽 system prompt 規則 — 翻譯英文、改主詞、改事實 | 對「最小編輯」這種約束式任務,**換大但更聽話的模型**(Qwen3-4B-Instruct-2507)比量化的小模型可靠。Qwen3 generation 的 instruction-following 大幅優於 Qwen2.5(v0.7.0 18-case bench 驗證)|
 | Polish decode 不是運算量大,是 **per-token Python + kernel launch overhead bound**(實測 22 ms/step,理論下限 8 ms,9x gap)| v0.7.1 用 **PLD + 預 cache POLISH_PROMPT KV** 攤平 — 一次 forward 平行驗證多 token、靜態 prompt 預 prefill。lossless 因為 verifier 仍是完整模型,長文 -55% |
-| Windows 上很多 PyTorch CUDA 加速選項 silently no-op 或反而更慢 | torch.compile 需 triton(無 Windows wheel)、bnb-NF4 在 Blackwell + 小模型反而慢 67%、flash-attn 沒對齊 stack 的 wheel。**bench-first 否則 ship placebo**(v0.7.2 GPU mel patch 就是被 bench 攔住、研究 agent 預估錯 300x 的例子)|
+| Windows 上很多 PyTorch CUDA 加速選項 silently no-op 或反而更慢 | torch.compile 需 triton(無 Windows wheel)、bnb-NF4 在 Blackwell + 小模型反而慢 67%、flash-attn 沒對齊 stack 的 wheel。**bench-first 否則 ship placebo**(早期一次「GPU mel spectrogram」Tier 1A 嘗試就是被 bench 攔住、研究 agent 預估錯 300x 的例子,revert 後 v0.7.2 改做 correctness sweep)|
+| 用戶鬆手時 PortAudio 還在處理 in-flight 50 ms audio block,callback 的 `if _recording:` gate 拒絕後尾音 phoneme 被切掉 | v0.7.2 在 `_on_release` 加 80 ms drain delay 後才 flip `_recording = False`。Windows `time.sleep` 預設 ~15.6 ms 解析度 → 80 ms padding 保證 ≥1 個 PortAudio 50 ms 週期 elapse。Drain 期間 re-press 會 abort 該 release |
+| 用戶在 transcribe 處理中再按一次,第二段 audio 沉默留在 buffer,等下次按鍵被 prepend 到第三段 transcript | v0.7.2 busy path 明確 `[stt] busy — dropped X.XXs of captured audio` log + clear buffer + reset sample counter,不再 silent merge |
+| 卡住的 trigger key 沒有 buffer 上限,RDP 斷線 / kernel hang 會 memory bomb | v0.7.2 加 `MAX_AUDIO_SEC = 120`,callback 內檢查 `_recording_samples`,超過就 force-release + spawn transcribe |
+| Qwen3-ASR LLM-backbone 對長靜音會 hallucinate(HF model card 列為已知 edge case,decoder 生成 training data「fit silence」的習得片語,如「好好好好」)| v0.7.2 在 ASR 前加 RMS silence trim(30 ms frame、-50 dBFS threshold、100 ms margin),純 numpy 微秒成本,順帶縮短 encoder forward |
+| 每次 paste 開 powershell.exe ~100-300 ms 冷啟動 + 150 ms async 發佈 settle sleep,累計 ~250-450 ms 浪費 | v0.7.2 Win 換 ctypes `OpenClipboard` + `SetClipboardData(CF_UNICODETEXT, ...)`(~1-5 ms 同步寫,sleep 降到 20 ms);Mac 換 PyObjC `NSPasteboard.setString_forType_()`,pbcopy 保留 fallback |
+| polish `max_tokens = 256` 對 280 字輸入會默默截斷句尾,paste 出去斷句 | v0.7.2 dynamic budget `max(64, min(input_tokens × 1.2, 512))`,ceiling 從 256 升到 512(memory 成本可忽略);加 truncation detection — 撞 budget 且 last token != `<|im_end|>` 就 fallback 到原 ASR 文字 |
+| `POLISH_PROMPT` 全程中文只 anchor 中文行為,但 `POLISH_LANGUAGES` 包含 ja/ko 等於對日韓 transcript 0 規則約束 | v0.7.2 收斂到 `POLISH_LANGUAGES = {"zh"}`,等 per-language prompt dispatch 路徑就緒再開 ja/ko |
+| 中文「好」「對」「是」典型發音 ~0.25 s,被 `MIN_AUDIO_SEC = 0.3` silent reject | v0.7.2 降到 0.15 s(仍高於 ~20 ms key-bounce + ~80 ms 最短意圖按鍵,但低於最短單音節回應)|
 
 ---
 
@@ -687,7 +719,7 @@ daemon **核心管線 100% 跨平台**：
 
 | 抽象層 | Windows(`stt_platform_win.py`) | macOS(`stt_platform_mac.py`) | Linux(規劃) |
 |--------|------------------------------|----------------------------|----------|
-| **Clipboard 寫入** | PowerShell `Set-Clipboard`(UTF-8 強制) | `pbcopy` 子程序 | `xclip` (X11) / `wl-copy` (Wayland) |
+| **Clipboard 寫入** | ctypes `OpenClipboard` + `SetClipboardData(CF_UNICODETEXT, GMEM_MOVEABLE handle)`(v0.7.2+,同步寫 ~1-5 ms;之前是 PowerShell `Set-Clipboard` 100-300 ms 冷啟動 + 150 ms async settle sleep)| PyObjC `NSPasteboard.setString_forType_()`(v0.7.2+,~1 ms 同步);AppKit 沒裝時 fallback 到 `pbcopy` 子程序 | `xclip` (X11) / `wl-copy` (Wayland) |
 | **Paste 模擬** | ctypes `SendInput` Ctrl+V(IME-proof) | `osascript` 透過 System Events 發 Cmd+V(Accessibility 綁系統 binary,不會因 pyenv 切版漂移) | `xdotool key ctrl+v` (X11) / `ydotool` 或 `wtype` (Wayland) |
 | **預設觸發鍵** | `{Key.alt_gr, Key.ctrl_r}` | `{Key.alt_r}` (Right Option) | 預定 `{Key.alt_r}` |
 | **Native lib 註冊** | NVIDIA cuDNN/cuBLAS DLL 路徑 | n/a(回 0) | NVIDIA(同 Win) |
@@ -767,6 +799,45 @@ STT_MODEL   = _DEFAULT_MODEL        # 對應 platform 的 default model 字串
 
 ---
 
+## 測試
+
+v0.7.2 起 `tests/` 內有 pytest 回歸 test,主要防護:
+
+1. **設定回歸**:`__version__` / `MIN_AUDIO_SEC` / `MAX_AUDIO_SEC` / `POLISH_LANGUAGES` 被改回舊值會立刻失敗 — 避免 v0.7.2 修好的 correctness fix(C1-C5)被 silent rollback
+2. **狀態機**:`_on_press` / `_on_release` / `_audio_callback` / `_transcribe_and_emit` 的狀態轉移、drain delay、busy log + buffer clear、MAX_AUDIO_SEC auto-stop 全部有 test;backend / polisher / pasteboard 走 `unittest.mock.MagicMock`,**不需 GPU 也不載模型**
+3. **`_trim_silence`**:tight clip 不變、靜音 pad 被剝掉、純靜音回空、太短 clip pass-through
+4. **Polish quality 回歸 bench**:18 個來自 README v0.7.0 投資紀錄的 failure case(`commit` → `push`、「更慢」→「更快」、`_USE_TORCH_COMPILE` underscore 被吞、「幫我」→「幫你」、`prebuilt wheel` → 「預建的輪子」等)固化為 fixture(`tests/fixtures/polish_cases.json`),每 case 有 `must_contain` / `must_not_contain` / `max_edit_ratio` 規則。**Skip-by-default** 因為要載 8 GB 模型;本地驗證 polish model 升版或 transformers bump 沒回歸時跑
+
+### 跑測試
+
+```bash
+pip install pytest  # 唯一額外依賴(numpy + sounddevice + pynput + opencc 是 runtime 依賴,已裝)
+
+# 狀態機 + 設定 + silence trim(18 個 test,~3 秒,不載模型)
+python -m pytest tests/ -v
+
+# 加跑 polish 回歸 bench(載 Qwen3-4B,~30 秒 warmup + 每 case ~1-3 秒)
+python -m pytest tests/ -v --run-polish-bench
+# 或環境變數:HOME_STT_RUN_POLISH_BENCH=1 python -m pytest tests/ -v
+```
+
+### CI
+
+`.github/workflows/tests.yml` 在 push / PR 到 main 時跑:
+- **Matrix**:Windows + macOS × Python 3.10 + 3.12
+- **跑什麼**:狀態機 + 設定 + silence trim(polish bench 預設 skip,避免 CI runner 載 8 GB 模型)
+- **時間**:每 OS × py 組合 ~5 秒
+
+### 手動 smoke 測試
+
+`tests/smoke_clipboard.py` 是 ctypes Windows clipboard 的 round-trip 測試(zh-TW、識別符號、emoji surrogate pair、1000 字壓力),會短暫覆蓋系統 clipboard 然後還原。不是 pytest 因為動到真實系統狀態。跑法:
+
+```powershell
+python tests\smoke_clipboard.py
+```
+
+---
+
 ## Roadmap
 
 ### 平台支援
@@ -821,5 +892,6 @@ STT_MODEL   = _DEFAULT_MODEL        # 對應 platform 的 default model 字串
 
 - [x] **v0.7.0 polish quality 升級** — Win/Linux 預設改 `Qwen3-4B-Instruct-2507`(對齊 Mac),修掉 Qwen2.5-1.5B 的英文翻譯 / 主詞改變 / 事實反向問題。詳見 [v0.7.x 投資紀錄](#v07x-效能與品質投資紀錄)
 - [x] **v0.7.1 polish decode lossless 加速** — PLD + 預 cache POLISH_PROMPT KV + cuDNN benchmark。長文 polish -55%(4.26s → 1.90s),quality byte-identical 對照 v0.7.0
-- [ ] **v0.8.0 ASR latency** — transformers + qwen-asr stack 在 v0.7.1 已是 ceiling。要再進步候選:flash-attn compile from source(~1.5x)、llama.cpp + GGUF Q8_0 backend swap(~2-3x)、vLLM streaming via WSL2。詳見 `plan-v0.8.0-asr-latency.md`(實作前 review)
+- [x] **v0.7.2 correctness sweep + clipboard direct API + dynamic budgets** — multi-agent review (`review-v0.7.1.md`) 後的工程交付。3 個 correctness fix (尾音 drain / busy log + buffer clear / `MAX_AUDIO_SEC=120`) + RMS silence trim (防 Qwen3-ASR LLM-backbone silence hallucination) + ctypes Win clipboard + PyObjC NSPasteboard 取代 subprocess(**每次 paste 省 ~250-450 ms**) + polish dynamic `max_tokens` + truncation detection + `POLISH_LANGUAGES` 收斂到 zh-only + `MIN_AUDIO_SEC` 0.3→0.15。同步加 `tests/`(18 個狀態機 test + 18 個 polish 回歸 case + GH Actions Win+Mac matrix)防回歸。詳見 [v0.7.2 投資紀錄](#v07x-效能與品質投資紀錄)
+- [ ] **v0.8.0 ASR latency** — transformers + qwen-asr stack 在 v0.7.1 已是 ceiling。要再進步候選:**press-time encoder pipelining**(背景 thread 在用戶講話時就跑 encoder,鬆手只算 decoder ~50% 體感延遲改善,不需換 stack;multi-agent review 發現的新方向)、flash-attn compile from source(~1.5x)、llama.cpp + GGUF Q8_0 backend swap(~2-3x)、vLLM streaming via WSL2。詳見 `plan-v0.8.0-asr-latency.md`(實作前 review)
 - [ ] **Polish KV 量化 / FP8 model swap** — Qwen3-4B-Instruct-2507-FP8 官方 ship,RTX 5080 有 native FP8 tensor cores,預估再 1.5-1.9x polish decode。風險:transformers FP8 path 較新,要驗證沒退回 dequant 路徑。留 v0.7.x 探索
