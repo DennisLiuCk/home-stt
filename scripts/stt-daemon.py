@@ -81,7 +81,7 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 
 # ---------------------------------------------------------------------------
@@ -210,18 +210,38 @@ POLISH_LANGUAGES = {"zh"}
 # "looks-similar" words, restructures sentences). Earlier iteration loaded
 # the prompt with detailed rules + 3 few-shot examples (~600 chars) which
 # fixed correctness but tripled prefill cost on every polish call. This
-# lean form keeps the essential bans + one example. Trade-off accepted:
+# lean form keeps the essential bans + two examples. Trade-off accepted:
 # polish may occasionally over-edit on edge cases, but per-call prefill
-# is much cheaper (~150 chars → ~100 tokens vs 600 → 400 tokens).
+# is much cheaper (~210 chars → ~140 tokens vs 600 → 400 tokens).
+#
+# v0.7.4: addressed asymmetric punctuation rule (補標點 but no 禁刪標點)
+# that let Qwen3-4B drop句末「。」between sentences. Symptom from live
+# stt-daemon.log on 2026-05-24: ASR raw "...小問題。我發現..." → polished
+# "...小問題 我發現..." (period replaced with space, two sentences merged).
+# Three reinforcing changes — single-axis fixes proved insufficient in
+# bench (negative constraint alone left 4/5 punct cases still failing):
+#   (a) Front-loaded positive constraint "原有標點(。？！，)完整保留"
+#       on line 1 where the model pays most attention,
+#   (b) Negative constraint "刪除或替換原有標點" in 嚴禁 line,
+#   (c) Second few-shot example showing period-preservation behavior on
+#       multi-sentence input — strongest signal for instruction-tuned
+#       models per the prior in-context-learning literature.
+# Regression-guarded by 5 punctuation_preservation cases in
+# tests/fixtures/polish_cases.json. Triggered by user noticing「過去有
+# 標點符號,現在沒有」during dictation.
 POLISH_PROMPT    = (
-    "把口語逐字稿做最小修飾。\n"
+    "把口語逐字稿做最小修飾。原有標點(。？！，)完整保留。\n"
     "只移除贅字(呃、嗯、就是、那個、然後、嘛、啊)、修立即重複(我我我→我)、補必要標點。\n"
-    "嚴禁:翻譯英文(commit/push/function 等保留)、改動詞、替換陌生詞(看似錯字也照樣輸出)、加新詞、改句式。\n"
+    "嚴禁:翻譯英文(commit/push/function 等保留)、改動詞、替換陌生詞(看似錯字也照樣輸出)、加新詞、改句式、刪除或替換原有標點。\n"
     "中文一律繁體。只輸出修飾後文字,不解釋、不加引號、不加前綴。\n"
     "\n"
-    "範例:\n"
+    "範例 1:\n"
     "輸入:呃我覺得這個 Python function 可以再優化\n"
-    "輸出:我覺得這個 Python function 可以再優化"
+    "輸出:我覺得這個 Python function 可以再優化\n"
+    "\n"
+    "範例 2:\n"
+    "輸入:我剛剛測試了一下。發現一個問題。\n"
+    "輸出:我剛剛測試了一下。發現一個問題。"
 )
 
 # Set of pynput Key/character triggers to listen for as hold-to-record keys.

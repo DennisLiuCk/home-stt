@@ -32,7 +32,7 @@ from pynput.keyboard import Key
 # ---------------------------------------------------------------------------
 
 def test_version_bumped(fresh_daemon):
-    assert fresh_daemon.__version__ == "0.7.3"
+    assert fresh_daemon.__version__ == "0.7.4"
 
 
 def test_polish_languages_is_zh_only(fresh_daemon):

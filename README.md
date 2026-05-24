@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.7.3-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.7.4-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -563,6 +563,35 @@ v0.7.3 是**第二次 bench-first save**(第一次是 v0.7.x 的 GPU mel patch r
 2. **Plan-vs-actual 數據要寫進 commit message + README** — 不止防回歸,也防未來重複犯同樣的錯
 3. **建好框架但不 enable** 是合理的 ship 方式 — 比拆掉重建好,也誠實 (用戶 opt-in 才付代價)
 4. 真正的 latency 瓶頸在 decoder。下一輪優化從 decoder 下手 (llama.cpp、FP8、speculative decode 對小模型的可行性)
+
+#### v0.7.4 — Polish prompt 標點保留修正 (live-log discovered, bench-validated)
+
+**Symptom**:用戶在實際 dictation 中發現中文標點在 polish 後**不一致地**被刪除 — 短句保留、多句中間的「。」被吃掉換成空格或直接消失。`%TEMP%/stt-daemon.log` 證據:
+```
+raw:      我剛剛在測試這個工具的過程中，發現了一個小問題。我發現中文的輸出都沒有標點符號。
+polished: 我剛剛在測試這個工具的過程中發現了一個小問題 中文的輸出都沒有標點符號
+                                                ^                                ^
+                                                「。」變空格                    句尾「。」消失
+```
+
+**Root cause**:POLISH_PROMPT 規則不對稱 — 只說「**補**必要標點」(正向、處理缺漏),從沒禁止「**刪**原有標點」(負向、處理多餘)。Qwen3-4B-Instruct-2507 把「最小修飾」解讀為流暢度優化,把句末「。」當成可合併的單字元編輯,**特別是多句長輸入**。短句 + ？/，多半保留;長段 + 「。」 隔開的多句就遭殃。
+
+**修正過程** — 單軸修法在 bench 中證實不足,需三軸並進:
+
+| 嘗試 | bench 結果 |
+|------|------------|
+| (僅) 加 `刪除或替換原有標點` 進 嚴禁 list | 4/5 punct case 仍 fail — 4B 模型忽略埋在第三行末尾的負向約束 |
+| (僅) 加正向約束 `原有標點(。？！，)完整保留` 到第一行 | 未獨立測,但結合其他軸 OK |
+| (僅) 加多句保留 few-shot example | 未獨立測 |
+| **三軸並進 (正向 + 負向 + example)** | **5/5 punct case 過、原 18 case 零回歸、bench 23/23 全綠** |
+
+**Lesson**:對 4B 等級 instruction-tuned 模型,要改變「default rewriting」這種強先驗行為,光加負向 constraint 不夠 — 需要 (a) 把約束**前置**到 prompt 第一行 (model attention 集中區)、(b) 給**具體 example** 展示期望行為 (few-shot signal 比 negative constraint 強)、(c) 同時保留**負向 constraint** 作雙重保險。
+
+**Side fix**:順手修了 `id_underscore_prefix` fixture 的 substring-match bug (`"USE_TORCH_COMPILE 設成"` 是 `"_USE_TORCH_COMPILE 設成"` 的子字串、即使 `_` 被正確保留也會 false-positive 失敗;改用 `" USE_TORCH_COMPILE"` leading-space pattern 精確偵測 underscore 被刪)。修完 bench 由 22/23 → 23/23 真正全綠。
+
+**Investment**:~1 hr (log 分析 + prompt 三輪迭代 + 5 個 fixture case + bench 三輪 + 1 個 side fixture fix)。Prefill cost 從 ~110 token → ~140 token (+27%) per polish,但 prefix-cache 吃掉、首次以外的 latency 影響零。
+
+**為什麼這個 bug 拖到 v0.7.4 才發現**:v0.7.0 換 polish model 到 Qwen3-4B-Instruct-2507 時,18 個 quality bench case 全部是 single-sentence 或無標點輸入。沒有任何 case 測 multi-sentence punctuation。**Bench 沒覆蓋的行為就會被悄悄迴歸。** 5 個新 case 補進 fixture 之後現在有了。
 
 ### 提示音說明
 

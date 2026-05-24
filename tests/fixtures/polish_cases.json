@@ -1,11 +1,11 @@
 {
   "_meta": {
-    "purpose": "Regression fixture for the v0.7.0 polish-quality investigation.",
-    "context": "These are the failure modes that pushed home-stt back from Qwen2.5-1.5B to Qwen3-4B-Instruct-2507 as the default polish model. Each case captures one class of error that smaller / less-instruction-following models produced, with assertion rules the *correct* (current) polish output must satisfy.",
-    "source": "README.md §'v0.7.x 效能與品質投資紀錄' + commits 676553a, 3d7ae7d, 23c8d07.",
+    "purpose": "Regression fixture for the v0.7.0 polish-quality investigation + v0.7.4 punctuation-preservation fix.",
+    "context": "These are the failure modes that pushed home-stt back from Qwen2.5-1.5B to Qwen3-4B-Instruct-2507 as the default polish model. Each case captures one class of error that smaller / less-instruction-following models produced, with assertion rules the *correct* (current) polish output must satisfy. v0.7.4 added punctuation_preservation cases after live log evidence showed the asymmetric prompt (補標點 but no 禁刪標點) let the model strip 。between sentences.",
+    "source": "README.md §'v0.7.x 效能與品質投資紀錄' + commits 676553a, 3d7ae7d, 23c8d07. Punctuation cases from %TEMP%/stt-daemon.log analysis on 2026-05-24.",
     "schema": {
       "id": "stable case id",
-      "category": "one of: english_keyword | identifier_fidelity | semantic_fidelity | subject_preservation | overformalization | no_english_translation | filler_removal | repetition_fix",
+      "category": "one of: english_keyword | identifier_fidelity | semantic_fidelity | subject_preservation | overformalization | no_english_translation | filler_removal | repetition_fix | punctuation_preservation",
       "input": "raw ASR output (post-OpenCC TW, pre-polish)",
       "must_contain": "substrings the polished output MUST contain (English keywords, identifiers, etc.)",
       "must_not_contain": "substrings that MUST NOT appear (translations, wrong subjects, fact reversals, etc.)",
@@ -38,8 +38,8 @@
       "category": "identifier_fidelity",
       "input": "把 _USE_TORCH_COMPILE 設成 True 試試",
       "must_contain": ["_USE_TORCH_COMPILE"],
-      "must_not_contain": ["USE_TORCH_COMPILE 設成"],
-      "note": "Qwen2.5-0.5B dropped the underscore prefix. Identifiers are opaque tokens — must be preserved byte-for-byte."
+      "must_not_contain": [" USE_TORCH_COMPILE"],
+      "note": "Qwen2.5-0.5B dropped the underscore prefix. Identifiers are opaque tokens — must be preserved byte-for-byte. must_not_contain uses LEADING SPACE before USE_ to detect underscore stripping specifically: input has ' _USE_...' (space-underscore-U), so a model that preserves '_' produces no ' U' substring (it's ' _U'); a model that strips '_' produces ' U' which matches. v0.7.4 fixture fix: prior 'USE_TORCH_COMPILE 設成' substring was a superstring of '_USE_TORCH_COMPILE 設成' and false-positived even when '_' was preserved."
     },
     {
       "id": "id_snake_case",
@@ -165,6 +165,44 @@
       "must_contain": ["好"],
       "max_edit_ratio": 0.5,
       "note": "v0.7.2 O7: short responses like 「好」 must now reach polish (they were silent-rejected by MIN_AUDIO_SEC=0.3 before). Already-clean input should pass through near-untouched."
+    },
+    {
+      "id": "punct_period_between_sentences",
+      "category": "punctuation_preservation",
+      "input": "我剛剛在測試這個工具的過程中，發現了一個小問題。我發現中文的輸出都沒有標點符號。",
+      "must_contain": ["小問題。", "標點符號。"],
+      "note": "v0.7.4 trigger case (verbatim from %TEMP%/stt-daemon.log 2026-05-24). The pre-v0.7.4 prompt's asymmetric rule (補必要標點 but no 禁刪標點) let Qwen3-4B drop the inter-sentence「。」and merge two sentences with a space. Both periods must survive — they delimit speaker intent."
+    },
+    {
+      "id": "punct_period_long_multi_sentence",
+      "category": "punctuation_preservation",
+      "input": "目前我輸出的文字都是透過這個工具來輸出。你可以發現前面的句子是沒有標點符號，後面又突然出現標點符號，請幫我分析一下。",
+      "must_contain": ["輸出。", "分析一下。"],
+      "max_edit_ratio": 0.35,
+      "note": "Longer multi-sentence case (pre-v0.7.4 polish stripped ALL period+comma on this input). Worst affected pattern in the live log; if this passes the prompt fix is working."
+    },
+    {
+      "id": "punct_sentence_ending_period",
+      "category": "punctuation_preservation",
+      "input": "讓我們先完成。",
+      "must_contain": ["。"],
+      "max_edit_ratio": 0.3,
+      "note": "Even single-sentence inputs lost their trailing「。」pre-v0.7.4 (log: 「讓我們先完成。」→「讓我們先完成」). Period must survive on shortest realistic case."
+    },
+    {
+      "id": "punct_question_mark_preservation",
+      "category": "punctuation_preservation",
+      "input": "你可以透過 GH CLI 來確認 pipeline 的執行狀況嗎？",
+      "must_contain": ["GH CLI", "pipeline", "嗎？"],
+      "note": "？ was already mostly preserved pre-v0.7.4 (no log regression seen), but added as defensive regression guard now that punctuation is in the bench's scope."
+    },
+    {
+      "id": "punct_mixed_punctuation_dense",
+      "category": "punctuation_preservation",
+      "input": "是我需要有講話有停頓，然後才會有標點符號，還是其他原因？",
+      "must_contain": ["停頓", "符號", "原因？"],
+      "max_edit_ratio": 0.25,
+      "note": "Multiple ，inside one sentence + ？at end. The 然後 filler may go (allowed by prompt) but commas surrounding the kept content + the final ？ must survive. Regression guard for the prompt change not over-suppressing legitimate filler removal."
     }
   ]
 }
