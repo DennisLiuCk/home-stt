@@ -27,6 +27,14 @@ class Pasteboard(ABC):
     """
 
     default_trigger_keys: set  # must be set by subclasses
+    # v0.7.5: per-platform default voice-edit trigger. Distinct from
+    # default_trigger_keys (dictate) so the two modes don't overlap.
+    # Win: Key.f13 (full-size keyboards almost universally have it,
+    # unbound from OS shortcuts; TKL / laptop users override).
+    # Mac: Key.cmd_r (Right Command — symmetric to Right Option dictate
+    # trigger, exists on all Mac keyboards including MacBook, doesn't
+    # interfere with Option-dead-key composition like Left Option would).
+    default_edit_trigger_keys: set  # must be set by subclasses
 
     @abstractmethod
     def set_text(self, text: str) -> bool:

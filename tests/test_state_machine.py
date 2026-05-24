@@ -712,15 +712,20 @@ def _install_edit_mocks(daemon_mod, *, seqno_bumps: bool = True,
 
 
 def test_edit_trigger_distinct_from_dictate_trigger(fresh_daemon):
-    """EDIT_TRIGGER_KEYS_DEFAULT must not overlap with the known
-    platform-default dictate triggers — overlap would create routing
-    ambiguity in `_on_press` (both is_edit and is_dictate true)."""
-    known_dictate_defaults = {Key.alt_r, Key.alt_gr, Key.ctrl_r}
-    assert fresh_daemon.EDIT_TRIGGER_KEYS_DEFAULT.isdisjoint(
-        known_dictate_defaults
+    """Pasteboard's per-platform default_edit_trigger_keys must not
+    overlap with default_trigger_keys (dictate) — overlap would create
+    routing ambiguity in `_on_press` (both is_edit and is_dictate true).
+
+    Checks the REAL pasteboard subclass for the current platform (Win
+    or Mac), not a mock — this is a per-platform contract assertion."""
+    from stt_platform import build_pasteboard
+    pb = build_pasteboard()
+    assert pb.default_edit_trigger_keys.isdisjoint(
+        pb.default_trigger_keys
     ), (
-        f"EDIT_TRIGGER_KEYS_DEFAULT={fresh_daemon.EDIT_TRIGGER_KEYS_DEFAULT} "
-        f"overlaps with dictate defaults {known_dictate_defaults}"
+        f"default_edit_trigger_keys={pb.default_edit_trigger_keys} "
+        f"overlaps with default_trigger_keys={pb.default_trigger_keys} "
+        f"on {type(pb).__name__}"
     )
 
 

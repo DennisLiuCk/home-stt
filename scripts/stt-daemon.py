@@ -258,17 +258,15 @@ TRIGGER_KEYS: set | None = None
 # in text_polisher.py) → result replaces the selection via paste →
 # original clipboard restored.
 #
-# Default trigger is Key.f13 on BOTH platforms (cross-platform parity).
-# F13 is unmapped on almost every keyboard's OS shortcuts and won't
-# collide with TRIGGER_KEYS defaults (alt_gr/ctrl_r on Win, alt_r on Mac).
-# Caveat: most modern MacBook keyboards don't have a physical F13 key —
-# Mac users override e.g. `EDIT_TRIGGER_KEYS = {Key.alt_l}` (Left Option,
-# different from Right Option used for dictate).
+# `None` here means "use platform default" — Win: {Key.f13}, Mac:
+# {Key.cmd_r} (Right Command, symmetric to Right Option dictate trigger;
+# defaults defined per-platform in stt_platform_{win,mac}.py to mirror
+# the existing default_trigger_keys pattern). Set explicitly to an
+# empty set `set()` to DISABLE voice-edit entirely.
 #
-# `None` here means "use EDIT_TRIGGER_KEYS_DEFAULT". Set explicitly to
-# an empty set `{}` to DISABLE voice-edit entirely (no trigger registered).
+# Caveat: F13 only exists on full-size Win keyboards (TKL / laptop users
+# override). Right Command exists on all Mac keyboards including MacBook.
 EDIT_TRIGGER_KEYS: set | None = None
-EDIT_TRIGGER_KEYS_DEFAULT = {Key.f13}
 SELECTION_CAPTURE_WAIT_S  = 0.1   # post-Cmd+C wait before checking seqno
 
 # ---------------------------------------------------------------------------
@@ -1838,10 +1836,11 @@ def main() -> None:
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
-    # v0.7.5: apply EDIT_TRIGGER_KEYS default. `None` = use platform default;
-    # explicit empty set `{}` = disabled (no edit trigger registered).
+    # v0.7.5: apply EDIT_TRIGGER_KEYS default. `None` = use platform
+    # default (Win: F13, Mac: Right Cmd — defined in WindowsPasteboard
+    # / MacOSPasteboard subclasses). Explicit `set()` = disabled.
     if EDIT_TRIGGER_KEYS is None:
-        EDIT_TRIGGER_KEYS = EDIT_TRIGGER_KEYS_DEFAULT
+        EDIT_TRIGGER_KEYS = _pasteboard.default_edit_trigger_keys
 
     print(f"[stt] warming up on {_backend.device_label}...", flush=True)
     t0 = time.time()

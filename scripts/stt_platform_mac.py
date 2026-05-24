@@ -172,6 +172,13 @@ def _get_clipboard_via_nspasteboard() -> str | None:
 
 class MacOSPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_r}
+    # v0.7.5 voice-edit default — Right Command. Symmetric to Right
+    # Option dictate trigger (both next to space bar), exists on all
+    # Mac keyboards including MacBook (unlike F13 which only exists
+    # on Magic Keyboard with Numpad), and doesn't interfere with
+    # Option-dead-key composition (Left Option does — would block
+    # typing é/è/ñ etc.).
+    default_edit_trigger_keys = {Key.cmd_r}
 
     # Virtual key codes for the Quartz path. Constants don't change.
     _CMD_KEYCODE = 55  # kVK_Command (left command — either side works)

@@ -599,17 +599,20 @@ polished: 我剛剛在測試這個工具的過程中發現了一個小問題 中
 
 **用法**:
 1. 在任何 app 選取文字
-2. 按住 **F13**(`EDIT_TRIGGER_KEYS` 預設值)講指令 — 例如「改成正式語氣」「translate to English」「縮短」「改寫成命令句」
-3. 放開 F13 → daemon 把選取文字 + 指令送進 polish LLM(同 Qwen3-4B,不同 prompt)→ 結果取代選取
+2. 按住 **edit trigger**(Win 預設 F13、Mac 預設 Right Command)講指令 — 例如「改成正式語氣」「translate to English」「縮短」「改寫成命令句」
+3. 放開 → daemon 把選取文字 + 指令送進 polish LLM(同 Qwen3-4B,不同 prompt)→ 結果取代選取
 4. 原 clipboard 自動還原(`try/finally` 保證)
+
+**平台預設(per-platform,定義在 `stt_platform_{win,mac}.py` 的 `default_edit_trigger_keys`)**:
+- **Win**: `{Key.f13}` — full-size 鍵盤幾乎都有 F13,不衝突任何 OS 快捷;TKL/筆電鍵盤沒 F13 需要 override
+- **Mac**: `{Key.cmd_r}` — Right Command,跟 Right Option(dictate)在 space 右側對稱、所有 Mac 鍵盤都有(含 MacBook),且不會跟 Left Option 的死鍵(`Option+e` → é 等)衝突
 
 **設定範例**(在 `scripts/stt-daemon.py` 頂端):
 ```python
-# 預設 F13 不論平台 — full-size 鍵盤幾乎不衝突,但 MacBook 通常沒實體 F13 key:
-EDIT_TRIGGER_KEYS = {Key.f13}                # 預設
-EDIT_TRIGGER_KEYS = {Key.alt_l}              # Mac 沒 F13 可選 Left Option
-EDIT_TRIGGER_KEYS = {Key.menu}               # Win Menu 鍵
-EDIT_TRIGGER_KEYS = None                     # 用平台預設 (Key.f13)
+EDIT_TRIGGER_KEYS = None                     # 用平台預設(Win: F13 / Mac: Right Cmd)
+EDIT_TRIGGER_KEYS = {Key.f13}                # 強制 F13 不論平台
+EDIT_TRIGGER_KEYS = {Key.cmd_r}              # 強制 Right Command(Mac)
+EDIT_TRIGGER_KEYS = {Key.menu}               # Win 沒 F13 的 TKL 鍵盤可選 Menu 鍵
 EDIT_TRIGGER_KEYS = set()                    # 停用 voice-edit
 ```
 
