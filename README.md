@@ -282,6 +282,12 @@ home-stt start
 
 之後 `home-stt {start,stop,restart,status,log,config}` 在任何目錄都能跑,雙平台語法一致。
 
+> ⚠️ **Windows 安裝兩個小坑(踩過留紀念,別重複)**:
+> 1. **`pip install -e .` 寫不進 `C:\Python<X>\Scripts`**:Python 裝在 all-users 路徑(`C:\Python312\` 等)時,Scripts 目錄預設沒寫權限,pip 會炸 `WARNING: Failed to write executable ... WinError 2` 然後 `ERROR: Could not install`(訊息誤導,實際是權限不足、不是檔案不見)。加 `--user`:`pip install -e . --user`;或用 venv 也行。
+> 2. **`--user` 裝完 entry point 不在 PATH 上**:`home-stt.exe` 會放到 `%APPDATA%\Python\Python<X>\Scripts\`,該路徑**預設不在 PATH**,直接打 `home-stt` 找不到。永久加進去:`setx PATH "%PATH%;%APPDATA%\Python\Python312\Scripts"`(Python 版本對齊你裝的)後**重開終端機**才生效;或當下用 `& "$env:APPDATA\Python\Python312\Scripts\home-stt.exe" status` 全路徑跑。
+>
+> 不想 pip install 也可以,直接 `python scripts\home_stt.py {start,stop,status,...}` 跑同一個 CLI(下方 `.\scripts\stt-start.ps1` 是更底層、只負責 spawn daemon 的版本)。
+
 也可以直接執行底層腳本(不想 pip install / 偏好顯式呼叫):
 
 ```powershell

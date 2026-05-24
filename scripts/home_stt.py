@@ -23,6 +23,17 @@ import tempfile
 import time
 from pathlib import Path
 
+# Daemon log + polish startup line contain non-ASCII (zh transcripts, ≤ in
+# polish banner). Windows default console codepage (cp950 on zh-TW) cannot
+# encode these and would raise UnicodeEncodeError. Force UTF-8 on stdout/err.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 DAEMON_SCRIPT = SCRIPTS_DIR / "stt-daemon.py"
 PID_FILE = SCRIPTS_DIR / "stt-daemon.pid"
