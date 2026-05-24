@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON="$SCRIPT_DIR/stt-daemon.py"
 PID_FILE="$SCRIPT_DIR/stt-daemon.pid"
 LOG_DIR="${TMPDIR:-/tmp}"
+LOG_DIR="${LOG_DIR%/}"
 LOG_FILE="$LOG_DIR/stt-daemon.log"
 ERR_FILE="$LOG_DIR/stt-daemon.err.log"
 
