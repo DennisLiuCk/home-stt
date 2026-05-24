@@ -57,6 +57,46 @@ def _format_polish_user_msg(text: str) -> str:
     return f"請修飾以下逐字稿:\n{text}"
 
 
+# v0.7.5: voice-edit mode prompt. Bilingual because instruction can be
+# either language and selection can be any language. The load-bearing
+# sentence is "輸出語言預設與選取的文字相同;若指令明確要求換語言則依
+# 指令" — phrasing it as "default unless explicit override" is more
+# robust than "always match selection" (loses translation) or "always
+# follow instruction" (loses no-explicit-language case). Bilingual
+# (zh + en) covers the case where a Chinese-only system prompt + English
+# instruction leaks Chinese-flavoured English into the output.
+EDIT_PROMPT = (
+    "你是文字編輯助手。使用者會給你一段「選取的文字」與一段「指令」。\n"
+    "依照指令修改選取的文字,只輸出修改後的結果。\n"
+    "輸出語言預設與選取的文字相同;若指令明確要求換語言"
+    "(例如「translate to English」「改成中文」「翻成日文」),則依指令。\n"
+    "保留原本的英文技術詞彙(commit/push/function 等)與識別字"
+    "(_USE_FOO 等),除非指令明確要求翻譯。\n"
+    "不解釋、不加引號、不加前綴。\n"
+    "\n"
+    "You are a text editor. The user gives you SELECTION and INSTRUCTION.\n"
+    "Apply the instruction to the selection and output ONLY the modified text.\n"
+    "Default output language = selection's language. Switch only if the "
+    "instruction explicitly says so.\n"
+    "Preserve English tech terms and identifiers verbatim unless the "
+    "instruction explicitly translates them.\n"
+    "No explanations, no quotes, no prefixes."
+)
+
+
+def _format_edit_user_msg(selection: str, instruction: str) -> str:
+    """Build the user-role message for voice-edit. Tag-wrapped
+    (<selection>...<instruction>...) so the model sees clear data
+    boundaries vs. asking it to compose free-form text.
+
+    Output kept agnostic of which polish backend reads it — same helper
+    serves MLX + Torch + any future cloud impl."""
+    return (
+        f"<selection>\n{selection}\n</selection>\n\n"
+        f"<instruction>\n{instruction}\n</instruction>"
+    )
+
+
 class TextPostProcessor(ABC):
     """Polish raw ASR text. Implementations may transform, leave unchanged,
     or fail-safely return the input. Must NEVER raise — failure modes are
@@ -66,6 +106,19 @@ class TextPostProcessor(ABC):
     @abstractmethod
     def polish(self, text: str) -> str:
         """Return polished text. Return input unchanged on any failure."""
+
+    @abstractmethod
+    def edit(self, selection: str, instruction: str) -> str | None:
+        """v0.7.5 voice-edit: apply `instruction` to `selection` and
+        return the modified text. Return None on ANY failure — caller
+        (daemon `_transcribe_and_emit_edit`) treats None as 'abort, do not
+        paste anything'. Different failure semantics from polish() — for
+        polish, silently returning the input is the right UX (filler
+        removal failure → paste the raw transcript). For edit, pasting
+        the input back would simulate a no-op that consumed the user's
+        edit gesture and the original selection would be replaced with
+        itself, which is silently confusing. Explicit None lets the caller
+        play a failure beep and abort cleanly."""
 
     @property
     def device_label(self) -> str:
@@ -83,6 +136,14 @@ class NoopPolisher(TextPostProcessor):
 
     def polish(self, text: str) -> str:
         return text
+
+    def edit(self, selection: str, instruction: str) -> str | None:
+        """Voice-edit is meaningless without an LLM (it's the LLM that
+        does the editing). Return None so the daemon plays the fail beep
+        instead of silently pasting the selection back unchanged. The
+        daemon startup log should warn the user if POLISH_ENABLED=False
+        but EDIT_TRIGGER_KEYS is set."""
+        return None
 
 
 class MlxLocalLlmPolisher(TextPostProcessor):
@@ -121,40 +182,66 @@ class MlxLocalLlmPolisher(TextPostProcessor):
     def device_label(self) -> str:
         return f"{self._model_name} (MLX, ≤{self._max_tokens} tok)"
 
+    def _run_generation(self, system_prompt: str, user_msg: str,
+                        max_tokens: int) -> str:
+        """v0.7.5: shared inference path for polish() and edit(). Builds
+        messages → chat template → generate → decode → quote-strip.
+        Raises on backend failure — caller decides what to log/return."""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        prompt = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        response = self._generate(
+            self._model, self._tokenizer, prompt=prompt,
+            max_tokens=max_tokens, verbose=False,
+        )
+        out = (response or "").strip()
+        # Best-effort guard: some models occasionally wrap output in quotes
+        # despite the prompt. Strip a single matched pair. Shared across
+        # polish + edit because both system prompts forbid quoting.
+        if (out.startswith('"') and out.endswith('"')) or \
+           (out.startswith("「") and out.endswith("」")):
+            out = out[1:-1].strip() or out
+        return out
+
     def polish(self, text: str) -> str:
         text = text.strip()
         if not text:
             return text
         try:
-            messages = [
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": _format_polish_user_msg(text)},
-            ]
-            prompt = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+            polished = self._run_generation(
+                self._system_prompt,
+                _format_polish_user_msg(text),
+                self._max_tokens,
             )
-            response = self._generate(
-                self._model,
-                self._tokenizer,
-                prompt=prompt,
-                max_tokens=self._max_tokens,
-                verbose=False,
-            )
-            polished = (response or "").strip()
-            if not polished:
-                return text
-            # Best-effort guard: some models occasionally wrap output in
-            # quotes despite the prompt. Strip a single matched pair.
-            if (polished.startswith('"') and polished.endswith('"')) or \
-               (polished.startswith("「") and polished.endswith("」")):
-                polished = polished[1:-1].strip() or polished
-            return polished
+            return polished or text  # empty → degrade to raw ASR
         except Exception as e:
             print(f"[stt] polish failed, returning raw: {e}",
                   file=sys.stderr, flush=True)
             return text
+
+    def edit(self, selection: str, instruction: str) -> str | None:
+        """v0.7.5 voice-edit on MLX. Uses EDIT_PROMPT instead of the
+        polish system prompt. Budget heuristic differs from polish: edit
+        can EXPAND (e.g. "expand this", "translate from Chinese to English"
+        often grows length), so use 3× selection tokens floored at 256."""
+        selection = selection.strip()
+        instruction = instruction.strip()
+        if not selection or not instruction:
+            return None
+        user_msg = _format_edit_user_msg(selection, instruction)
+        # MLX tokenizer's encode returns a list — len() gives token count.
+        selection_tokens = len(self._tokenizer.encode(selection))
+        budget = max(256, min(int(selection_tokens * 3.0), self._max_tokens))
+        try:
+            out = self._run_generation(EDIT_PROMPT, user_msg, budget)
+            return out.strip() or None
+        except Exception as e:
+            print(f"[stt] edit failed: {e}", file=sys.stderr, flush=True)
+            return None
 
 
 class TorchLocalLlmPolisher(TextPostProcessor):
@@ -366,97 +453,154 @@ class TorchLocalLlmPolisher(TextPostProcessor):
     def device_label(self) -> str:
         return self._device_label
 
+    def _run_generation(self, system_prompt: str, user_msg: str,
+                        budget_fn, past_key_values=None) -> tuple[str, int, int, int]:
+        """v0.7.5: shared inference path for polish() and edit(). Returns
+        (text_post_quote_strip, input_len, n_new_tokens, last_token_id).
+        Caller computes the budget from input_len via `budget_fn` and
+        decides truncation/empty handling. Raises on backend failure —
+        caller picks the right log+return shape.
+
+        past_key_values=None means no prefix cache (cold inference path —
+        full system prompt prefills on every call). polish() passes a
+        deep-copy of self._prefix_cache for the pre-warmed common system
+        block; edit() passes None because its system prompt is different
+        from polish's and we don't pre-warm an edit-side cache (per
+        v0.7.5 plan §D — edit is called ~10× less than polish, prefix
+        cache cost wouldn't amortise)."""
+        # add_special_tokens=False: the chat template already inserts any
+        # BOS / role-marker tokens the model expects. For Qwen tokenizers
+        # add_bos_token defaults False so this is a no-op today, but
+        # Llama-family tokenizers auto-prepend <s> — without this flag,
+        # a future POLISH_MODEL swap to Llama-derived weights would
+        # silently produce double-BOS prompts and degrade quality with
+        # no error.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        prompt = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self._tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=False,
+        ).to(self._device)
+        input_len = inputs["input_ids"].shape[-1]
+        target_max = budget_fn(input_len)
+        # Reusing self._gen_config when the budget happens to equal the
+        # configured cap preserves the v0.7.1 micro-opt of not rebuilding
+        # GenerationConfig per call. Otherwise copy + override —
+        # sub-millisecond cost, negligible vs decode.
+        if target_max == self._gen_config.max_new_tokens:
+            gen_cfg = self._gen_config
+        else:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig(
+                **{**self._gen_config.to_dict(),
+                   "max_new_tokens": target_max},
+            )
+        with self._torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                past_key_values=past_key_values,
+                generation_config=gen_cfg,
+            )
+        new_tokens = outputs[0][input_len:]
+        n_new = int(new_tokens.shape[-1])
+        last_token = int(new_tokens[-1].item()) if n_new > 0 else -1
+        text = self._tokenizer.decode(
+            new_tokens, skip_special_tokens=True,
+        ).strip()
+        # Best-effort guard: some models occasionally wrap output in
+        # quotes despite the prompt. Strip a single matched pair. Shared
+        # across polish + edit because both system prompts forbid quoting.
+        if (text.startswith('"') and text.endswith('"')) or \
+           (text.startswith("「") and text.endswith("」")):
+            text = text[1:-1].strip() or text
+        return text, input_len, n_new, last_token
+
     def polish(self, text: str) -> str:
         import copy
         text = text.strip()
         if not text:
             return text
         try:
-            # Wrapper logic (request → data framing) lives in
-            # _format_polish_user_msg at module scope and is shared with
-            # MlxLocalLlmPolisher for cross-platform output consistency.
-            messages = [
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": _format_polish_user_msg(text)},
-            ]
-            prompt = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            # add_special_tokens=False: the chat template already inserts
-            # any BOS / role-marker tokens the model expects. For Qwen
-            # tokenizers add_bos_token defaults False so this is a no-op
-            # today, but Llama-family tokenizers auto-prepend <s> — without
-            # this flag, a future POLISH_MODEL swap to Llama-derived weights
-            # would silently produce double-BOS prompts and degrade quality
-            # with no error.
-            inputs = self._tokenizer(
-                prompt, return_tensors="pt", add_special_tokens=False,
-            ).to(self._device)
-            input_len = inputs["input_ids"].shape[-1]
             # v0.7.2: dynamic max_new_tokens. Polish is a "minimum-edit"
-            # task — output length ≈ input length. The previous static
-            # 256-token cap silently truncated outputs on stress inputs
-            # (~280-char zh utterances, where Qwen3 tokenizes ~1
-            # token/char). Now: budget ~1.2× input tokens, floored at 64
-            # for short clips and ceilinged at the configured max_tokens
-            # (still acts as the hard safety cap against runaway).
+            # task — output length ≈ input length. Budget ~1.2× input
+            # tokens, floored at 64 for short clips, ceilinged at the
+            # configured max_tokens (hard safety cap against runaway).
             #
-            # Reusing self._gen_config when the dynamic budget happens to
-            # equal the configured cap preserves the v0.7.1 micro-opt of
-            # not rebuilding GenerationConfig per call. Otherwise we copy
-            # + override — sub-millisecond cost, negligible vs decode.
-            target_max = max(64, min(int(input_len * 1.2), self._max_tokens))
-            if target_max == self._gen_config.max_new_tokens:
-                gen_cfg = self._gen_config
-            else:
-                from transformers import GenerationConfig
-                gen_cfg = GenerationConfig(
-                    **{**self._gen_config.to_dict(),
-                       "max_new_tokens": target_max},
-                )
             # v0.7.1: reuse pre-built prefix KV cache for the static
-            # system block. generate() infers cached length from
-            # past_key_values.get_seq_length() and only forwards the
-            # new (user + assistant_prompt + generated) tokens.
-            # deepcopy is required — DynamicCache mutates during decode,
-            # so each call needs its own copy to keep the prefix pristine.
-            pkv = copy.deepcopy(self._prefix_cache)
-            with self._torch.no_grad():
-                outputs = self._model.generate(
-                    **inputs,
-                    past_key_values=pkv,
-                    generation_config=gen_cfg,
-                )
-            new_tokens = outputs[0][input_len:]
-            n_new = int(new_tokens.shape[-1])
+            # system block. deepcopy required — DynamicCache mutates
+            # during decode, so each call needs its own copy.
+            polished, input_len, n_new, last_token = self._run_generation(
+                self._system_prompt,
+                _format_polish_user_msg(text),
+                budget_fn=lambda n: max(64, min(int(n * 1.2), self._max_tokens)),
+                past_key_values=copy.deepcopy(self._prefix_cache),
+            )
             # v0.7.2: truncation detection. If generate() hit the budget
             # AND the last emitted token isn't the chat terminator
             # (<|im_end|> for Qwen), the polish output is cut off mid-
             # sentence. Falling back to the raw ASR text is strictly
             # better than pasting a truncated sentence.
-            last_token = int(new_tokens[-1].item()) if n_new > 0 else -1
+            target_max = max(64, min(int(input_len * 1.2), self._max_tokens))
             if n_new >= target_max and last_token != self._pad_token_id:
                 print(f"[stt] polish truncated at {target_max} tok "
                       f"(input {input_len} tok); using raw ASR text",
                       file=sys.stderr, flush=True)
                 return text
-            polished = self._tokenizer.decode(
-                new_tokens, skip_special_tokens=True,
-            ).strip()
-            if not polished:
-                return text
-            # Best-effort guard: some models occasionally wrap output in
-            # quotes despite the prompt. Strip a single matched pair.
-            if (polished.startswith('"') and polished.endswith('"')) or \
-               (polished.startswith("「") and polished.endswith("」")):
-                polished = polished[1:-1].strip() or polished
-            return polished
+            return polished or text  # empty → degrade to raw ASR
         except Exception as e:
             print(f"[stt] polish failed, returning raw: {e}",
                   file=sys.stderr, flush=True)
             return text
+
+    def edit(self, selection: str, instruction: str) -> str | None:
+        """v0.7.5 voice-edit on Torch. Uses EDIT_PROMPT instead of polish's
+        system prompt, NO prefix cache (different system prompt — would
+        need its own cache, not worth amortising for ~10× lower call rate
+        than polish per plan §D).
+
+        Budget heuristic differs from polish: edit can EXPAND text
+        (e.g. "expand this", "translate from Chinese to English" often
+        grows length), so use 3× selection tokens floored at 256, capped
+        at self._max_tokens. The 3× ceiling handles "expand" + safety;
+        256 floor handles short selections + verbose instructions like
+        "translate to Chinese with explanation"."""
+        selection = selection.strip()
+        instruction = instruction.strip()
+        if not selection or not instruction:
+            return None
+        # Pre-compute selection token count for budget. Tokenize ONCE here
+        # then again inside _run_generation for the full prompt — small
+        # waste, but selection-only is the right unit for the heuristic
+        # (full prompt is system + selection + instruction; only selection
+        # bounds the output size).
+        selection_tokens = len(
+            self._tokenizer.encode(selection, add_special_tokens=False)
+        )
+        budget = max(256, min(int(selection_tokens * 3.0), self._max_tokens))
+        try:
+            text, _input_len, n_new, last_token = self._run_generation(
+                EDIT_PROMPT,
+                _format_edit_user_msg(selection, instruction),
+                budget_fn=lambda _: budget,
+                past_key_values=None,  # no prefix cache for edit
+            )
+            # Truncation handling for edit DIFFERS from polish: there's
+            # no coherent fallback (raw selection is the OLD text, not the
+            # edit output). Decision: log + return truncated result. User
+            # can re-trigger if they want.
+            if n_new >= budget and last_token != self._pad_token_id:
+                print(f"[stt] edit truncated at {budget} tok "
+                      f"(selection {selection_tokens} tok); "
+                      f"returning partial result",
+                      file=sys.stderr, flush=True)
+            return text.strip() or None
+        except Exception as e:
+            print(f"[stt] edit failed: {e}", file=sys.stderr, flush=True)
+            return None
 
 
 def build_polisher(

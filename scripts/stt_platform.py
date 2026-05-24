@@ -46,6 +46,42 @@ class Pasteboard(ABC):
         should print an actionable diagnostic to the main log before
         returning False (e.g. macOS Accessibility-permission hint)."""
 
+    # ----- v0.7.5 voice-edit selection capture ------------------------------
+    # These three methods support the voice-edit mode (⌥+E hotkey) where
+    # the daemon captures the current text selection from the focused app by
+    # round-tripping through the clipboard. See
+    # scripts/stt-daemon.py::_capture_selection for the orchestration that
+    # uses them.
+
+    @abstractmethod
+    def get_text(self) -> str | None:
+        """Read the current clipboard contents as a UTF-8 string. Return
+        None when the clipboard is empty, holds a non-text format (image,
+        file list, RTF), or any read error occurs. Implementations should
+        log low-level errors to stderr but NOT to the main log — the caller
+        (voice-edit selection capture) will decide what's user-actionable."""
+
+    @abstractmethod
+    def clipboard_seqno(self) -> int | None:
+        """Return the OS's clipboard sequence number (Win:
+        GetClipboardSequenceNumber, Mac: NSPasteboard.changeCount). The
+        value monotonically increases on every clipboard modification. The
+        daemon uses this to detect whether `simulate_copy` actually wrote
+        new content (seqno changed) vs. did nothing (seqno unchanged, no
+        selection in the focused app). Return None on the rare implementation
+        error — the caller treats this the same as 'no change detected'."""
+
+    @abstractmethod
+    def simulate_copy(self) -> bool:
+        """Simulate the COPY keystroke (Ctrl+C on Win, Cmd+C on Mac) so the
+        focused application puts its current selection onto the clipboard.
+        Return True iff the keystroke was delivered. Cross-platform parity
+        considerations are identical to `paste()` — on Mac requires
+        Accessibility permission for the Quartz path, falls back to osascript
+        otherwise. On False the daemon will report 'voice-edit: no selection
+        captured' since we can't distinguish 'keystroke not delivered' from
+        'app had no selection to copy' downstream."""
+
     def register_native_libs(self) -> int:
         """Optional: register native libs needed by STT backends (NVIDIA
         cuDNN/cuBLAS DLLs on Windows). Returns the number of paths added.

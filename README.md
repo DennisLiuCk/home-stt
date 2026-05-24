@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.7.4-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.7.5-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
 
@@ -592,6 +592,43 @@ polished: 我剛剛在測試這個工具的過程中發現了一個小問題 中
 **Investment**:~1 hr (log 分析 + prompt 三輪迭代 + 5 個 fixture case + bench 三輪 + 1 個 side fixture fix)。Prefill cost 從 ~110 token → ~140 token (+27%) per polish,但 prefix-cache 吃掉、首次以外的 latency 影響零。
 
 **為什麼這個 bug 拖到 v0.7.4 才發現**:v0.7.0 換 polish model 到 Qwen3-4B-Instruct-2507 時,18 個 quality bench case 全部是 single-sentence 或無標點輸入。沒有任何 case 測 multi-sentence punctuation。**Bench 沒覆蓋的行為就會被悄悄迴歸。** 5 個新 case 補進 fixture 之後現在有了。
+
+#### v0.7.5 — Voice-edit 模式 (⌥+E 熱鍵,clipboard round-trip 抓選取)
+
+**第二個 trigger 熱鍵分支**。原本只有「按住 dictate key 講話 → 貼字」單一模式;v0.7.5 加「按住 edit key + 選取文字 → 講指令 → LLM 改寫選取」第二模式。完全不需要 Accessibility API / UI Automation — 純靠 clipboard 模擬 Cmd+C/Ctrl+C 抓選取,跨平台都可以做。
+
+**用法**:
+1. 在任何 app 選取文字
+2. 按住 **F13**(`EDIT_TRIGGER_KEYS` 預設值)講指令 — 例如「改成正式語氣」「translate to English」「縮短」「改寫成命令句」
+3. 放開 F13 → daemon 把選取文字 + 指令送進 polish LLM(同 Qwen3-4B,不同 prompt)→ 結果取代選取
+4. 原 clipboard 自動還原(`try/finally` 保證)
+
+**設定範例**(在 `scripts/stt-daemon.py` 頂端):
+```python
+# 預設 F13 不論平台 — full-size 鍵盤幾乎不衝突,但 MacBook 通常沒實體 F13 key:
+EDIT_TRIGGER_KEYS = {Key.f13}                # 預設
+EDIT_TRIGGER_KEYS = {Key.alt_l}              # Mac 沒 F13 可選 Left Option
+EDIT_TRIGGER_KEYS = {Key.menu}               # Win Menu 鍵
+EDIT_TRIGGER_KEYS = None                     # 用平台預設 (Key.f13)
+EDIT_TRIGGER_KEYS = set()                    # 停用 voice-edit
+```
+
+**Selection 抓不到時**:daemon 播一個 220 Hz 的「dull」失敗 beep(跟啟動 880 Hz / 結束 660 Hz 都不同),log 寫 `[stt] voice-edit: no selection captured`。常見原因:(a) 你沒選取文字、(b) focused app 不支援 Cmd+C / Ctrl+C(影像檢視器、終端輸出 pane 等)。
+
+**架構重點**:
+- **Pasteboard ABC 加 3 個 method**:`get_text` / `clipboard_seqno` / `simulate_copy`。Win 用 `GetClipboardSequenceNumber` + SendInput Ctrl+C(對應現有 paste 的 Ctrl+V);Mac 用 `NSPasteboard.changeCount` + Quartz CGEvent Cmd+C(對應現有 Cmd+V),osascript fallback 處理 Accessibility 未授權狀態。**沒引入新 input library** — 跟現有 paste path 用同個機制。
+- **TextPostProcessor.edit() 新介面**:`edit(selection, instruction) -> str | None`。`None` 是顯性失敗訊號(polish() 是回傳 input,但 edit 回傳 input 等於 paste 回原文 — 用戶以為沒按到 → 不清楚)。`NoopPolisher.edit() = None`(沒 polish 就沒辦法 edit)、`MlxLocalLlmPolisher` + `TorchLocalLlmPolisher` 共用新抽出的 `_run_generation` private helper(polish() 也 refactor 走同一個 helper、零回歸 — 23 個原 polish bench case 全綠)。
+- **EDIT_PROMPT 雙語設計**:中文 + 英文兩段,核心規則「輸出語言預設與選取的文字相同;若指令明確要求換語言則依指令」。實測 6 個 fixture case 全 pass(中保中、英保英、中→英 explicit translate、英→中 explicit translate、formality change、shorten、識別字保留)。
+- **Edit budget heuristic**:`max(256, min(3 × selection_tokens, max_tokens))`。Polish 用 1.2× 因為 minimum-edit;edit 可能 expand(「expand」「translate from Chinese to English」常常變長),3× 加 floor 256 給足空間。
+- **No prefix cache for edit (v0.7.5)**:edit 的 system prompt 跟 polish 不同,要另建 cache 增加 startup 150-300 ms;edit 預估呼叫頻率比 polish 低 ~10×,amortise 不過。若實測 edit latency 不可接受再加 (`v0.7.5.1` follow-up)。
+
+**Bench**(local-only,`pytest tests/ --run-polish-bench`):**29/29 全綠**(23 polish + 6 edit)。**0 polish regression** — `_run_generation` refactor 沒破壞任何既有行為。
+
+**Investment**:~4 day solo(原 plan 估)。實際:**~半天** — Pasteboard ABC + Win/Mac 約 1.5 hr、polisher.edit + refactor 約 1.5 hr、daemon 接線約 1 hr、9 state-machine tests + 6 fixture case + bench loader 約 1.5 hr。
+
+**Key-repeat hotfix**(smoke test 時抓到):Windows OS 在 F13 被按住時會持續發 key-repeat 事件(~24×/s),原版的 `_active_trigger` 早期 return 寫在 `_capture_selection` **之後**,導致每個 repeat 都跑 100 ms 選取偵測 + 模擬 Ctrl+C + 放失敗 beep + flood log。每按一次 F13 聽到 20+ 個失敗音,蓋過實際成功訊號讓用戶以為「沒運作」。修正:把早期 return hoisted 到 selection capture 之前,加 `test_edit_press_skips_capture_on_key_repeat` regression guard。
+
+**Tests + CI**(v0.7.5 同步):新增 9 個 voice-edit state-machine test + 1 個 key-repeat regression test(hotkey 路由、selection capture、edit-mode dispatch、clipboard 還原 on success / on polish failure / on busy、key-repeat skip)+ 6 個 edit fixture case(語言保留 × 2、explicit translate × 2、formality、shorten、技術識別字保留)。整套狀態機 test 從 33 → 43 個(全 mock 不需 GPU,本地 + CI 都 ~5s)。
 
 ### 提示音說明
 

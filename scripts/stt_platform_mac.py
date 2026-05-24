@@ -56,6 +56,13 @@ _PASTE_APPLESCRIPT = (
     'to keystroke "v" using command down'
 )
 
+# v0.7.5: Cmd+C parallel for voice-edit selection capture. Same scripting
+# bridge, same Accessibility constraints as the paste path.
+_COPY_APPLESCRIPT = (
+    'tell application "System Events" '
+    'to keystroke "c" using command down'
+)
+
 
 # v0.7.2: cached NSPasteboard reference. Lazy-loaded on first set_text()
 # call rather than at module import — keeps the daemon startable on
@@ -132,12 +139,44 @@ def _set_clipboard_via_nspasteboard(text: str) -> bool:
         return _set_clipboard_via_pbcopy(text)
 
 
+def _get_clipboard_via_nspasteboard() -> str | None:
+    """v0.7.5: read clipboard via PyObjC for voice-edit selection capture.
+
+    Returns the string, or None on empty/non-text clipboard or any error.
+    Falls back to `pbpaste` subprocess when AppKit isn't importable.
+    """
+    if _try_load_nspasteboard():
+        try:
+            value = _NS_PASTEBOARD.stringForType_(_NS_PASTEBOARD_TYPE)
+            if value is None:
+                return None  # empty or non-text format
+            return str(value)
+        except Exception as e:
+            print(f"[stt] clipboard: NSPasteboard read failed ({e}); "
+                  f"falling back to pbpaste for this read",
+                  file=sys.stderr, flush=True)
+    # pbpaste fallback path — works without AppKit
+    try:
+        proc = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, check=False, timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        print("[stt] clipboard: pbpaste timed out (2s)",
+              file=sys.stderr, flush=True)
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout
+    return out if out else None
+
+
 class MacOSPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_r}
 
     # Virtual key codes for the Quartz path. Constants don't change.
     _CMD_KEYCODE = 55  # kVK_Command (left command — either side works)
     _V_KEYCODE   = 9   # kVK_ANSI_V
+    _C_KEYCODE   = 8   # kVK_ANSI_C  (v0.7.5 voice-edit selection capture)
 
     def __init__(self) -> None:
         # Decide the paste path ONCE at construction. Re-probing on every
@@ -199,31 +238,59 @@ class MacOSPasteboard(Pasteboard):
 
     def paste(self) -> bool:
         if self._has_ax:
-            return self._paste_via_quartz()
+            return self._send_cmd_combo_via_quartz(self._V_KEYCODE)
         return self._paste_via_osascript()
+
+    def get_text(self) -> str | None:
+        """v0.7.5: read pasteboard for voice-edit selection capture."""
+        return _get_clipboard_via_nspasteboard()
+
+    def clipboard_seqno(self) -> int | None:
+        """v0.7.5: NSPasteboard.changeCount monotonically increases on
+        every modification. Returns None only if AppKit isn't available
+        — in that case voice-edit falls back to a 'no selection detected'
+        result, which is the safe degradation."""
+        if not _try_load_nspasteboard():
+            return None
+        try:
+            return int(_NS_PASTEBOARD.changeCount())
+        except Exception as e:
+            print(f"[stt] clipboard: NSPasteboard.changeCount failed ({e})",
+                  file=sys.stderr, flush=True)
+            return None
+
+    def simulate_copy(self) -> bool:
+        """v0.7.5: Send Cmd+C so the focused app puts its selection on the
+        pasteboard. Mirrors `paste()` — Quartz IME-safe path when
+        Accessibility granted, osascript fallback otherwise."""
+        if self._has_ax:
+            return self._send_cmd_combo_via_quartz(self._C_KEYCODE)
+        return self._copy_via_osascript()
 
     # -- Path 1: Quartz CGEvent (preferred, IME-safe) -----------------------
 
-    def _paste_via_quartz(self) -> bool:
-        """Send Cmd+V via four CGEvents (Cmd-down, V-down, V-up, Cmd-up)
-        posted at kCGAnnotatedSessionEventTap. This tap sits AFTER the
-        IME's event tap, so Chinese / Japanese / Korean IMEs do not get a
-        chance to consume the keystroke. CGEventPost returns void, so we
-        cannot directly verify delivery — we trust the AXIsProcessTrusted
-        check from __init__: if that was True, post will be honoured."""
+    def _send_cmd_combo_via_quartz(self, letter_keycode: int) -> bool:
+        """Shared Cmd+letter CGEvent sender — used by paste() (Cmd+V) and
+        simulate_copy() (Cmd+C). v0.7.5 extracted from the original
+        _paste_via_quartz; behaviour unchanged for paste path.
+
+        Posts at kCGAnnotatedSessionEventTap (after the IME's event tap)
+        so Chinese / Japanese / Korean IMEs do not get a chance to consume
+        the keystroke. CGEventPost returns void; we trust the
+        AXIsProcessTrusted check from __init__."""
         # Cmd down — no flag yet (no key is "modified" by Cmd being pressed).
         cmd_down = self._cg_create(None, self._CMD_KEYCODE, True)
         self._cg_post(self._event_tap, cmd_down)
-        # V down WITH Cmd flag set on the event itself. Apps that check
+        # Letter down WITH Cmd flag set on the event. Apps that check
         # [NSEvent modifierFlags] see Cmd held; apps that rely on event
-        # ordering see Cmd-down first then V-down.
-        v_down = self._cg_create(None, self._V_KEYCODE, True)
-        self._cg_set_flags(v_down, self._cmd_mask)
-        self._cg_post(self._event_tap, v_down)
-        # V up still flagged so the press/release pair share the same flag.
-        v_up = self._cg_create(None, self._V_KEYCODE, False)
-        self._cg_set_flags(v_up, self._cmd_mask)
-        self._cg_post(self._event_tap, v_up)
+        # ordering see Cmd-down first then letter-down.
+        letter_down = self._cg_create(None, letter_keycode, True)
+        self._cg_set_flags(letter_down, self._cmd_mask)
+        self._cg_post(self._event_tap, letter_down)
+        # Letter up still flagged so the press/release pair share the same flag.
+        letter_up = self._cg_create(None, letter_keycode, False)
+        self._cg_set_flags(letter_up, self._cmd_mask)
+        self._cg_post(self._event_tap, letter_up)
         # Cmd up.
         cmd_up = self._cg_create(None, self._CMD_KEYCODE, False)
         self._cg_post(self._event_tap, cmd_up)
@@ -231,10 +298,31 @@ class MacOSPasteboard(Pasteboard):
 
     # -- Path 2: osascript fallback (no Accessibility for Python) -----------
 
+    def _copy_via_osascript(self) -> bool:
+        """v0.7.5: parallel to _paste_via_osascript, sends Cmd+C via
+        System Events. Same Accessibility requirements on the osascript
+        binary (NOT on the Python binary). Same error-detection logic
+        as paste — refactored to share _run_osascript helper."""
+        return self._run_osascript(_COPY_APPLESCRIPT, action="copy")
+
     def _paste_via_osascript(self) -> bool:
+        return self._run_osascript(_PASTE_APPLESCRIPT, action="paste")
+
+    def _run_osascript(self, script: str, *, action: str) -> bool:
+        """Shared osascript Cmd+letter runner. `action` is "paste" or "copy"
+        — used to compose user-facing messages so the hint for paste says
+        "press Cmd+V manually" while the copy variant says "voice-edit:
+        selection capture failed" (Cmd+C from the daemon side has no
+        manual-recovery — the user can just try again)."""
+        key_letter = "V" if action == "paste" else "C"
+        manual_hint = (
+            "text is on clipboard, press Cmd+V manually"
+            if action == "paste"
+            else "voice-edit: selection capture failed, try again"
+        )
         try:
             proc = subprocess.run(
-                ["osascript", "-e", _PASTE_APPLESCRIPT],
+                ["osascript", "-e", script],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -245,8 +333,8 @@ class MacOSPasteboard(Pasteboard):
             # Stage Manager glitches. Without timeout this would block the
             # transcription thread forever.
             print(
-                "[stt] paste timed out (5s) — System Events not responding; "
-                "text is on clipboard, press Cmd+V manually.",
+                f"[stt] {action} timed out (5s) — System Events not "
+                f"responding; {manual_hint}.",
                 flush=True,
             )
             return False
@@ -269,21 +357,16 @@ class MacOSPasteboard(Pasteboard):
             )
             if denied:
                 print(
-                    "[stt] paste failed: macOS denied osascript/System Events the "
-                    "Accessibility permission needed to send Cmd+V. Grant it in "
-                    "系統設定 → 隱私權與安全性 → 輔助使用 (add 'System Events').",
+                    f"[stt] {action} failed: macOS denied osascript/System "
+                    f"Events the Accessibility permission needed to send "
+                    f"Cmd+{key_letter}. Grant it in 系統設定 → 隱私權與安全性 "
+                    f"→ 輔助使用 (add 'System Events').",
                     file=sys.stderr, flush=True,
                 )
-                print(
-                    "[stt] paste blocked — text is on clipboard, press Cmd+V manually for now.",
-                    flush=True,
-                )
+                print(f"[stt] {action} blocked — {manual_hint}.", flush=True)
             else:
-                print(f"[stt] paste failed: {err}",
+                print(f"[stt] {action} failed: {err}",
                       file=sys.stderr, flush=True)
-                print(
-                    "[stt] paste blocked — text is on clipboard, press Cmd+V manually.",
-                    flush=True,
-                )
+                print(f"[stt] {action} blocked — {manual_hint}.", flush=True)
             return False
         return True

@@ -119,6 +119,15 @@ _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 _user32.CloseClipboard.restype    = ctypes.c_int
 _user32.CloseClipboard.argtypes   = []
 
+# v0.7.5: read-side of the clipboard for voice-edit selection capture.
+# GetClipboardData returns a handle to the global memory; sequence number
+# bumps on every modification (no OpenClipboard needed, so it's a cheap
+# poll). Both APIs documented at MSDN under "Clipboard Functions".
+_user32.GetClipboardData.restype           = ctypes.c_void_p
+_user32.GetClipboardData.argtypes          = [ctypes.c_uint]
+_user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+_user32.GetClipboardSequenceNumber.argtypes = []
+
 
 def _set_clipboard_text(text: str, *, retries: int = 5,
                         retry_delay_s: float = 0.01) -> bool:
@@ -239,6 +248,50 @@ def type_text(text: str) -> None:
 # Virtual-key codes for the Ctrl+V combo.
 _VK_CONTROL = 0x11
 _VK_V       = 0x56
+_VK_C       = 0x43  # v0.7.5: Ctrl+C for voice-edit selection capture
+
+
+def _get_clipboard_text(*, retries: int = 5,
+                        retry_delay_s: float = 0.01) -> str | None:
+    """Read the current clipboard's CF_UNICODETEXT contents.
+
+    Returns the string or None on any failure (empty clipboard, non-text
+    format, transient OpenClipboard contention). Mirrors `_set_clipboard_text`'s
+    retry policy — clipboard managers / paste tools may briefly hold the
+    lock so retry ~50 ms total before giving up.
+
+    Caller (voice-edit selection capture) treats None as 'no readable
+    selection' — same as 'app had no selection to copy'.
+    """
+    import time as _time
+    opened = False
+    for _ in range(retries):
+        if _user32.OpenClipboard(None):
+            opened = True
+            break
+        _time.sleep(retry_delay_s)
+    if not opened:
+        return None
+
+    try:
+        h_mem = _user32.GetClipboardData(_CF_UNICODETEXT)
+        if not h_mem:
+            # Clipboard empty or holds a non-text format (image, file list,
+            # RTF only). Not an error — voice-edit will treat as 'no
+            # selection' and fail-beep.
+            return None
+        ptr = _kernel32.GlobalLock(h_mem)
+        if not ptr:
+            return None
+        try:
+            # wstring_at copies a NUL-terminated UTF-16 string out of the
+            # global handle. CF_UNICODETEXT is contractually NUL-terminated
+            # so this is safe; otherwise we'd need a length probe.
+            return ctypes.wstring_at(ptr)
+        finally:
+            _kernel32.GlobalUnlock(h_mem)
+    finally:
+        _user32.CloseClipboard()
 
 
 class WindowsPasteboard(Pasteboard):
@@ -263,10 +316,38 @@ class WindowsPasteboard(Pasteboard):
         """Send Ctrl+V via raw SendInput. Ctrl is a system modifier and IMEs
         don't intercept Ctrl-combos, so a single Ctrl+V pastes the whole
         clipboard content atomically (no per-character IME interference)."""
+        return self._send_ctrl_combo(_VK_V, label="Ctrl+V")
+
+    def get_text(self) -> str | None:
+        """v0.7.5: read clipboard for voice-edit selection capture."""
+        return _get_clipboard_text()
+
+    def clipboard_seqno(self) -> int | None:
+        """v0.7.5: GetClipboardSequenceNumber bumps on every modification.
+        Cheap to poll (no OpenClipboard required). Returns None only if
+        the ctypes call raises — practically never on a working Win32
+        runtime."""
+        try:
+            return int(_user32.GetClipboardSequenceNumber())
+        except Exception as e:
+            print(f"[stt] clipboard: GetClipboardSequenceNumber failed ({e})",
+                  file=sys.stderr, flush=True)
+            return None
+
+    def simulate_copy(self) -> bool:
+        """v0.7.5: Send Ctrl+C via SendInput so the focused app puts its
+        selection on the clipboard. Mirrors `paste()` — same IME-immunity
+        argument (Ctrl is a system modifier IMEs don't intercept)."""
+        return self._send_ctrl_combo(_VK_C, label="Ctrl+C")
+
+    def _send_ctrl_combo(self, vk_letter: int, *, label: str) -> bool:
+        """Shared helper for Ctrl+letter SendInput (Ctrl+V for paste,
+        Ctrl+C for voice-edit selection capture). Extracted v0.7.5 — the
+        4-event sequence is identical, only the letter VK differs."""
         sequence = [
             (_VK_CONTROL, False),
-            (_VK_V,       False),
-            (_VK_V,       True),
+            (vk_letter,   False),
+            (vk_letter,   True),
             (_VK_CONTROL, True),
         ]
         inputs: list[_INPUT] = []
@@ -282,7 +363,7 @@ class WindowsPasteboard(Pasteboard):
         sent = _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
         if sent != n:
             print(f"[stt] SendInput partial: sent {sent}/{n} events "
-                  f"(text on clipboard, press Ctrl+V manually)",
+                  f"({label} failed)",
                   file=sys.stderr, flush=True)
             return False
         return True

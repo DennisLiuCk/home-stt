@@ -115,7 +115,7 @@ def _ids(cases):
 
 
 # Generate one test per case. Pytest parametrize gives us per-case pass/fail
-# visibility in CI output, which matters for triage ("which 3 of 18 broke?").
+# visibility in CI output, which matters for triage ("which 3 of 23 broke?").
 def _load_cases():
     if not _FIXTURE_PATH.exists():
         return []
@@ -124,11 +124,17 @@ def _load_cases():
 
 
 _CASES = _load_cases()
+# v0.7.5: split by mode. Cases without `mode` default to "polish" — keeps
+# the original 23 cases working unchanged. Edit cases (`mode == "edit"`)
+# route to `test_edit_case` which calls polisher.edit(selection, instruction)
+# instead of polisher.polish(input).
+_POLISH_CASES = [c for c in _CASES if c.get("mode", "polish") == "polish"]
+_EDIT_CASES   = [c for c in _CASES if c.get("mode") == "edit"]
 
 
-@pytest.mark.parametrize("case", _CASES, ids=_ids(_CASES))
+@pytest.mark.parametrize("case", _POLISH_CASES, ids=_ids(_POLISH_CASES))
 def test_polish_case(case, polisher, capfd):
-    """Run one case through the loaded polish model, assert rules."""
+    """Run one polish case through the loaded model, assert rules."""
     raw = case["input"]
     out = polisher.polish(raw)
     failures = []
@@ -156,4 +162,60 @@ def test_polish_case(case, polisher, capfd):
         f"output:  {out!r}\n"
         f"note:    {case.get('note', '')}\n"
         f"failures: {failures}"
+    )
+
+
+@pytest.mark.parametrize("case", _EDIT_CASES, ids=_ids(_EDIT_CASES))
+def test_edit_case(case, polisher, capfd):
+    """v0.7.5: run one voice-edit case through polisher.edit() and assert
+    the same must_contain/must_not_contain machinery as polish cases.
+    Adds `max_length_ratio` support for the shorten-class cases."""
+    selection = case["selection"]
+    instruction = case["instruction"]
+    out = polisher.edit(selection, instruction)
+    failures = []
+
+    # edit() returns None on failure — catch this as a single distinct
+    # failure mode so the bench output points clearly at "model gave up"
+    # vs "model returned bad text".
+    if out is None:
+        failures.append("polisher.edit returned None (gave up)")
+        out = ""  # let downstream checks run cleanly for the report
+
+    for needle in case.get("must_contain", []):
+        if needle not in out:
+            failures.append(f"must_contain {needle!r} missing")
+
+    for needle in case.get("must_not_contain", []):
+        if needle in out:
+            failures.append(f"must_not_contain {needle!r} present")
+
+    if "max_length_ratio" in case:
+        ratio = len(out) / max(1, len(selection))
+        if ratio > case["max_length_ratio"]:
+            failures.append(
+                f"length_ratio {ratio:.2f} > {case['max_length_ratio']} "
+                f"(out_len={len(out)}, selection_len={len(selection)})"
+            )
+
+    if "max_edit_ratio" in case:
+        # Same Levenshtein semantics as polish, but applied to selection
+        # vs output. Edit cases rarely use this — most edits intentionally
+        # rewrite substantially — but supporting it keeps the schema
+        # uniform with polish cases.
+        dist = _levenshtein(selection, out)
+        ratio = dist / max(1, len(selection))
+        if ratio > case["max_edit_ratio"]:
+            failures.append(
+                f"edit_ratio {ratio:.2f} > {case['max_edit_ratio']} "
+                f"(dist={dist}, len={len(selection)})"
+            )
+
+    assert not failures, (
+        f"\n--- Edit case {case['id']} ({case['category']}) ---\n"
+        f"selection:   {selection!r}\n"
+        f"instruction: {instruction!r}\n"
+        f"output:      {out!r}\n"
+        f"note:        {case.get('note', '')}\n"
+        f"failures:    {failures}"
     )

@@ -32,7 +32,7 @@ from pynput.keyboard import Key
 # ---------------------------------------------------------------------------
 
 def test_version_bumped(fresh_daemon):
-    assert fresh_daemon.__version__ == "0.7.4"
+    assert fresh_daemon.__version__ == "0.7.5"
 
 
 def test_polish_languages_is_zh_only(fresh_daemon):
@@ -673,3 +673,278 @@ def test_100_press_release_cycles_no_deadlock(fresh_daemon):
               if getattr(t, "_target", None) is not None
               and getattr(t._target, "__name__", "") == "_encoder_worker"]
     assert leaked == [], f"leaked encoder workers: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# v0.7.5 voice-edit mode
+# ---------------------------------------------------------------------------
+
+def _install_edit_mocks(daemon_mod, *, seqno_bumps: bool = True,
+                        selection_text: str = "selected text",
+                        original_clipboard: str = "original clipboard",
+                        edit_result: str | None = "edited text",
+                        asr_instruction: str = "make it formal"):
+    """Voice-edit-specific mock setup. Builds on _install_inert_mocks.
+
+    seqno_bumps=True simulates a successful selection capture (clipboard
+    sequence number bumps after simulate_copy → daemon reads new
+    selection); False simulates no selection (seqno unchanged → daemon
+    aborts).
+
+    edit_result=None simulates a polish.edit() failure (e.g. model
+    returned empty/None); the daemon should restore the original
+    clipboard and play the fail beep instead of pasting.
+    """
+    _install_inert_mocks(daemon_mod)
+    pb = daemon_mod._pasteboard
+    # get_text is called twice per capture: first to save original
+    # clipboard, then to read the selection after simulate_copy.
+    pb.get_text.side_effect = [original_clipboard, selection_text]
+    if seqno_bumps:
+        pb.clipboard_seqno.side_effect = [100, 101]  # before, after
+    else:
+        pb.clipboard_seqno.side_effect = [100, 100]  # unchanged
+    pb.simulate_copy.return_value = True
+    daemon_mod._polisher.edit.return_value = edit_result
+    daemon_mod._backend.transcribe.return_value = (asr_instruction, "zh")
+    # Enable voice-edit explicitly per test (fresh_daemon resets to None).
+    daemon_mod.EDIT_TRIGGER_KEYS = {Key.f13}
+
+
+def test_edit_trigger_distinct_from_dictate_trigger(fresh_daemon):
+    """EDIT_TRIGGER_KEYS_DEFAULT must not overlap with the known
+    platform-default dictate triggers — overlap would create routing
+    ambiguity in `_on_press` (both is_edit and is_dictate true)."""
+    known_dictate_defaults = {Key.alt_r, Key.alt_gr, Key.ctrl_r}
+    assert fresh_daemon.EDIT_TRIGGER_KEYS_DEFAULT.isdisjoint(
+        known_dictate_defaults
+    ), (
+        f"EDIT_TRIGGER_KEYS_DEFAULT={fresh_daemon.EDIT_TRIGGER_KEYS_DEFAULT} "
+        f"overlaps with dictate defaults {known_dictate_defaults}"
+    )
+
+
+def test_edit_press_captures_selection(fresh_daemon):
+    """Press of edit trigger → daemon round-trips clipboard, captures
+    selection text, populates _edit_* globals, starts recording."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, seqno_bumps=True,
+                        selection_text="hello world",
+                        original_clipboard="prev clipboard")
+
+    fresh_daemon._on_press(Key.f13)
+
+    assert fresh_daemon._edit_mode is True
+    assert fresh_daemon._edit_selection == "hello world"
+    assert fresh_daemon._edit_original_clipboard == "prev clipboard"
+    assert fresh_daemon._recording is True
+    assert fresh_daemon._active_trigger == Key.f13
+    # simulate_copy was actually called
+    fresh_daemon._pasteboard.simulate_copy.assert_called_once()
+
+
+def test_edit_press_aborts_when_no_selection(fresh_daemon, capfd):
+    """If the focused app has no selection (seqno doesn't bump after
+    simulate_copy), the daemon should NOT start recording, edit state
+    stays clean, fail beep would have played."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, seqno_bumps=False)
+
+    fresh_daemon._on_press(Key.f13)
+
+    assert fresh_daemon._recording is False
+    assert fresh_daemon._edit_mode is False
+    assert fresh_daemon._edit_selection is None
+    assert fresh_daemon._active_trigger is None
+    out, err = capfd.readouterr()
+    assert "no selection" in (out + err).lower()
+
+
+def test_edit_press_routes_release_to_transcribe_and_emit_edit(fresh_daemon,
+                                                                 monkeypatch):
+    """End-to-end routing: edit press + release → spawns thread targeting
+    `_transcribe_and_emit_edit` with (selection, original_clipboard)."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, selection_text="some selection",
+                        original_clipboard="prev")
+
+    invocations = []
+
+    def fake_edit(selection, original):
+        invocations.append(("edit", selection, original))
+
+    def fake_polish():
+        invocations.append(("polish",))
+
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit_edit", fake_edit)
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit", fake_polish)
+
+    fresh_daemon._on_press(Key.f13)
+    fresh_daemon._on_release(Key.f13)
+    # _on_release spawns a daemon thread; give it time to invoke fake_edit
+    time.sleep(0.3)
+
+    assert len(invocations) == 1, (
+        f"expected exactly 1 spawn, got {invocations}"
+    )
+    assert invocations[0] == ("edit", "some selection", "prev")
+
+
+def test_dictate_press_unaffected_by_edit_keys(fresh_daemon, monkeypatch):
+    """Regression guard: pressing a regular dictate trigger should NOT
+    trigger any voice-edit behaviour (no clipboard read, no simulate_copy,
+    routes to _transcribe_and_emit)."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon)  # also sets EDIT_TRIGGER_KEYS
+
+    invocations = []
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit",
+                        lambda: invocations.append("polish"))
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit_edit",
+                        lambda s, o: invocations.append("edit"))
+
+    fresh_daemon._on_press(Key.alt_r)
+    fresh_daemon._on_release(Key.alt_r)
+    time.sleep(0.3)
+
+    assert invocations == ["polish"]
+    assert fresh_daemon._edit_mode is False
+    # Dictate path must NOT have touched the clipboard or simulated Cmd+C
+    fresh_daemon._pasteboard.simulate_copy.assert_not_called()
+    fresh_daemon._pasteboard.get_text.assert_not_called()
+
+
+def test_edit_clipboard_restored_on_success(fresh_daemon):
+    """End-to-end: after a successful edit, the daemon must have:
+    1. set_text(edit_result) — pasted the LLM output
+    2. set_text(original_clipboard) — restored the pre-edit clipboard"""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, selection_text="the selection",
+                        original_clipboard="user's saved clipboard",
+                        edit_result="LLM output")
+
+    fresh_daemon._on_press(Key.f13)
+    # Pre-load buffer with non-silent audio so _trim_silence doesn't
+    # strip everything. 16000 samples of low-amplitude noise = 1s.
+    fresh_daemon._buffer.append(
+        np.full(16000, 0.05, dtype=np.float32)
+    )
+    fresh_daemon._recording_samples = 16000
+    fresh_daemon._on_release(Key.f13)
+    time.sleep(0.5)  # let edit thread run
+
+    set_text_calls = [c.args[0] for c
+                      in fresh_daemon._pasteboard.set_text.call_args_list]
+    assert "LLM output" in set_text_calls, (
+        f"paste of edit result missing: {set_text_calls}"
+    )
+    assert "user's saved clipboard" in set_text_calls, (
+        f"clipboard restore missing: {set_text_calls}"
+    )
+    # Restore must come AFTER paste
+    paste_idx = set_text_calls.index("LLM output")
+    restore_idx = set_text_calls.index("user's saved clipboard")
+    assert restore_idx > paste_idx, "restore must run after paste"
+
+
+def test_edit_clipboard_restored_on_polish_failure(fresh_daemon):
+    """polisher.edit returning None → daemon aborts the paste but MUST
+    still restore the original clipboard (finally block guarantees this)."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, selection_text="sel",
+                        original_clipboard="orig", edit_result=None)
+
+    fresh_daemon._on_press(Key.f13)
+    fresh_daemon._buffer.append(
+        np.full(16000, 0.05, dtype=np.float32)
+    )
+    fresh_daemon._recording_samples = 16000
+    fresh_daemon._on_release(Key.f13)
+    time.sleep(0.5)
+
+    set_text_calls = [c.args[0] for c
+                      in fresh_daemon._pasteboard.set_text.call_args_list]
+    assert "orig" in set_text_calls, (
+        f"clipboard restore missing on polish failure: {set_text_calls}"
+    )
+
+
+def test_edit_polisher_called_with_selection_and_instruction(fresh_daemon):
+    """polisher.edit must be invoked with (selection, asr_instruction).
+    Regression guard against arg-order swap that would silently treat
+    the instruction as the selection."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(
+        fresh_daemon,
+        selection_text="my code",
+        asr_instruction="add docstring",
+        edit_result="my code\n# docstring",
+    )
+
+    fresh_daemon._on_press(Key.f13)
+    fresh_daemon._buffer.append(
+        np.full(16000, 0.05, dtype=np.float32)
+    )
+    fresh_daemon._recording_samples = 16000
+    fresh_daemon._on_release(Key.f13)
+    time.sleep(0.5)
+
+    fresh_daemon._polisher.edit.assert_called_once_with(
+        "my code", "add docstring",
+    )
+
+
+def test_edit_busy_path_drops_and_restores(fresh_daemon):
+    """If a previous transcribe is still running (_processing=True) when
+    voice-edit release fires, the daemon drops the audio AND still
+    restores the original clipboard (the finally block guarantees this
+    so the user's pre-edit clipboard is never silently lost on busy)."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon)
+    fresh_daemon._processing = True  # simulate busy
+
+    # Call _transcribe_and_emit_edit directly — bypass the thread spawn
+    # to avoid the daemon thread timing variance.
+    fresh_daemon._transcribe_and_emit_edit("sel", "orig")
+
+    set_text_calls = [c.args[0] for c
+                      in fresh_daemon._pasteboard.set_text.call_args_list]
+    assert "orig" in set_text_calls, (
+        f"busy-path restore missing: {set_text_calls}"
+    )
+    # Polisher.edit must NOT have been called (busy-drop happens before)
+    fresh_daemon._polisher.edit.assert_not_called()
+
+
+def test_edit_press_skips_capture_on_key_repeat(fresh_daemon):
+    """v0.7.5 hotfix regression guard: OS key-repeat fires _on_press on
+    every repeat tick (~24×/s on Windows for F13). Without the cheap
+    _active_trigger early-return BEFORE _capture_selection, every repeat
+    would invoke a 100 ms selection capture + simulate_copy + fail beep +
+    log spam (24×/s of all of that). Live-log evidence on 2026-05-24
+    showed 24 'no selection captured' messages per single F13 press.
+
+    This test asserts that the second _on_press (simulating a repeat
+    tick) does NOT invoke simulate_copy / get_text / play a fail beep.
+    """
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, seqno_bumps=True)
+
+    # First press — real start of voice-edit
+    fresh_daemon._on_press(Key.f13)
+    assert fresh_daemon._active_trigger == Key.f13
+    capture_calls_after_first = fresh_daemon._pasteboard.simulate_copy.call_count
+    assert capture_calls_after_first == 1, (
+        f"first press should simulate_copy once, got "
+        f"{capture_calls_after_first}"
+    )
+
+    # Second press — OS key-repeat. Must be a cheap no-op (no extra
+    # simulate_copy, no extra get_text, no fail beep).
+    fresh_daemon._on_press(Key.f13)
+    capture_calls_after_repeat = fresh_daemon._pasteboard.simulate_copy.call_count
+    assert capture_calls_after_repeat == 1, (
+        f"key-repeat must NOT re-invoke simulate_copy; "
+        f"call count went from {capture_calls_after_first} to "
+        f"{capture_calls_after_repeat}"
+    )

@@ -67,6 +67,10 @@ daemon = _load_daemon_module()
 # means a future module-default flip doesn't require touching this file.
 _ORIGINAL_ENCODER_PIPELINING = daemon.ENCODER_PIPELINING
 
+# v0.7.5: same pattern for EDIT_TRIGGER_KEYS — voice-edit state-machine
+# tests set this to {Key.f13} locally; restore between tests.
+_ORIGINAL_EDIT_TRIGGER_KEYS = daemon.EDIT_TRIGGER_KEYS
+
 # Mute beeps globally for the test session. Several tests exercise
 # _on_press which calls _play_beep, which calls sd.query_devices() +
 # sd.play(). On headless CI runners (macOS GitHub Actions in particular)
@@ -98,9 +102,18 @@ def _reset_daemon_state():
     daemon._active_trigger = None
     daemon._processing = False
     daemon._recording_samples = 0
+    # v0.7.5: voice-edit per-recording state. Reset between tests so a
+    # test that sets _edit_mode=True (via mocked _on_press flow) doesn't
+    # leak into the next test's release dispatch.
+    daemon._edit_mode = False
+    daemon._edit_selection = None
+    daemon._edit_original_clipboard = None
     # v0.7.3: restore module-default ENCODER_PIPELINING after any test
     # mutation (streaming tests flip it True for their body).
     daemon.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
+    # v0.7.5: restore EDIT_TRIGGER_KEYS module-default (voice-edit tests
+    # set it to a sentinel like {Key.f13}).
+    daemon.EDIT_TRIGGER_KEYS = _ORIGINAL_EDIT_TRIGGER_KEYS
     # v0.8.0 encoder-pipelining state. Mirrors what _on_press does on a
     # real recording start, so tests that exercise the audio callback
     # without going through _on_press first don't hit stale flags.

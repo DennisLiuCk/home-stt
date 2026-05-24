@@ -81,7 +81,7 @@ from text_polisher import TextPostProcessor, build_polisher
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +250,28 @@ POLISH_PROMPT    = (
 TRIGGER_KEYS: set | None = None
 
 # ---------------------------------------------------------------------------
+# v0.7.5 voice-edit mode (⌥+E hotkey, clipboard round-trip selection capture)
+#
+# Hold an edit trigger key → daemon captures the current text selection
+# via clipboard round-trip → user speaks an instruction → polish LLM
+# applies the instruction to the selection (different prompt: EDIT_PROMPT
+# in text_polisher.py) → result replaces the selection via paste →
+# original clipboard restored.
+#
+# Default trigger is Key.f13 on BOTH platforms (cross-platform parity).
+# F13 is unmapped on almost every keyboard's OS shortcuts and won't
+# collide with TRIGGER_KEYS defaults (alt_gr/ctrl_r on Win, alt_r on Mac).
+# Caveat: most modern MacBook keyboards don't have a physical F13 key —
+# Mac users override e.g. `EDIT_TRIGGER_KEYS = {Key.alt_l}` (Left Option,
+# different from Right Option used for dictate).
+#
+# `None` here means "use EDIT_TRIGGER_KEYS_DEFAULT". Set explicitly to
+# an empty set `{}` to DISABLE voice-edit entirely (no trigger registered).
+EDIT_TRIGGER_KEYS: set | None = None
+EDIT_TRIGGER_KEYS_DEFAULT = {Key.f13}
+SELECTION_CAPTURE_WAIT_S  = 0.1   # post-Cmd+C wait before checking seqno
+
+# ---------------------------------------------------------------------------
 # Press-time encoder pipelining framework (built for v0.8.0, shipped
 # DISABLED in v0.7.3 after a bench-first save).
 #
@@ -296,6 +318,11 @@ ENCODER_SILENCE_FALLBACK_SEC  = 2.0    # mid-utterance silence ≥ N s → batch
 BEEPS_ENABLED    = True
 BEEP_START_HZ    = 880                 # A5, "bright" — start of recording
 BEEP_END_HZ      = 660                 # E5, "calmer" — paste done
+BEEP_FAIL_HZ     = 220                 # A3, "dull" — v0.7.5 voice-edit
+                                       #   abort (no selection / polish.edit
+                                       #   failure). Distinct from press +
+                                       #   end so user can audibly tell
+                                       #   things went wrong.
 BEEP_DURATION_MS = 80
 BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 
@@ -977,6 +1004,15 @@ _encoder_use_batch_fallback = False  # Option C: mid-silence detected → use ba
 _encoder_silence_run_samples = 0   # rolling silence sample count for Option C
 _encoder_residual_samples: np.ndarray | None = None  # tail audio worker left for finalize
 
+# v0.7.5 voice-edit per-recording state. Snapshotted at press time —
+# `_on_release` reads these under _state_lock then routes to
+# `_transcribe_and_emit_edit` instead of `_transcribe_and_emit`. All three
+# are cleared at the top of `_on_press` and re-populated if the press is
+# an edit-trigger.
+_edit_mode = False                  # True iff this recording is voice-edit
+_edit_selection: str | None = None  # the captured selection text
+_edit_original_clipboard: str | None = None  # to restore in finally
+
 # Silence threshold for the mid-utterance fallback detector. Matches the
 # -50 dBFS that _trim_silence uses, so user-visible behaviour is consistent
 # ("daemon thought you stopped speaking" → fallback).
@@ -1448,6 +1484,167 @@ def _transcribe_and_emit() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v0.7.5 voice-edit mode — selection capture + edit-path transcribe
+# ---------------------------------------------------------------------------
+def _capture_selection(pb) -> tuple[str, str | None] | None:
+    """Synchronous clipboard round-trip to capture the focused app's
+    current text selection.
+
+    Returns (selection, original_clipboard) on success, or None if no
+    selection was captured (seqno unchanged after simulate_copy — the
+    focused app either had no selection or doesn't expose one to Cmd+C).
+    `original_clipboard` is the pre-capture clipboard text (may be None
+    if empty / non-text); the caller is responsible for restoring it via
+    pb.set_text in their finally block.
+
+    Timing: ~110 ms sync (SELECTION_CAPTURE_WAIT_S = 100 ms + ~10 ms of
+    OS calls). Per plan §G this is hidden behind the user's natural
+    "start speaking" gesture latency, so the press feels instant.
+
+    Why daemon-side timing not pasteboard-side: the 100 ms wait is policy
+    (depends on host responsiveness) and may need to become a 5-poll loop
+    on a slow machine. That belongs at the orchestration layer, not in
+    the platform abstraction.
+    """
+    original = pb.get_text()
+    seqno_before = pb.clipboard_seqno()
+    if not pb.simulate_copy():
+        # SendInput / Quartz / osascript already logged the specific
+        # failure. Caller will play fail beep + log voice-edit context.
+        return None
+    time.sleep(SELECTION_CAPTURE_WAIT_S)
+    seqno_after = pb.clipboard_seqno()
+    if seqno_before is not None and seqno_after is not None:
+        if seqno_after == seqno_before:
+            # No clipboard mutation → no selection in the focused app
+            # (or simulate_copy hit a no-op modal). Restore not needed
+            # (we never overwrote anything).
+            return None
+    selection = pb.get_text()
+    if selection is None or not selection.strip():
+        return None
+    return selection, original
+
+
+def _transcribe_and_emit_edit(selection: str,
+                              original_clipboard: str | None) -> None:
+    """v0.7.5 voice-edit transcribe path. Parallel to _transcribe_and_emit
+    but: (a) uses _polisher.edit(selection, instruction) instead of
+    .polish(instruction), (b) pastes the LLM's edit result, (c) restores
+    the original clipboard in finally.
+
+    Reads audio from _buffer at lock acquisition (same pattern as
+    _transcribe_and_emit). selection/original_clipboard are passed in by
+    _on_release (snapshotted under lock at the release moment).
+
+    Skips encoder pipelining (edit recordings are typically short
+    instructions — pipelining win is negligible). Skips POLISH_LANGUAGES
+    gating (the LLM is given an EXPLICIT language-handling rule via
+    EDIT_PROMPT, so all language combinations route here)."""
+    global _processing, _buffer, _recording_samples
+    with _state_lock:
+        if _processing:
+            dropped_chunks = len(_buffer)
+            dropped_sec = _recording_samples / SAMPLE_RATE
+            _buffer = []
+            _recording_samples = 0
+            if dropped_chunks > 0:
+                print(f"[stt] busy — dropped {dropped_sec:.2f}s of voice-edit "
+                      f"audio ({dropped_chunks} blocks)", flush=True)
+            # Still need to restore the original clipboard even on busy-
+            # drop, because _on_press already overwrote it via simulate_copy.
+            _try_restore_clipboard(original_clipboard, context="busy-drop")
+            return
+        _processing = True
+        chunks = _buffer
+        _buffer = []
+        _recording_samples = 0
+    try:
+        if not chunks:
+            print("[stt] voice-edit: empty audio (no instruction)",
+                  flush=True)
+            return
+        samples_arr = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
+        raw_sec = len(samples_arr) / SAMPLE_RATE
+        trimmed = _trim_silence(samples_arr)
+        if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
+            print(f"[stt] voice-edit: too short ({raw_sec:.2f}s) — "
+                  f"no instruction captured",
+                  flush=True)
+            return
+        # ASR transcribes the spoken instruction
+        t0 = time.time()
+        instruction_raw, language = _backend.transcribe(trimmed)
+        asr_elapsed = time.time() - t0
+        if not instruction_raw.strip():
+            print(f"[stt] voice-edit: empty transcript ({language}, "
+                  f"{asr_elapsed:.2f}s)", flush=True)
+            return
+        # OpenCC normalisation on the instruction (Qwen3-ASR outputs
+        # simplified natively — same logic as polish path).
+        instruction = post_process(instruction_raw)
+
+        # LLM applies instruction to selection
+        t1 = time.time()
+        edited = _polisher.edit(selection, instruction)
+        edit_elapsed = time.time() - t1
+        if edited is None:
+            _play_beep(BEEP_FAIL_HZ)
+            print(f"[stt] voice-edit: polish.edit returned None "
+                  f"(instruction: {instruction!r})", flush=True)
+            return
+        edited = post_process(edited)  # backstop simplified→traditional
+
+        # Paste result
+        if not _pasteboard.set_text(edited):
+            print(f"[stt] voice-edit: clipboard write failed — "
+                  f"'{edited}' NOT inserted",
+                  file=sys.stderr, flush=True)
+            return
+        time.sleep(0.02)
+        paste_ok = _pasteboard.paste()
+        if paste_ok:
+            _play_beep(BEEP_END_HZ)
+            # Compact log: instruction + before/after lets user diff in
+            # the daemon log without re-deriving from clipboard history.
+            print(f"[stt] voice-edit ({language}, {asr_elapsed:.2f}s+"
+                  f"edit {edit_elapsed:.2f}s)\n"
+                  f"  instr:  {instruction}\n"
+                  f"  before: {selection}\n"
+                  f"  after:  {edited}",
+                  flush=True)
+        else:
+            print(f"[stt] voice-edit: paste keystroke failed — '{edited}' "
+                  f"on clipboard, press Ctrl+V/Cmd+V manually",
+                  flush=True)
+    except Exception as e:
+        print(f"[stt] voice-edit error: {e}", file=sys.stderr, flush=True)
+    finally:
+        # Restore original clipboard regardless of success/failure path.
+        # User's clipboard history should look like nothing happened
+        # beyond the paste of the edit result (which is then immediately
+        # replaced — so user keeps their pre-edit clipboard intact).
+        _try_restore_clipboard(original_clipboard, context="post-edit")
+        with _state_lock:
+            _processing = False
+
+
+def _try_restore_clipboard(original: str | None, *, context: str) -> None:
+    """Best-effort clipboard restore for voice-edit cleanup. Logs a
+    warning on failure but does NOT raise — failed restore means user
+    loses their pre-edit clipboard, an acceptable rare degradation."""
+    if original is None:
+        return  # nothing to restore (clipboard was empty pre-capture)
+    try:
+        if not _pasteboard.set_text(original):
+            print(f"[stt] voice-edit: clipboard restore failed ({context})",
+                  flush=True)
+    except Exception as e:
+        print(f"[stt] voice-edit: clipboard restore raised ({context}): "
+              f"{e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Keyboard hooks
 # ---------------------------------------------------------------------------
 def _on_press(key) -> None:
@@ -1455,11 +1652,63 @@ def _on_press(key) -> None:
     global _encoder_thread, _encoder_handle, _encoder_active, _encoder_failed
     global _encoder_use_batch_fallback, _encoder_silence_run_samples
     global _encoder_residual_samples
-    if key not in TRIGGER_KEYS:
+    global _edit_mode, _edit_selection, _edit_original_clipboard
+
+    # v0.7.5: route both trigger key sets. EDIT_TRIGGER_KEYS may be None
+    # (= disabled) or a set; same for TRIGGER_KEYS. The two sets are
+    # expected to be disjoint — overlap would be ambiguous (we'd default
+    # to dictate via the `elif` below).
+    is_edit = bool(EDIT_TRIGGER_KEYS) and key in EDIT_TRIGGER_KEYS
+    is_dictate = bool(TRIGGER_KEYS) and key in TRIGGER_KEYS and not is_edit
+    if not (is_edit or is_dictate):
         return
+
+    # v0.7.5 hotfix: cheap _active_trigger check BEFORE any expensive work
+    # (selection capture takes ~100 ms). Windows OS fires _on_press on
+    # every key-repeat tick while a key is held (~24×/s for F13) — without
+    # this early-return, edit triggers would invoke _capture_selection on
+    # every repeat: 24 × 100 ms wasted per second + 24 × failed-beep
+    # cacophony + 24 × log-flood of "no selection captured" + 24 × Ctrl+C
+    # injected into the focused app. Dictate path already had this early
+    # return below (inside the lock); we needed to hoist it above the
+    # selection-capture step.
     with _state_lock:
         if _active_trigger is not None:
-            return  # another trigger is already held (or OS key-repeat)
+            return  # OS key-repeat — first press already started recording
+
+    # For edit, capture selection BEFORE acquiring state lock (again).
+    # The 100 ms blocking sleep inside _capture_selection should not hold
+    # _state_lock — the audio callback acquires _state_lock on every
+    # 50 ms tick, and blocking it for 100 ms would back-pressure
+    # PortAudio. (When _recording=False the callback early-returns without
+    # locking, so this is only a defence-in-depth — recording hasn't
+    # started yet.)
+    captured: tuple[str, str | None] | None = None
+    if is_edit:
+        captured = _capture_selection(_pasteboard)
+        if captured is None:
+            _play_beep(BEEP_FAIL_HZ)
+            print("[stt] voice-edit: no selection captured", flush=True)
+            return  # DO NOT start recording
+        # Verify polisher actually has edit capability — NoopPolisher's
+        # edit() returns None unconditionally, so starting a recording
+        # we know can't succeed would just waste 1-5s of user effort.
+        if _polisher.__class__.__name__ == "NoopPolisher":
+            _play_beep(BEEP_FAIL_HZ)
+            print("[stt] voice-edit: POLISH_ENABLED is False — voice-edit "
+                  "requires polish (LLM does the editing). Enable polish "
+                  "or unset EDIT_TRIGGER_KEYS.", flush=True)
+            _try_restore_clipboard(captured[1], context="noop-polisher")
+            return
+
+    with _state_lock:
+        if _active_trigger is not None:
+            # Race: another trigger pressed during the ~100 ms selection
+            # capture window. For edit, restore the captured clipboard
+            # we modified via simulate_copy.
+            if captured is not None:
+                _try_restore_clipboard(captured[1], context="active-trigger")
+            return
         _active_trigger = key
         _recording = True
         _buffer.clear()
@@ -1467,6 +1716,14 @@ def _on_press(key) -> None:
         # this, a previous transcribe that left a stale count + a new press
         # could falsely trip the cap and auto-stop the new recording early.
         _recording_samples = 0
+        # v0.7.5: edit state — cleared every press, populated only if this
+        # press is an edit trigger. Snapshot read in _on_release.
+        _edit_mode = False
+        _edit_selection = None
+        _edit_original_clipboard = None
+        if captured is not None:
+            _edit_mode = True
+            _edit_selection, _edit_original_clipboard = captured
         # v0.8.0: reset all per-recording encoder state. _encoder_consecutive_failures
         # is INTENTIONALLY NOT reset — it persists across utterances so 3
         # back-to-back failures suppress streaming for the 4th. A successful
@@ -1485,13 +1742,17 @@ def _on_press(key) -> None:
                 _encoder_queue.get_nowait()
             except queue.Empty:
                 break
-    print(f"[stt] REC ({key})", flush=True)
+    edit_tag = " [edit]" if is_edit else ""
+    print(f"[stt] REC ({key}){edit_tag}", flush=True)
     _play_beep(BEEP_START_HZ)
 
 
 def _on_release(key) -> None:
     global _recording, _active_trigger
-    if key not in TRIGGER_KEYS:
+    # v0.7.5: accept release of either trigger key set.
+    is_edit_key = bool(EDIT_TRIGGER_KEYS) and key in EDIT_TRIGGER_KEYS
+    is_dictate_key = bool(TRIGGER_KEYS) and key in TRIGGER_KEYS
+    if not (is_edit_key or is_dictate_key):
         return
     with _state_lock:
         if _active_trigger != key:
@@ -1514,6 +1775,10 @@ def _on_release(key) -> None:
     # cheap perceived latency — bounded delay before transcribe starts.
     time.sleep(0.08)
     abort = False
+    # v0.7.5: snapshot edit state under lock for coherent routing decision.
+    edit_mode_snap = False
+    edit_selection_snap: str | None = None
+    edit_original_snap: str | None = None
     with _state_lock:
         # If user pressed a trigger again during the drain, _active_trigger
         # is non-None. Leave _recording=True (the new press wants to
@@ -1523,6 +1788,9 @@ def _on_release(key) -> None:
             abort = True
         else:
             _recording = False
+            edit_mode_snap = _edit_mode
+            edit_selection_snap = _edit_selection
+            edit_original_snap = _edit_original_clipboard
     if abort:
         print("[stt] release aborted by new press during drain", flush=True)
         return
@@ -1533,15 +1801,23 @@ def _on_release(key) -> None:
     # being scheduled.
     if _encoder_active:
         _encoder_stop_event.set()
-    print("[stt] processing...", flush=True)
-    threading.Thread(target=_transcribe_and_emit, daemon=True).start()
+    if edit_mode_snap:
+        print("[stt] voice-edit processing...", flush=True)
+        threading.Thread(
+            target=_transcribe_and_emit_edit,
+            args=(edit_selection_snap, edit_original_snap),
+            daemon=True,
+        ).start()
+    else:
+        print("[stt] processing...", flush=True)
+        threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    global _backend, _pasteboard, TRIGGER_KEYS
+    global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
 
     _pasteboard = build_pasteboard()
     n_native = _pasteboard.register_native_libs()
@@ -1562,13 +1838,30 @@ def main() -> None:
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
+    # v0.7.5: apply EDIT_TRIGGER_KEYS default. `None` = use platform default;
+    # explicit empty set `{}` = disabled (no edit trigger registered).
+    if EDIT_TRIGGER_KEYS is None:
+        EDIT_TRIGGER_KEYS = EDIT_TRIGGER_KEYS_DEFAULT
 
     print(f"[stt] warming up on {_backend.device_label}...", flush=True)
     t0 = time.time()
     _backend.warmup()
     trigger_labels = ", ".join(str(k) for k in TRIGGER_KEYS)
-    print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} to record.",
-          flush=True)
+    if EDIT_TRIGGER_KEYS:
+        edit_labels = ", ".join(str(k) for k in EDIT_TRIGGER_KEYS)
+        # v0.7.5: voice-edit requires polish (NoopPolisher.edit returns
+        # None). Warn at startup so user isn't surprised when the fail
+        # beep plays on every edit press.
+        if _polisher.__class__.__name__ == "NoopPolisher":
+            print(f"[stt] WARN: EDIT_TRIGGER_KEYS set ({edit_labels}) but "
+                  f"polish is disabled — voice-edit will fail-beep on every "
+                  f"press. Enable polish or unset EDIT_TRIGGER_KEYS.",
+                  file=sys.stderr, flush=True)
+        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+              f"to dictate, hold {edit_labels} to voice-edit.", flush=True)
+    else:
+        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+              f"to record.", flush=True)
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
