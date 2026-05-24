@@ -2,11 +2,76 @@
 
 ![version](https://img.shields.io/badge/version-0.7.5-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
-按住觸發鍵講話、放開即可把語音轉成文字 **自動貼到當下焦點視窗**。中英文混合直接講沒問題、自動繁體（簡轉繁台灣）、自動在中英之間補空格、按下與處理完成都有提示音。
+**按住熱鍵講話、放開自動貼到當下焦點視窗,完全離線。** 兩個模式:語音輸入(Dictate)+ 語音編輯(Voice-Edit),詳見 [核心功能](#核心功能)。
 
-v0.5.0+ 起 **可選 LLM polish 後處理層**:走小型本地 LLM (預設 Qwen3-4B-Instruct-2507) 移除口語贅字(呃、嗯、就是、那個、然後)、修口誤,讓貼出去的文字更乾淨。可關。v0.6.0 起 Windows / Linux 也跑 polish(走 PyTorch + transformers + CUDA bfloat16)。
+> 📌 **macOS 用戶必讀**:第一次跑前要在「系統設定 → 隱私權與安全性」授權 3 個權限給 Python(輸入裝置監控 / 輔助使用 / 麥克風)。沒授權 daemon 不會 crash 但**按鍵完全沒反應** — 這是 #1 onboarding 掉坑點。先讀完 [macOS 第一次啟用 Step 3](#3-授權三個權限最容易忽略的一步) 再裝。
 
-完全離線，無 API key、無流量費。
+## 目錄
+
+**🚀 新用戶從這開始**
+
+- [核心功能](#核心功能) — Dictate + Voice-Edit 兩個模式
+- [平台支援](#平台支援)
+- [系統需求](#系統需求)
+- [macOS 第一次啟用](#macos-第一次啟用) ⭐ Mac 新用戶這條
+- [Windows 第一次啟用](#windows-第一次啟用)
+- [停止](#停止)
+- [疑難排解](#疑難排解)
+
+**⚙️ 進階配置**
+
+- [依硬體選擇 Preset](#依硬體選擇-preset) — 低 VRAM / 低 RAM 機降階
+- [自訂](#自訂) — Config 變數說明
+- [Polish 後處理](#polish-後處理-v050windows-macos-v060) — LLM 修飾文字機制
+- [開機自動啟動（選用）](#開機自動啟動選用)
+
+**📚 架構 / Reference**
+
+- [檔案結構](#檔案結構)
+- [跨平台設計](#跨平台設計)
+- [STT 模型抽象](#stt-模型抽象)
+- [測試](#測試)
+- [Roadmap](#roadmap)
+
+**📜 歷史紀錄(maintainer 取向)**
+
+- [v0.7.x 效能與品質投資紀錄](#v07x-效能與品質投資紀錄)
+- [已測試但放棄的優化方向](#已測試但放棄的優化方向別重複嘗試)
+- [設計重點](#設計重點)
+
+## 核心功能
+
+兩個語音模式,**獨立 hotkey、互不干擾**:
+
+### 🎤 1. 語音輸入 (Dictate)
+
+> 按住觸發鍵 → 講話 → 放開 → 文字自動貼到當下焦點視窗
+
+按住 **Right Option**(macOS)/ **Right Alt** 或 **Right Ctrl**(Windows)→ 對麥克風講話 → 放開 → 文字 ~0.3-2 秒後自動出現在當下焦點視窗。
+
+```
+[使用者] 按住 Right Option → 說「幫我 review 這個 Python function 的 async 部分」→ 放開
+[daemon] 約 0.5 秒後,Notes / VSCode / iTerm 任何輸入框自動出現:
+         「幫我 review 這個 Python function 的 async 部分」
+```
+
+中英文混合直接講、自動繁體、自動 CJK↔ASCII 補空格、口語贅字自動清掉。
+
+### ✏️ 2. 語音編輯 (Voice-Edit, v0.7.5+)
+
+> 選中文字 → 按住觸發鍵 → 講編輯指令 → 放開 → LLM 改寫選取並貼回去
+
+在任何 app 選取一段文字,按住 **Right Command**(macOS)/ **F13**(Windows)→ 講編輯指令(「翻譯成英文」「改成正式語氣」「縮短一半」「整理成條列式」「改成過去式」)→ 放開 → 選取被改寫後的版本取代。
+
+```
+[使用者] 在 Notes 選一段中文段落 → 按住 Right Command
+         → 說「翻譯成英文,保留技術名詞」→ 放開
+[daemon] 約 1-2 秒後,選取的段落被英文版取代
+```
+
+完全離線,LLM 在本地跑(macOS:MLX 4-bit;Windows:PyTorch CUDA bfloat16)。
+
+---
 
 ## 平台支援
 
@@ -19,19 +84,6 @@ v0.5.0+ 起 **可選 LLM polish 後處理層**:走小型本地 LLM (預設 Qwen3
 > ⛔ **Intel Mac (darwin x86_64) 不再支援(v0.4.0+)** — daemon 啟動會 SystemExit 並提示降版到 v0.3.0。Intel 機已罕見,維護 + 文件成本不划算。要 Intel Mac 請 `git checkout v0.3.0`。
 
 > 🏗️ **核心管線（麥克風 → Whisper → 文字後處理）100% 跨平台**。平台特定的薄薄三層 —— **clipboard 寫入**、**paste 模擬**、**全域熱鍵代號** —— 從 v0.2.0 起抽到 `Pasteboard` 介面實作。詳見 [跨平台設計](#跨平台設計) 段。
-
-## 體驗
-
-```
-[使用者] 焦點放在任何輸入框（Terminal / Chrome / Notepad / VSCode / Slack ...）
-[使用者] 按住觸發鍵 → 說「幫我 review 這個 Python function 的 async 部分」→ 放開
-[daemon] 約 0.2–0.5 秒後，文字自動出現：
-         「幫我 review 這個 Python function 的 async 部分」
-```
-
-—— 焦點在哪、整個系統的任何輸入框都通用。
-
----
 
 ## 系統需求
 
@@ -119,30 +171,9 @@ pip install --user `
 pip install --user numpy
 ```
 
-### macOS Apple Silicon 加速（**只 Apple Silicon 需要**）
+### macOS Apple Silicon 安裝
 
-| 套件 | 用途 |
-|------|------|
-| `mlx-qwen3-asr` | **預設 ASR backend（v0.3.0+）** — Qwen3-ASR via Apple MLX（Metal 加速）。中文標點 + 中英混合表現比 Whisper turbo 強 |
-| `mlx-whisper` | 可選 ASR — Whisper large-v3-turbo via Apple MLX，v0.2.x 的舊預設，仍可切回去 |
-| `mlx-lm` | **預設 polish 後處理 backend（v0.5.0+）** — 跑小 LLM 移除口語贅字 + 修口誤。可關 (`POLISH_ENABLED = False`) |
-
-> ⚠️ 這兩個都只在 Apple Silicon（M1 以上）可用。Intel Mac 從 v0.4.0 起不支援(daemon 啟動會拒絕)。
-
-### macOS 一鍵安裝(Apple Silicon)
-
-```bash
-pip install \
-    faster-whisper \
-    sounddevice \
-    pynput \
-    opencc-python-reimplemented \
-    mlx-qwen3-asr \
-    mlx-whisper \
-    mlx-lm
-```
-
-> `mlx-whisper` 不是必裝，只是想留個切換選項才裝。最小集合可拿掉它，daemon 預設只用 `mlx-qwen3-asr`。`faster-whisper` 也不是預設需要的(macOS 預設 backend 是 qwen3-asr),但留著當 CPU fallback / debug 工具。`mlx-lm` 是 v0.5.0+ 的 polish 後處理用的;不裝的話 daemon 自動 fall back 到 NoopPolisher,直接貼原始 ASR 輸出,行為等同 v0.4.x。
+完整指令 + 三權限授權步驟一條 vertical scroll 走完,見 [macOS 第一次啟用](#macos-第一次啟用)。
 
 ### Linux 安裝（規劃中）
 
@@ -291,7 +322,29 @@ cd home-stt
 
 ### 2. 安裝套件
 
-見 [macOS 一鍵安裝](#macos-一鍵安裝)。Apple Silicon 用戶會多裝 `mlx-qwen3-asr`(預設,v0.3.0+),選裝 `mlx-whisper`(舊預設,要切換才用得到)。
+```bash
+pip install \
+    faster-whisper \
+    sounddevice \
+    pynput \
+    opencc-python-reimplemented \
+    mlx-qwen3-asr \
+    mlx-whisper \
+    mlx-lm
+```
+
+各套件用途:
+
+| 套件 | 用途 | 必裝? |
+|------|------|------|
+| `mlx-qwen3-asr` | **預設 ASR backend(v0.3.0+)** — Qwen3-ASR via Apple MLX(Metal 加速),中文標點 + 中英混合 SOTA | ✅ 必裝 |
+| `mlx-lm` | **預設 polish 後處理 backend(v0.5.0+)** — 跑小 LLM 移除口語贅字 + 修口誤 | ✅ 必裝(不裝則 polish 退到 NoopPolisher,等於 v0.4.x 行為) |
+| `sounddevice` / `pynput` / `numpy` | 麥克風 / 全域 key hook / 音訊運算 | ✅ 必裝 |
+| `opencc-python-reimplemented` | 簡轉繁(s2twp,台灣正體 + 詞彙慣用) | ✅ 必裝 |
+| `mlx-whisper` | 可選 ASR — Whisper large-v3-turbo via Apple MLX,v0.2.x 舊預設,切回去才用得到 | ⚠️ 選裝 |
+| `faster-whisper` | CPU fallback / debug 工具,macOS 預設 backend 不用 | ⚠️ 選裝 |
+
+> ⚠️ 這些都只在 Apple Silicon(M1 以上)可用。Intel Mac 從 v0.4.0 起不支援(daemon 啟動會拒絕)。
 
 ### 3. 授權三個權限（最容易忽略的一步）
 
@@ -322,7 +375,15 @@ python3 -c "import sys; print(sys.executable)"
 
 ### 4. （可選）依硬體挑 Preset
 
-Apple Silicon 預設跑 **Qwen3-ASR-0.6B** on MLX,延遲約 0.3-0.5 秒,中文標點 + 中英混合表現比 Whisper turbo 強。想試 1.7B 把 `STT_MODEL` 改成 `"1.7B"`;想切回 Whisper 把 `STT_BACKEND` 改成 `"mlx-whisper"`,然後去 [依硬體選擇 Preset](#依硬體選擇-preset) 改 `STT_MODEL`。
+**先看你 Mac 的記憶體**:
+
+| Mac 配置 | 建議設定 | RAM 用量 (peak) |
+|---------|---------|----------------|
+| **M1/M2/M3/M4 + 16GB+** | **預設不動**(Maximum tier:ASR + LLM polish 全開) | ~4.5 GB |
+| **M-Air / 任何 8GB 機** | `POLISH_ENABLED = False`(Light tier:只 ASR、無 polish) | ~1.5-2 GB |
+| **M-Pro / M-Max / 32GB+** | 預設不動,可選升 `STT_MODEL = "1.7B"` 換更高 ASR 精度 | ~4.5-7 GB |
+
+要改的話編輯 `scripts/stt-daemon.py` 頂部 Config 區。完整 4-tier 比較表(含 Windows / Linux 路徑)見 [依硬體選擇 Preset](#依硬體選擇-preset)。
 
 ### 5. 啟動 daemon
 
@@ -339,13 +400,32 @@ Log: /var/folders/.../T/stt-daemon.log
 Allow ~10-30s for model load + Metal warmup before first trigger key.
 ```
 
-### 6. 使用
+### 6. 使用 — 兩個模式
+
+兩個 hotkey 互不干擾,**Right Option = 講新文字**,**Right Command = 改現有選取**。
+
+#### 6a. 語音輸入(Dictate)— 按住 **Right Option**
 
 1. 把焦點放在任何想輸入文字的視窗（Notes / TextEdit / iTerm / VSCode / Slack...）
 2. 按住 **Right Option** → 聽到「叮」表示開始錄
 3. 對麥克風講話（中英文都可）
 4. 放開 Right Option
 5. 約 0.3–1 秒後文字自動出現,並聽到「咚」表示完成
+
+#### 6b. 語音編輯(Voice-Edit, v0.7.5+)— 按住 **Right Command**
+
+1. 在任何 app **選取一段現有文字**(Notes / Mail / VSCode / Safari 編輯框 / iTerm 都可以)
+2. 按住 **Right Command** → 聽到「叮」表示開始錄
+3. 對麥克風講編輯指令,例如:
+   - 「翻譯成英文」/ 「翻譯成中文」
+   - 「改成正式語氣」/「改得口語一點」
+   - 「縮短一半」/「展開成兩段」
+   - 「整理成條列式」/「合併成一段」
+   - 「改成過去式」/「改成命令句」
+4. 放開 Right Command
+5. 約 1-2 秒後選取被改寫後的版本取代,聽到「咚」表示完成
+
+> 沒選取文字就按了 Right Command 會聽到 220 Hz 的「dull」失敗 beep — 表示 daemon 抓不到 selection,沒事發生。常見原因:該 app 不支援 Cmd+C 抓選取(影像檢視器 / 終端機輸出區)、或你忘了選取就按下去。
 
 ### 7. 確認狀態
 
@@ -469,169 +549,29 @@ POLISH_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 ### v0.7.x 效能與品質投資紀錄
 
-實測延遲(Windows + RTX 5080,v0.7.1):
+完整工程紀錄抽到 [`CHANGELOG.md`](CHANGELOG.md)。每版做了什麼、為什麼、bench 結果、未來重啟條件全部寫在那。這裡只留摘要 + 延遲基準。
+
+**實測延遲(Windows + RTX 5080,v0.7.1+)**:
 
 | 場景 | 音訊長度 | ASR | Polish | 總等待 |
 |------|---------|-----|--------|--------|
-| 短(「好」、「對啊就是這樣」)| 1-3s | ~0.5-1s | ~0.25s | < 2s |
-| 中(技術討論一兩句)| 5-15s | ~2-3s | 0.7-1.0s | ~3-5s |
-| 長(完整段落)| 20-30s | ~7-8s | ~2-3s | ~10-13s |
-| 超長(連續講 40s)| 40s+ | ~10s | ~5s | ~15s |
+| 短(「好」「對啊就是這樣」)| 1-3s | ~0.5-1s | ~0.25s | **< 2s** |
+| 中(技術討論一兩句)| 5-15s | ~2-3s | 0.7-1.0s | **3-5s** |
+| 長(完整段落)| 20-30s | ~7-8s | ~2-3s | **10-13s** |
+| 超長(連續講 40s)| 40s+ | ~10s | ~5s | **~15s** |
 
-Mac M-series 跑同 stack 短中段約 1-2s(MLX 4-bit + Metal native,Python overhead 比 PyTorch 路徑低)。
+Mac M-series 跑同 stack 短中段約 1-2s(MLX 4-bit + Metal native,Python overhead 低於 PyTorch 路徑)。
 
-#### v0.7.0 — Polish model 換回 4B 修品質
+**版本主題 highlights**:
 
-v0.6.0 為了省 VRAM 暫用 Qwen2.5-1.5B-Instruct,後續 18-case bench 對照 `Qwen2.5-{0.5B, 1.5B}` 跟 `Qwen3-4B-Instruct-2507` 發現 1.5B 在我們這個「最小編輯」任務上會:
-
-- **改 English keyword**:`commit` → `push`(完全不同的動詞,嚴重事實錯誤)
-- **改變事實 / 數字 / 語義**:「INT4 反而**更慢**」→「INT4 反而**更快**」(語義反向)
-- **翻譯英文片語**:`prebuilt wheel` → 「預建的輪子」(違反 prompt「禁翻譯英文」規則)
-- **過度書面化**:「想要解決」→「目的是為了解決」、「容易實作」→「容易實現」
-
-換回 Qwen3-4B-Instruct-2507 後上述全部消失。**Qwen3 generation 的 instruction-following 顯著優於 Qwen2.5**(Qwen3.5-4B IFEval 89.8 vs Qwen2.5 大幅進步)。對約束式任務,**更大但更老實的模型,比量化的小模型可靠** — bigger ≠ better in raw size, but bigger generation 通常 = more obedient。
-
-#### v0.7.1 — Polish decode -55%,quality byte-identical
-
-長文 polish:v0.7.0 ≈ 4.26s,v0.7.1 ≈ **1.90s**。三個 **lossless** 工程優化疊加(都在 `TorchLocalLlmPolisher` 內,verifier 仍是完整 Qwen3-4B):
-
-1. **Prompt Lookup Decoding (PLD)** — `generate(..., prompt_lookup_num_tokens=10)`。Polish 輸出 ≈ 輸入(只刪贅字、補標點),PLD 從 input 抓 token 序列做**平行驗證**,「一步猜一 token」變「一步驗證多 token」。lossless 因為驗證仍由完整模型做
-2. **預先 cache POLISH_PROMPT 的 KV** — 系統 prompt 每次都一樣,daemon 啟動時跑一次 prefill 把 `DynamicCache` 存起來,每次 polish `deepcopy` 一份從「已讀完 prompt」狀態接續,省 ~30-50 ms prefill / call
-3. **cuDNN benchmark mode** — `torch.backends.cudnn.benchmark = True`,第一次跑 autotune 挑最快 kernel(+~24s daemon startup 一次性成本),之後每步省一點
-
-**根因觀察**:Polish 慢的不是模型運算量(8 GB weights / 960 GB/s = 8 ms 理論下限),而是 **per-token 固定 overhead**(Python loop + CUDA kernel launch + transformers internals 累計 ~22 ms/step,9x 高於理論)。v0.7.1 三招都是攤平這個 fixed overhead,**不碰模型也不量化** → quality 完全保留。
-
-#### v0.7.2 — Correctness sweep + clipboard direct API + dynamic budgets
-
-v0.7.2 是 multi-agent review (見 `review-v0.7.1.md`) 後的工程交付。三類修正:correctness bug、clipboard 開 subprocess 浪費的延遲、polish 對長輸入的 silent truncation。
-
-**3 個 correctness bug**:
-
-1. **尾音被丟** (`stt-daemon.py:_on_release`) — 鬆手後 PortAudio 還在處理 in-flight 50 ms audio block,但 `_recording = False` 已經被 flip,callback 的 `if _recording:` gate 拒絕該 block。實際症狀:講「...這個 function」會被切成「...這個 functio」(尾音 phoneme 缺一截)。修法:鬆手後 `time.sleep(0.08)` drain delay 再 flip。Windows `time.sleep` 預設解析度 ~15.6 ms (一個 multimedia timer tick),`sleep(0.05)` 可能 ~47 ms 就返回 → padding 到 80 ms 保證 ≥1 個 PortAudio 50 ms 週期 elapse。Drain 期間 re-press 會 abort 該 release 並讓新 press 繼續 capture。
-2. **`_processing` 沉默吞第二段語音** (`_transcribe_and_emit`) — 用戶在 transcribe 跑時再按一次,第二段 audio 留在 buffer 等下次按鍵時被 prepend 到第三段 transcript。用戶完全不知道發生什麼。修法:busy path 明確 `[stt] busy — dropped Xs of captured audio (previous transcribe still running)` log + clear buffer + reset `_recording_samples`。
-3. **無 `MAX_AUDIO_SEC` 上限** (`_audio_callback`) — stuck key / RDP 斷線 / kernel hang 會讓 buffer 無限長大。修法:120 s 硬上限,callback 內檢查 `_recording_samples`,超過就 force-release + spawn transcribe。
-
-**Polish silence hallucination 防護**:Qwen3-ASR 是 LLM-backbone,HF model card 明確列出「silence hallucination」為已知 edge case (decoder 在大段沉默上會生成 training data 中「fit silence」的習得片語,如中文 voice-blog 結尾「好好好好」)。新增 RMS-based silence trim 在 ASR 之前:30 ms frame、-50 dBFS threshold、100 ms margin。純 numpy 微秒成本,順帶縮短 encoder forward。
-
-**Polish 範圍收斂到 zh-only**:`POLISH_LANGUAGES` 從 `{zh, ja, ko}` 改 `{zh}`。`POLISH_PROMPT` 全程中文、只 anchor 中文行為(「中文一律繁體」「禁翻譯英文」),ja/ko transcript 透過同一個 prompt 等於 **0 規則約束**,4B 模型可任意改寫。等 per-language prompt dispatch 路徑就緒再開回 ja/ko。
-
-**Clipboard 從 subprocess 改成直接 API**:
-- **Windows**:`powershell.exe -Command "Set-Clipboard"` (冷啟動 100-300 ms + async 發佈需要 150 ms settle sleep) 換成 ctypes 直接呼叫 `OpenClipboard` + `EmptyClipboard` + `SetClipboardData(CF_UNICODETEXT, GMEM_MOVEABLE handle)` + `CloseClipboard`。**~1-5 ms 同步寫**,SetClipboardData 返回就代表 OS-side clipboard daemon 已發佈。settle sleep 從 150 ms 降到 20 ms (只留 keystroke timing margin)。每次 paste 累計省 **~250-450 ms**。OpenClipboard 含 5×10 ms retry 處理 clipboard manager 短暫鎖住。
-- **macOS**:`pbcopy` subprocess (~20-50 ms) 換成 PyObjC `NSPasteboard.generalPasteboard().setString_forType_(text, NSPasteboardTypeString)`,~1 ms 同步。AppKit 沒裝時自動 fallback 到 `pbcopy`(不會 crash)。
-
-**Polish `max_tokens` dynamic budget + truncation detection**:固定 256 token cap 對 README 的「超長」測試(~280 字 zh,~280 token)會默默截斷句尾,paste 出去是斷句。改成 `max(64, min(input_tokens * 1.2, ceiling))`,ceiling 從 256 提到 **512**(memory 成本 ~25 MB 額外 KV cache,可忽略對 8 GB 模型)。Truncation detection:若 output token 數撞到 budget **且** last token != `<|im_end|>` (chat terminator),log warning 並 fallback 到原 ASR 文字 — 「truncated polish」嚴格 worse than 「raw ASR」。
-
-**`MIN_AUDIO_SEC` 0.3 → 0.15**:中文「好」「對」「是」典型發音 ~0.25 s,原本被 silent reject (`[stt] too short`)。0.15 s 仍在 key-bounce (~20 ms) 跟最短意圖按鍵 (~80 ms) 之上,但低於最短單音節回應。
-
-**Tests + CI** (v0.7.3 同步交付):新增 `tests/` (state machine + silence trim + 設定回歸 18 個 test,純 mock 不需 GPU) + 18 個 polish quality 回歸 case (v0.7.0 投資發現的 failure mode 全部變成 fixture) + `.github/workflows/tests.yml` Win + Mac × py3.10/3.12 matrix。Polish bench skip-by-default,本地跑 `pytest tests/ --run-polish-bench`。
-
-#### v0.7.3 — Press-time encoder pipelining framework + bench-first null result
-
-v0.7.3 是**第二次 bench-first save**(第一次是 v0.7.x 的 GPU mel patch revert)。原訂為 v0.8.0、目標 50% release-to-text latency reduction,實際 bench 數據證明假設錯了,改 ship framework 但 `ENCODER_PIPELINING = False` 預設、記錄 null 結果。
-
-**原始 plan 假設**:hold-to-talk 模式下 GPU 在用戶講話時閒著、encoder forward 對 40s 音訊估 3-5s。把 encoder 移到背景 worker thread 跑、用戶鬆手時只算 decoder + tail encoder → 釋放後等待時間從 ~7s 降到 ~3-4s (≈50% 改善)。
-
-**已做的完整工程** (15 天 spec、~600 行 code、11 個新 test、全部 commit 進 repo 留作未來重啟):
-- `scripts/qwen3_asr_streaming.py` — `StreamingQwen3ASRModel(Qwen3ASRModel)` 子類,透過 monkey-patch `thinker.get_audio_features` 注入 pre-computed encoder hidden states。Spike (`tmp/spike_torch_encoder.py`) 已驗證 chunked encode + concat dim=0 在真實中英混合 20s 上 Levenshtein=0、40s continuous 上 Lev=21 (字詞 drift 但語意保留)、30s 中段靜音上 Lev=21 (silence 在 chunk 中央破壞 hidden states)
-- STTBackend ABC 加 5 個 streaming method (`supports_streaming` / `start_encoder` / `push_chunk` / `finalize` / `abort`);default `False` + `NotImplementedError` 讓 batch-only backend 零改動
-- `_encoder_worker` thread + `_encoder_*` state machine (queue.Queue / threading.Event)、`_audio_callback` 加 lazy spawn + dual-write + RMS silence-detect、`_on_press` 重置、`_on_release` 設 stop event、`_transcribe_and_emit` 兩路 dispatch with abort/fallback
-- Option C 防禦:mid-utterance ≥2s silence 觸發 `_encoder_use_batch_fallback = True`、跳過 streaming 直接走 batch (避免 silence-mid 的 Lev=21 drift)
-- 11 個新 state-machine test (lazy spawn、dual-write、stop event、crash fallback、finalize timeout、consecutive failure suppression、short tap、processing flag independence、Option C silence detect、100-cycle race stress)、`_install_inert_mocks` 加 `streaming` kwarg、`fresh_daemon` fixture auto-cleanup worker threads
-- v0.8.1 deferred:`_Qwen3MlxImpl.supports_streaming() = False` (MLX 端框架 ready 但需 Mac 驗證)
-
-**Day 13-14 bench 實測** (`tmp/bench_v080_latency.py`、daemon-driven、50ms realtime feed、encoder thread 真的在背景跑):
-
-| Sample | audio | batch | stream | saved | % | Lev |
-|--------|-------|-------|--------|-------|---|-----|
-| sample.wav (zh-en) | 20s | 2.83s | 2.88s | -0.06s | -2% | 2 |
-| sample_english | 20s | 2.82s | 2.85s | -0.03s | -1% | 0 |
-| sample_long (zh-en) | 40s | 6.99s | **6.81s** | **+0.18s** | +3% | 21 |
-| sample_silence-mid | 30s | 4.54s | 4.47s | +0.07s | +2% | 21 |
-
-**Root cause**:plan 假設 encoder forward ~3-5s for 40s audio;實測 RTX 5080 + Qwen3-ASR-0.6B (audio_tower ≈ 200M params) **~0.2s**。Off by 15-25x。Decoder (autoregressive ~200 tokens) 才是 ~95% post-release time 的瓶頸。
-
-**Ship decision**:framework 留著 (架構乾淨、test coverage 高、abstractions 對未來有用),但 `ENCODER_PIPELINING = False` 預設、`__version__ = 0.7.3` 而非 0.8.0。Daemon runtime 行為 = v0.7.2 byte-identical。需要時 `ENCODER_PIPELINING = True` 一鍵啟用。
-
-**未來何時重評估**(觸發條件):
-- Qwen3-ASR-FP8 checkpoint 由 Alibaba 官方 ship → FP8 decoder 速度可能 2x → encoder 佔比上升、pipelining 開始有意義
-- llama.cpp + GGUF Q8_0 backend swap 落地 (原 v0.8.0 plan candidate B、2-3x decoder 加速) → 同上
-- 改用更大的 ASR (1.7B 或未來更大版本) → encoder forward 變長、pipelining 改善幅度跟著放大
-- Apple Silicon MLX 端 `audio_tower` 速度數據 (deferred 到能跑 Mac 時)
-
-**Lessons**:
-1. **Bench-first 又一次救命** — agent / plan 預估 50% 改善,實測 3%。第二次驗證「Windows + PyTorch CUDA 路徑充滿性能直覺反例」這個 v0.7.2 提到的教訓
-2. **Plan-vs-actual 數據要寫進 commit message + README** — 不止防回歸,也防未來重複犯同樣的錯
-3. **建好框架但不 enable** 是合理的 ship 方式 — 比拆掉重建好,也誠實 (用戶 opt-in 才付代價)
-4. 真正的 latency 瓶頸在 decoder。下一輪優化從 decoder 下手 (llama.cpp、FP8、speculative decode 對小模型的可行性)
-
-#### v0.7.4 — Polish prompt 標點保留修正 (live-log discovered, bench-validated)
-
-**Symptom**:用戶在實際 dictation 中發現中文標點在 polish 後**不一致地**被刪除 — 短句保留、多句中間的「。」被吃掉換成空格或直接消失。`%TEMP%/stt-daemon.log` 證據:
-```
-raw:      我剛剛在測試這個工具的過程中，發現了一個小問題。我發現中文的輸出都沒有標點符號。
-polished: 我剛剛在測試這個工具的過程中發現了一個小問題 中文的輸出都沒有標點符號
-                                                ^                                ^
-                                                「。」變空格                    句尾「。」消失
-```
-
-**Root cause**:POLISH_PROMPT 規則不對稱 — 只說「**補**必要標點」(正向、處理缺漏),從沒禁止「**刪**原有標點」(負向、處理多餘)。Qwen3-4B-Instruct-2507 把「最小修飾」解讀為流暢度優化,把句末「。」當成可合併的單字元編輯,**特別是多句長輸入**。短句 + ？/，多半保留;長段 + 「。」 隔開的多句就遭殃。
-
-**修正過程** — 單軸修法在 bench 中證實不足,需三軸並進:
-
-| 嘗試 | bench 結果 |
-|------|------------|
-| (僅) 加 `刪除或替換原有標點` 進 嚴禁 list | 4/5 punct case 仍 fail — 4B 模型忽略埋在第三行末尾的負向約束 |
-| (僅) 加正向約束 `原有標點(。？！，)完整保留` 到第一行 | 未獨立測,但結合其他軸 OK |
-| (僅) 加多句保留 few-shot example | 未獨立測 |
-| **三軸並進 (正向 + 負向 + example)** | **5/5 punct case 過、原 18 case 零回歸、bench 23/23 全綠** |
-
-**Lesson**:對 4B 等級 instruction-tuned 模型,要改變「default rewriting」這種強先驗行為,光加負向 constraint 不夠 — 需要 (a) 把約束**前置**到 prompt 第一行 (model attention 集中區)、(b) 給**具體 example** 展示期望行為 (few-shot signal 比 negative constraint 強)、(c) 同時保留**負向 constraint** 作雙重保險。
-
-**Side fix**:順手修了 `id_underscore_prefix` fixture 的 substring-match bug (`"USE_TORCH_COMPILE 設成"` 是 `"_USE_TORCH_COMPILE 設成"` 的子字串、即使 `_` 被正確保留也會 false-positive 失敗;改用 `" USE_TORCH_COMPILE"` leading-space pattern 精確偵測 underscore 被刪)。修完 bench 由 22/23 → 23/23 真正全綠。
-
-**Investment**:~1 hr (log 分析 + prompt 三輪迭代 + 5 個 fixture case + bench 三輪 + 1 個 side fixture fix)。Prefill cost 從 ~110 token → ~140 token (+27%) per polish,但 prefix-cache 吃掉、首次以外的 latency 影響零。
-
-**為什麼這個 bug 拖到 v0.7.4 才發現**:v0.7.0 換 polish model 到 Qwen3-4B-Instruct-2507 時,18 個 quality bench case 全部是 single-sentence 或無標點輸入。沒有任何 case 測 multi-sentence punctuation。**Bench 沒覆蓋的行為就會被悄悄迴歸。** 5 個新 case 補進 fixture 之後現在有了。
-
-#### v0.7.5 — Voice-edit 模式 (⌥+E 熱鍵,clipboard round-trip 抓選取)
-
-**第二個 trigger 熱鍵分支**。原本只有「按住 dictate key 講話 → 貼字」單一模式;v0.7.5 加「按住 edit key + 選取文字 → 講指令 → LLM 改寫選取」第二模式。完全不需要 Accessibility API / UI Automation — 純靠 clipboard 模擬 Cmd+C/Ctrl+C 抓選取,跨平台都可以做。
-
-**用法**:
-1. 在任何 app 選取文字
-2. 按住 **edit trigger**(Win 預設 F13、Mac 預設 Right Command)講指令 — 例如「改成正式語氣」「translate to English」「縮短」「改寫成命令句」
-3. 放開 → daemon 把選取文字 + 指令送進 polish LLM(同 Qwen3-4B,不同 prompt)→ 結果取代選取
-4. 原 clipboard 自動還原(`try/finally` 保證)
-
-**平台預設(per-platform,定義在 `stt_platform_{win,mac}.py` 的 `default_edit_trigger_keys`)**:
-- **Win**: `{Key.f13}` — full-size 鍵盤幾乎都有 F13,不衝突任何 OS 快捷;TKL/筆電鍵盤沒 F13 需要 override
-- **Mac**: `{Key.cmd_r}` — Right Command,跟 Right Option(dictate)在 space 右側對稱、所有 Mac 鍵盤都有(含 MacBook),且不會跟 Left Option 的死鍵(`Option+e` → é 等)衝突
-
-**設定範例**(在 `scripts/stt-daemon.py` 頂端):
-```python
-EDIT_TRIGGER_KEYS = None                     # 用平台預設(Win: F13 / Mac: Right Cmd)
-EDIT_TRIGGER_KEYS = {Key.f13}                # 強制 F13 不論平台
-EDIT_TRIGGER_KEYS = {Key.cmd_r}              # 強制 Right Command(Mac)
-EDIT_TRIGGER_KEYS = {Key.menu}               # Win 沒 F13 的 TKL 鍵盤可選 Menu 鍵
-EDIT_TRIGGER_KEYS = set()                    # 停用 voice-edit
-```
-
-**Selection 抓不到時**:daemon 播一個 220 Hz 的「dull」失敗 beep(跟啟動 880 Hz / 結束 660 Hz 都不同),log 寫 `[stt] voice-edit: no selection captured`。常見原因:(a) 你沒選取文字、(b) focused app 不支援 Cmd+C / Ctrl+C(影像檢視器、終端輸出 pane 等)。
-
-**架構重點**:
-- **Pasteboard ABC 加 3 個 method**:`get_text` / `clipboard_seqno` / `simulate_copy`。Win 用 `GetClipboardSequenceNumber` + SendInput Ctrl+C(對應現有 paste 的 Ctrl+V);Mac 用 `NSPasteboard.changeCount` + Quartz CGEvent Cmd+C(對應現有 Cmd+V),osascript fallback 處理 Accessibility 未授權狀態。**沒引入新 input library** — 跟現有 paste path 用同個機制。
-- **TextPostProcessor.edit() 新介面**:`edit(selection, instruction) -> str | None`。`None` 是顯性失敗訊號(polish() 是回傳 input,但 edit 回傳 input 等於 paste 回原文 — 用戶以為沒按到 → 不清楚)。`NoopPolisher.edit() = None`(沒 polish 就沒辦法 edit)、`MlxLocalLlmPolisher` + `TorchLocalLlmPolisher` 共用新抽出的 `_run_generation` private helper(polish() 也 refactor 走同一個 helper、零回歸 — 23 個原 polish bench case 全綠)。
-- **EDIT_PROMPT 雙語設計**:中文 + 英文兩段,核心規則「輸出語言預設與選取的文字相同;若指令明確要求換語言則依指令」。實測 6 個 fixture case 全 pass(中保中、英保英、中→英 explicit translate、英→中 explicit translate、formality change、shorten、識別字保留)。
-- **Edit budget heuristic**:`max(256, min(3 × selection_tokens, max_tokens))`。Polish 用 1.2× 因為 minimum-edit;edit 可能 expand(「expand」「translate from Chinese to English」常常變長),3× 加 floor 256 給足空間。
-- **No prefix cache for edit (v0.7.5)**:edit 的 system prompt 跟 polish 不同,要另建 cache 增加 startup 150-300 ms;edit 預估呼叫頻率比 polish 低 ~10×,amortise 不過。若實測 edit latency 不可接受再加 (`v0.7.5.1` follow-up)。
-
-**Bench**(local-only,`pytest tests/ --run-polish-bench`):**29/29 全綠**(23 polish + 6 edit)。**0 polish regression** — `_run_generation` refactor 沒破壞任何既有行為。
-
-**Investment**:~4 day solo(原 plan 估)。實際:**~半天** — Pasteboard ABC + Win/Mac 約 1.5 hr、polisher.edit + refactor 約 1.5 hr、daemon 接線約 1 hr、9 state-machine tests + 6 fixture case + bench loader 約 1.5 hr。
-
-**Key-repeat hotfix**(smoke test 時抓到):Windows OS 在 F13 被按住時會持續發 key-repeat 事件(~24×/s),原版的 `_active_trigger` 早期 return 寫在 `_capture_selection` **之後**,導致每個 repeat 都跑 100 ms 選取偵測 + 模擬 Ctrl+C + 放失敗 beep + flood log。每按一次 F13 聽到 20+ 個失敗音,蓋過實際成功訊號讓用戶以為「沒運作」。修正:把早期 return hoisted 到 selection capture 之前,加 `test_edit_press_skips_capture_on_key_repeat` regression guard。
-
-**Tests + CI**(v0.7.5 同步):新增 9 個 voice-edit state-machine test + 1 個 key-repeat regression test(hotkey 路由、selection capture、edit-mode dispatch、clipboard 還原 on success / on polish failure / on busy、key-repeat skip)+ 6 個 edit fixture case(語言保留 × 2、explicit translate × 2、formality、shorten、技術識別字保留)。整套狀態機 test 從 33 → 43 個(全 mock 不需 GPU,本地 + CI 都 ~5s)。
+| 版本 | 主題 | 影響 / 結果 |
+|------|------|------------|
+| **v0.7.0** | Polish model 升 Qwen3-4B-Instruct-2507 | 修 Qwen2.5-1.5B 翻譯英文 keyword、改主詞、語義反向、過度書面化等 4 類品質問題 |
+| **v0.7.1** | Polish decode lossless 加速 -55% | PLD + 預 cache POLISH_PROMPT KV + cuDNN benchmark,長文 4.26s → 1.90s,quality byte-identical |
+| **v0.7.2** | Correctness sweep + clipboard direct API | 修 3 個 correctness bug + ctypes/PyObjC 取代 subprocess(每次 paste 省 250-450 ms)+ dynamic max_tokens + silence trim + tests/CI |
+| **v0.7.3** | Encoder pipelining framework(shipped DISABLED) | **Bench-first save**:plan 估省 50%,實測 3%,framework 留著但預設關 |
+| **v0.7.4** | Polish prompt 標點保留修正 | Live-log discovered;三軸並進(正向約束 + 負向約束 + few-shot)修好多句中間「。」被刪 |
+| **v0.7.5** | Voice-Edit 模式上線 | 第二個 trigger 熱鍵(Mac Right Command / Win F13),選取 + 講指令 → LLM 改寫選取 |
 
 ### 提示音說明
 
