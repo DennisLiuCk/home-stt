@@ -67,6 +67,15 @@ daemon = _load_daemon_module()
 # means a future module-default flip doesn't require touching this file.
 _ORIGINAL_ENCODER_PIPELINING = daemon.ENCODER_PIPELINING
 
+# Mute beeps globally for the test session. Several tests exercise
+# _on_press which calls _play_beep, which calls sd.query_devices() +
+# sd.play(). On headless CI runners (macOS GitHub Actions in particular)
+# there's no audio device — sounddevice / PortAudio segfault with
+# Abort trap (SIGABRT, exit 134) before Python's try/except in
+# _play_beep can catch it (native crash, not a Python exception).
+# Tests don't care about audio feedback; just disable for safety.
+daemon.BEEPS_ENABLED = False
+
 
 def _reset_daemon_state():
     """Single source of truth for the clean-state baseline used by
