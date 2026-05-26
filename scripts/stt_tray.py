@@ -135,6 +135,13 @@ def _poll_state(icon, interval: float = 0.3) -> None:
                     except Exception:
                         pass
 
+        # Auto-quit when daemon stops (so `home-stt stop` closes both)
+        if state == "stopped" and prev_state is not None and prev_state != "stopped":
+            icon.notify("Daemon stopped", "home-stt")
+            time.sleep(2)
+            icon.stop()
+            return
+
         prev_state = state
         time.sleep(interval)
 
