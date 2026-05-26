@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "home-stt"
-version = "0.7.5"
+version = "0.8.0"
 description = "Hold-to-talk speech-to-text daemon with LLM polish (macOS + Windows)."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -35,7 +35,7 @@ import stt_streaming
 # ---------------------------------------------------------------------------
 
 def test_version_bumped(fresh_daemon):
-    assert fresh_daemon.__version__ == "0.7.5"
+    assert fresh_daemon.__version__ == "0.8.0"
 
 
 def test_polish_languages_is_zh_only(fresh_daemon):
