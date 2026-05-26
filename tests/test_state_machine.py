@@ -18,6 +18,7 @@ Covered:
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from unittest.mock import MagicMock
@@ -255,7 +256,7 @@ def test_on_release_has_drain_delay(fresh_daemon):
     assert fresh_daemon._recording is False
 
 
-def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, capfd):
+def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
     """C1 corner case: user re-presses during the drain window.
     _on_release should leave _recording=True (so the new press
     continues capturing) and skip its transcribe spawn — the new
@@ -264,18 +265,18 @@ def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, capfd):
     _install_inert_mocks(fresh_daemon)
     fresh_daemon._on_press(Key.alt_r)
 
-    release_thread = threading.Thread(
-        target=fresh_daemon._on_release, args=(Key.alt_r,),
-    )
-    release_thread.start()
-    time.sleep(0.02)  # 20ms into the 60ms drain
-    fresh_daemon._on_press(Key.alt_r)  # new press while still draining
-    release_thread.join(timeout=1.0)
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        release_thread = threading.Thread(
+            target=fresh_daemon._on_release, args=(Key.alt_r,),
+        )
+        release_thread.start()
+        time.sleep(0.02)  # 20ms into the 60ms drain
+        fresh_daemon._on_press(Key.alt_r)  # new press while still draining
+        release_thread.join(timeout=1.0)
 
     assert fresh_daemon._recording is True, "new press should keep capturing"
     assert fresh_daemon._active_trigger == Key.alt_r
-    out, err = capfd.readouterr()
-    assert "aborted" in (out + err).lower()
+    assert "aborted" in caplog.text.lower()
 
 
 def test_on_release_ignores_non_active_key(fresh_daemon):
@@ -313,7 +314,7 @@ def test_audio_callback_appends_only_when_recording(fresh_daemon):
     assert fresh_daemon._recording_samples == 100
 
 
-def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, capfd):
+def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, caplog):
     """C3: a chunk that pushes _recording_samples past
     MAX_AUDIO_SEC * SAMPLE_RATE should force _recording=False."""
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
@@ -325,17 +326,17 @@ def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, capfd):
     # One big chunk = full MAX_AUDIO_SEC worth of samples. Real PortAudio
     # callbacks are 50ms but the threshold check is purely sample-count.
     big = np.zeros((sr * fresh_daemon.MAX_AUDIO_SEC, 1), dtype=np.float32)
-    fresh_daemon._audio_callback(big, big.shape[0], None, None)
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        fresh_daemon._audio_callback(big, big.shape[0], None, None)
     assert fresh_daemon._recording is False
-    out, err = capfd.readouterr()
-    assert "auto-stop" in (out + err).lower()
+    assert "auto-stop" in caplog.text.lower()
 
 
 # ---------------------------------------------------------------------------
 # _transcribe_and_emit — busy path (C2 regression)
 # ---------------------------------------------------------------------------
 
-def test_transcribe_busy_clears_buffer_and_logs(fresh_daemon, capfd):
+def test_transcribe_busy_clears_buffer_and_logs(fresh_daemon, caplog):
     """C2: pre-v0.7.2 the busy early-return silently left captured audio
     in _buffer where the NEXT transcribe call would merge it with the
     next utterance. Now: explicitly drop, log, and clear."""
@@ -348,28 +349,28 @@ def test_transcribe_busy_clears_buffer_and_logs(fresh_daemon, capfd):
     ]
     fresh_daemon._recording_samples = chunk_size * 100
 
-    fresh_daemon._transcribe_and_emit()
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        fresh_daemon._transcribe_and_emit()
 
     assert fresh_daemon._buffer == [], "busy path must clear buffer"
     assert fresh_daemon._recording_samples == 0
-    out, err = capfd.readouterr()
-    combined = (out + err).lower()
+    combined = caplog.text.lower()
     assert "busy" in combined
     assert "drop" in combined  # "dropped 5.00s..."
 
 
-def test_transcribe_busy_with_empty_buffer_is_silent(fresh_daemon, capfd):
+def test_transcribe_busy_with_empty_buffer_is_silent(fresh_daemon, caplog):
     """The busy log should only fire if there was actually audio to drop —
     a no-op busy bail (e.g. release with empty buffer) shouldn't spam."""
     fresh_daemon._processing = True
     fresh_daemon._buffer = []
     fresh_daemon._recording_samples = 0
 
-    fresh_daemon._transcribe_and_emit()
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        fresh_daemon._transcribe_and_emit()
 
-    out, err = capfd.readouterr()
     # Should NOT log "busy ... dropped" when there was nothing to drop.
-    assert "busy" not in (out + err).lower()
+    assert "busy" not in caplog.text.lower()
 
 
 # ===========================================================================
@@ -471,31 +472,26 @@ def test_release_signals_stop_event_before_transcribe_spawn(fresh_daemon):
     assert fresh_daemon._encoder_stop_event.is_set()
 
 
-def test_encoder_crash_sets_failure_flag(fresh_daemon, capfd):
+def test_encoder_crash_sets_failure_flag(fresh_daemon, caplog):
     """Worker's push_chunk raising → worker catches, sets
     _encoder_failed=True, increments _encoder_consecutive_failures.
     _transcribe_and_emit reads the flag and falls back to batch."""
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_inert_mocks(fresh_daemon, streaming=True)
-    # Wire push_chunk to raise on the first call. Worker triggers
-    # push_chunk only after accumulating ENCODER_CHUNK_SEC of audio,
-    # so we'll feed enough to cross that threshold.
     fresh_daemon._backend.push_chunk.side_effect = RuntimeError("boom")
-    fresh_daemon._on_press(Key.alt_r)
-    # Feed one big 5.1s chunk so worker definitely pushes once.
-    sr = fresh_daemon.SAMPLE_RATE
-    big = _voiced_chunk(int(sr * 5.1))
-    fresh_daemon._audio_callback(big, big.shape[0], None, None)
-    # Give worker time to drain queue + try push_chunk + raise + set flag
-    fresh_daemon._encoder_stop_event.set()
-    fresh_daemon._encoder_thread.join(timeout=2.0)
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        fresh_daemon._on_press(Key.alt_r)
+        sr = fresh_daemon.SAMPLE_RATE
+        big = _voiced_chunk(int(sr * 5.1))
+        fresh_daemon._audio_callback(big, big.shape[0], None, None)
+        fresh_daemon._encoder_stop_event.set()
+        fresh_daemon._encoder_thread.join(timeout=2.0)
     assert fresh_daemon._encoder_failed is True
     assert fresh_daemon._encoder_consecutive_failures >= 1
-    out, err = capfd.readouterr()
-    assert "encoder worker crashed" in (out + err).lower()
+    assert "encoder worker crashed" in caplog.text.lower()
 
 
-def test_finalize_timeout_falls_back_to_batch(fresh_daemon, capfd, monkeypatch):
+def test_finalize_timeout_falls_back_to_batch(fresh_daemon, caplog, monkeypatch):
     """If the encoder worker is stuck (e.g. mid-forward on a slow GPU)
     when _transcribe_and_emit tries to join it, the join must time out
     within ENCODER_FINALIZE_TIMEOUT seconds and the batch path takes
@@ -504,31 +500,21 @@ def test_finalize_timeout_falls_back_to_batch(fresh_daemon, capfd, monkeypatch):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_inert_mocks(fresh_daemon, streaming=True)
 
-    # Worker will block in push_chunk until we release this Event. Using
-    # an Event (instead of a long time.sleep) lets the test release the
-    # hang at teardown — otherwise the orphaned worker thread keeps
-    # running with mock state, leaks across tests, and breaks the
-    # 100-cycle test that checks for leaked workers.
     release_hang = threading.Event()
     def hang_until_event(handle, samples):
         release_hang.wait(timeout=30)
     fresh_daemon._backend.push_chunk.side_effect = hang_until_event
 
     try:
-        fresh_daemon._on_press(Key.alt_r)
-        # Feed enough audio (5.1 s) so the worker invokes push_chunk
-        sr = fresh_daemon.SAMPLE_RATE
-        big = _voiced_chunk(int(sr * 5.1))
-        fresh_daemon._audio_callback(big, big.shape[0], None, None)
-        # Brief delay so worker actually enters push_chunk before release
-        time.sleep(0.15)
-        fresh_daemon._on_release(Key.alt_r)
-        # _transcribe_and_emit thread budget: 80 ms drain (in _on_release)
-        # + 200 ms finalize-join timeout + 2.0 s abort join + batch transcribe
-        # (instant mock). Wait 3 s for the full path.
-        time.sleep(3.0)
-        out, err = capfd.readouterr()
-        combined = (out + err).lower()
+        with caplog.at_level(logging.DEBUG, logger="stt"):
+            fresh_daemon._on_press(Key.alt_r)
+            sr = fresh_daemon.SAMPLE_RATE
+            big = _voiced_chunk(int(sr * 5.1))
+            fresh_daemon._audio_callback(big, big.shape[0], None, None)
+            time.sleep(0.15)
+            fresh_daemon._on_release(Key.alt_r)
+            time.sleep(3.0)
+        combined = caplog.text.lower()
         assert ("encoder join timed out" in combined
                 or "encoder finalize" in combined)
         # Batch transcribe must have been called as fallback
@@ -748,21 +734,21 @@ def test_edit_press_captures_selection(fresh_daemon):
     fresh_daemon._pasteboard.simulate_copy.assert_called_once()
 
 
-def test_edit_press_aborts_when_no_selection(fresh_daemon, capfd):
+def test_edit_press_aborts_when_no_selection(fresh_daemon, caplog):
     """If the focused app has no selection (seqno doesn't bump after
     simulate_copy), the daemon should NOT start recording, edit state
     stays clean, fail beep would have played."""
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_edit_mocks(fresh_daemon, seqno_bumps=False)
 
-    fresh_daemon._on_press(Key.f13)
+    with caplog.at_level(logging.DEBUG, logger="stt"):
+        fresh_daemon._on_press(Key.f13)
 
     assert fresh_daemon._recording is False
     assert fresh_daemon._edit_mode is False
     assert fresh_daemon._edit_selection is None
     assert fresh_daemon._active_trigger is None
-    out, err = capfd.readouterr()
-    assert "no selection" in (out + err).lower()
+    assert "no selection" in caplog.text.lower()
 
 
 def test_edit_press_routes_release_to_transcribe_and_emit_edit(fresh_daemon,

@@ -21,6 +21,7 @@ imports this module when `sys.platform == "win32"`.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import site
 import subprocess
@@ -28,6 +29,8 @@ import sys
 from ctypes import wintypes
 
 from pynput.keyboard import Key
+
+logger = logging.getLogger("stt.platform")
 
 from stt_platform import Pasteboard
 
@@ -147,16 +150,14 @@ def _set_clipboard_text(text: str, *, retries: int = 5,
     h_mem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, size)
     if not h_mem:
         err = ctypes.get_last_error()
-        print(f"[stt] clipboard: GlobalAlloc({size}) failed (errno={err})",
-              file=sys.stderr, flush=True)
+        logger.warning("clipboard: GlobalAlloc(%d) failed (errno=%d)", size, err)
         return False
 
     ptr = _kernel32.GlobalLock(h_mem)
     if not ptr:
         err = ctypes.get_last_error()
         _kernel32.GlobalFree(h_mem)
-        print(f"[stt] clipboard: GlobalLock failed (errno={err})",
-              file=sys.stderr, flush=True)
+        logger.warning("clipboard: GlobalLock failed (errno=%d)", err)
         return False
     try:
         ctypes.memmove(ptr, encoded, size)
@@ -176,8 +177,8 @@ def _set_clipboard_text(text: str, *, retries: int = 5,
     if not opened:
         err = ctypes.get_last_error()
         _kernel32.GlobalFree(h_mem)
-        print(f"[stt] clipboard: OpenClipboard failed after {retries} "
-              f"attempts (errno={err})", file=sys.stderr, flush=True)
+        logger.warning("clipboard: OpenClipboard failed after %d attempts "
+                       "(errno=%d)", retries, err)
         return False
 
     try:
@@ -185,8 +186,7 @@ def _set_clipboard_text(text: str, *, retries: int = 5,
         if not _user32.SetClipboardData(_CF_UNICODETEXT, h_mem):
             err = ctypes.get_last_error()
             _kernel32.GlobalFree(h_mem)  # ownership not transferred on failure
-            print(f"[stt] clipboard: SetClipboardData failed (errno={err})",
-                  file=sys.stderr, flush=True)
+            logger.warning("clipboard: SetClipboardData failed (errno=%d)", err)
             return False
         # Success — clipboard now owns h_mem. Do NOT GlobalFree.
         return True
@@ -334,8 +334,7 @@ class WindowsPasteboard(Pasteboard):
         try:
             return int(_user32.GetClipboardSequenceNumber())
         except Exception as e:
-            print(f"[stt] clipboard: GetClipboardSequenceNumber failed ({e})",
-                  file=sys.stderr, flush=True)
+            logger.warning("clipboard: GetClipboardSequenceNumber failed (%s)", e)
             return None
 
     def simulate_copy(self) -> bool:
@@ -366,8 +365,7 @@ class WindowsPasteboard(Pasteboard):
         arr = (_INPUT * n)(*inputs)
         sent = _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
         if sent != n:
-            print(f"[stt] SendInput partial: sent {sent}/{n} events "
-                  f"({label} failed)",
-                  file=sys.stderr, flush=True)
+            logger.warning("SendInput partial: sent %d/%d events (%s failed)",
+                          sent, n, label)
             return False
         return True

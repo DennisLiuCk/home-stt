@@ -18,6 +18,7 @@ Custom CLI options:
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -31,6 +32,12 @@ _SCRIPTS_DIR = _REPO_ROOT / "scripts"
 # Make scripts/ importable so stt-daemon's `from stt_platform import ...`
 # / `from text_polisher import ...` succeed.
 sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Configure the "stt" logger so pytest's caplog fixture captures messages.
+# No StreamHandler needed — pytest's log capture plugin handles it.
+_stt_logger = logging.getLogger("stt")
+_stt_logger.setLevel(logging.DEBUG)
+_stt_logger.propagate = True
 
 
 def pytest_addoption(parser):

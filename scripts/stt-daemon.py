@@ -39,6 +39,7 @@ Platform abstraction
 """
 from __future__ import annotations
 
+import logging
 import os
 import platform as _host_platform
 import queue
@@ -48,6 +49,8 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger("stt")
 
 # v0.7.1: PyTorch CUDA allocator hint — reduces fragmentation from the
 # polish KV cache + tokenizer scratch allocations that happen on every
@@ -433,7 +436,7 @@ def _play_beep(freq_hz: float,
         sd.play(wave, samplerate=sr)
     except Exception as e:
         # Beep is purely cosmetic — never let it break transcription.
-        print(f"[stt] beep failed: {e}", file=sys.stderr, flush=True)
+        logger.debug(f"beep failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +559,7 @@ class FasterWhisperBackend(STTBackend):
                                        compute_type="float16")
             self._device_label = "CUDA (float16)"
         except Exception as e:
-            print(f"[stt] CUDA load failed ({e}); falling back to CPU int8.",
-                  flush=True)
+            logger.info(f"CUDA load failed ({e}); falling back to CPU int8.")
             self._model = WhisperModel(model_name, device="cpu",
                                        compute_type="int8")
             self._device_label = "CPU (int8)"
@@ -844,10 +846,9 @@ class _Qwen3TorchImpl:
         stream_tag = " + streaming" if self._streaming_ok else ""
         self.device_label = f"{gpu_name} (bfloat16) — Qwen3-ASR{stream_tag}"
         if not self._streaming_ok:
-            print("[stt] qwen-asr streaming attrs missing — encoder "
-                  "pipelining disabled for this session, daemon will "
-                  "use batch path (v0.7.2 behaviour)",
-                  file=sys.stderr, flush=True)
+            logger.warning("qwen-asr streaming attrs missing — encoder "
+                           "pipelining disabled for this session, daemon will "
+                           "use batch path (v0.7.2 behaviour)")
 
     def supports_streaming(self) -> bool:
         # Both ENCODER_PIPELINING (daemon-side switch) AND _streaming_ok
@@ -915,12 +916,11 @@ def build_backend_with_fallback() -> STTBackend:
     try:
         return build_backend(STT_BACKEND, STT_MODEL)
     except (ImportError, ModuleNotFoundError) as e:
-        print(
-            f"[stt] backend '{STT_BACKEND}' missing required package: "
+        logger.warning(
+            f"backend '{STT_BACKEND}' missing required package: "
             f"{e}. Falling back to faster-whisper. To enable "
             f"{STT_BACKEND}, see README -> Windows 安裝步驟 (install "
-            f"torch+CUDA wheel before `pip install qwen-asr`).",
-            file=sys.stderr, flush=True,
+            f"torch+CUDA wheel before `pip install qwen-asr`)."
         )
     except Exception as e:
         # Three actionable failure classes (mirrors build_polisher):
@@ -954,20 +954,18 @@ def build_backend_with_fallback() -> STTBackend:
             )
         else:
             hint = ""
-        print(
-            f"[stt] backend '{STT_BACKEND}' init failed: {e}{hint}. "
-            f"Falling back to faster-whisper.",
-            file=sys.stderr, flush=True,
+        logger.warning(
+            f"backend '{STT_BACKEND}' init failed: {e}{hint}. "
+            f"Falling back to faster-whisper."
         )
 
     try:
         return build_backend("faster-whisper", "large-v3-turbo")
     except Exception as e:
-        print(
-            f"[stt] fatal: faster-whisper fallback also failed: {e}. "
+        logger.critical(
+            f"faster-whisper fallback also failed: {e}. "
             f"Daemon cannot continue — install dependencies per README "
-            f"-> Windows 安裝步驟 and restart.",
-            file=sys.stderr, flush=True,
+            f"-> Windows 安裝步驟 and restart."
         )
         raise SystemExit(1)
 
@@ -1120,8 +1118,7 @@ def _encoder_worker(handle: Any) -> None:
     except Exception as e:
         # Don't print full traceback — log a one-liner and let the
         # batch-fallback path produce the user-visible transcript.
-        print(f"[stt] encoder worker crashed: {type(e).__name__}: {e}",
-              file=sys.stderr, flush=True)
+        logger.warning(f"encoder worker crashed: {type(e).__name__}: {e}")
         with _state_lock:
             _encoder_failed = True
             _encoder_consecutive_failures += 1
@@ -1147,7 +1144,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
     global _encoder_silence_run_samples, _encoder_use_batch_fallback
     global _encoder_failed, _encoder_consecutive_failures
     if status:
-        print(f"[stt] audio status: {status}", file=sys.stderr, flush=True)
+        logger.debug(f"audio status: {status}")
 
     # Per-callback chunk stats. RMS uses float64 to avoid bf16/fp32 round
     # cancellation on very-low-amplitude room tone.
@@ -1209,8 +1206,8 @@ def _audio_callback(indata, frames, time_info, status) -> None:
             # Push the first chunk to the queue too — worker is now ready.
             push_to_encoder = True
         except Exception as e:
-            print(f"[stt] encoder spawn failed: {type(e).__name__}: {e}; "
-                  f"will use batch path", file=sys.stderr, flush=True)
+            logger.warning(f"encoder spawn failed: {type(e).__name__}: {e}; "
+                           f"will use batch path")
             with _state_lock:
                 _encoder_failed = True
                 _encoder_consecutive_failures += 1
@@ -1227,8 +1224,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
                 _encoder_use_batch_fallback = True
 
     if auto_stop:
-        print(f"[stt] auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger",
-              file=sys.stderr, flush=True)
+        logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
         threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
@@ -1256,8 +1252,8 @@ def _abort_encoder_quiet() -> None:
         try:
             _backend.abort(_encoder_handle)
         except Exception as e:
-            print(f"[stt] encoder abort raised (ignored): "
-                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            logger.warning(f"encoder abort raised (ignored): "
+                           f"{type(e).__name__}: {e}")
     with _state_lock:
         _encoder_active = False
 
@@ -1278,9 +1274,9 @@ def _transcribe_and_emit() -> None:
             _buffer = []
             _recording_samples = 0
             if dropped_chunks > 0:
-                print(f"[stt] busy — dropped {dropped_sec:.2f}s of captured "
-                      f"audio ({dropped_chunks} blocks; previous transcribe "
-                      f"still running)", flush=True)
+                logger.info(f"busy — dropped {dropped_sec:.2f}s of captured "
+                            f"audio ({dropped_chunks} blocks; previous transcribe "
+                            f"still running)")
             return
         _processing = True
         chunks = _buffer
@@ -1320,9 +1316,8 @@ def _transcribe_and_emit() -> None:
                 _encoder_thread.join(timeout=ENCODER_FINALIZE_TIMEOUT)
             join_elapsed = time.time() - t0
             if _encoder_thread is not None and _encoder_thread.is_alive():
-                print(f"[stt] encoder join timed out after "
-                      f"{join_elapsed:.1f}s — falling back to batch path",
-                      file=sys.stderr, flush=True)
+                logger.warning(f"encoder join timed out after "
+                               f"{join_elapsed:.1f}s — falling back to batch path")
                 _abort_encoder_quiet()
                 with _state_lock:
                     _encoder_failed = True
@@ -1351,9 +1346,8 @@ def _transcribe_and_emit() -> None:
                     _encoder_consecutive_failures = 0  # success → reset
                     _encoder_active = False
             except Exception as e:
-                print(f"[stt] encoder finalize raised "
-                      f"{type(e).__name__}: {e}; falling back to batch",
-                      file=sys.stderr, flush=True)
+                logger.warning(f"encoder finalize raised "
+                               f"{type(e).__name__}: {e}; falling back to batch")
                 try:
                     _backend.abort(_encoder_handle)
                 except Exception:
@@ -1376,11 +1370,10 @@ def _transcribe_and_emit() -> None:
                 # Could be (a) too-short tap or (b) all-silence after trim.
                 trim_sec = len(trimmed) / SAMPLE_RATE
                 if trim_sec < raw_sec * 0.5 and raw_sec >= MIN_AUDIO_SEC:
-                    print(f"[stt] silent — trimmed {raw_sec:.2f}s → "
-                          f"{trim_sec:.2f}s; mic muted or very quiet?",
-                          flush=True)
+                    logger.info(f"silent — trimmed {raw_sec:.2f}s → "
+                                f"{trim_sec:.2f}s; mic muted or very quiet?")
                 else:
-                    print(f"[stt] too short ({raw_sec:.2f}s)", flush=True)
+                    logger.info(f"too short ({raw_sec:.2f}s)")
                 return
             t0 = time.time()
             raw, language = _backend.transcribe(trimmed)
@@ -1388,8 +1381,7 @@ def _transcribe_and_emit() -> None:
             # path_label already "batch"
 
         if not raw:
-            print(f"[stt] empty ({language}, {elapsed:.2f}s, {path_label})",
-                  flush=True)
+            logger.info(f"empty ({language}, {elapsed:.2f}s, {path_label})")
             return
         text = post_process(raw)
         pre_polish = text  # captured to log diff when polish edits substantively
@@ -1425,9 +1417,8 @@ def _transcribe_and_emit() -> None:
         # suppress the success beep + use a different log line so the user
         # sees one consistent signal of what actually happened.
         if not _pasteboard.set_text(text):
-            print(f"[stt] {language} {elapsed:.2f}s clipboard write failed — "
-                  f"'{text}' NOT inserted",
-                  file=sys.stderr, flush=True)
+            logger.error(f"{language} {elapsed:.2f}s clipboard write failed — "
+                         f"'{text}' NOT inserted")
             return
         # v0.7.2: was 0.15 s, dropped to 0.02 s. The original sleep was
         # primarily compensating for PowerShell Set-Clipboard / pbcopy
@@ -1461,21 +1452,19 @@ def _transcribe_and_emit() -> None:
             # polish_edited (computed before the OpenCC backstop) so edits
             # that the backstop normalises away are still surfaced.
             if polish_edited:
-                print(f"[stt] {language} raw   -> {pre_polish}", flush=True)
+                logger.info(f"{language} raw   -> {pre_polish}")
             if paste_ok:
-                print(f"[stt] {language} {timing}{path_tag} -> {text}",
-                      flush=True)
+                logger.info(f"{language} {timing}{path_tag} -> {text}")
             else:
                 # paste() already printed a user-facing 'paste blocked' line
                 # to the main log; we record the transcript itself so it's
                 # discoverable even when auto-paste didn't fire.
-                print(f"[stt] {language} {timing}{path_tag} "
-                      f"clipboard-only -> {text}", flush=True)
+                logger.info(f"{language} {timing}{path_tag} "
+                            f"clipboard-only -> {text}")
         except Exception:
-            print(f"[stt] inserted ({elapsed:.2f}s); log encoding failed",
-                  flush=True)
+            logger.info(f"inserted ({elapsed:.2f}s); log encoding failed")
     except Exception as e:
-        print(f"[stt] error: {e}", file=sys.stderr, flush=True)
+        logger.error(f"{e}")
     finally:
         with _state_lock:
             _processing = False
@@ -1547,8 +1536,8 @@ def _transcribe_and_emit_edit(selection: str,
             _buffer = []
             _recording_samples = 0
             if dropped_chunks > 0:
-                print(f"[stt] busy — dropped {dropped_sec:.2f}s of voice-edit "
-                      f"audio ({dropped_chunks} blocks)", flush=True)
+                logger.info(f"busy — dropped {dropped_sec:.2f}s of voice-edit "
+                            f"audio ({dropped_chunks} blocks)")
             # Still need to restore the original clipboard even on busy-
             # drop, because _on_press already overwrote it via simulate_copy.
             _try_restore_clipboard(original_clipboard, context="busy-drop")
@@ -1559,24 +1548,22 @@ def _transcribe_and_emit_edit(selection: str,
         _recording_samples = 0
     try:
         if not chunks:
-            print("[stt] voice-edit: empty audio (no instruction)",
-                  flush=True)
+            logger.info("voice-edit: empty audio (no instruction)")
             return
         samples_arr = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
         raw_sec = len(samples_arr) / SAMPLE_RATE
         trimmed = _trim_silence(samples_arr)
         if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
-            print(f"[stt] voice-edit: too short ({raw_sec:.2f}s) — "
-                  f"no instruction captured",
-                  flush=True)
+            logger.info(f"voice-edit: too short ({raw_sec:.2f}s) — "
+                        f"no instruction captured")
             return
         # ASR transcribes the spoken instruction
         t0 = time.time()
         instruction_raw, language = _backend.transcribe(trimmed)
         asr_elapsed = time.time() - t0
         if not instruction_raw.strip():
-            print(f"[stt] voice-edit: empty transcript ({language}, "
-                  f"{asr_elapsed:.2f}s)", flush=True)
+            logger.info(f"voice-edit: empty transcript ({language}, "
+                        f"{asr_elapsed:.2f}s)")
             return
         # OpenCC normalisation on the instruction (Qwen3-ASR outputs
         # simplified natively — same logic as polish path).
@@ -1588,16 +1575,15 @@ def _transcribe_and_emit_edit(selection: str,
         edit_elapsed = time.time() - t1
         if edited is None:
             _play_beep(BEEP_FAIL_HZ)
-            print(f"[stt] voice-edit: polish.edit returned None "
-                  f"(instruction: {instruction!r})", flush=True)
+            logger.warning(f"voice-edit: polish.edit returned None "
+                           f"(instruction: {instruction!r})")
             return
         edited = post_process(edited)  # backstop simplified→traditional
 
         # Paste result
         if not _pasteboard.set_text(edited):
-            print(f"[stt] voice-edit: clipboard write failed — "
-                  f"'{edited}' NOT inserted",
-                  file=sys.stderr, flush=True)
+            logger.error(f"voice-edit: clipboard write failed — "
+                         f"'{edited}' NOT inserted")
             return
         time.sleep(0.02)
         paste_ok = _pasteboard.paste()
@@ -1605,18 +1591,16 @@ def _transcribe_and_emit_edit(selection: str,
             _play_beep(BEEP_END_HZ)
             # Compact log: instruction + before/after lets user diff in
             # the daemon log without re-deriving from clipboard history.
-            print(f"[stt] voice-edit ({language}, {asr_elapsed:.2f}s+"
-                  f"edit {edit_elapsed:.2f}s)\n"
-                  f"  instr:  {instruction}\n"
-                  f"  before: {selection}\n"
-                  f"  after:  {edited}",
-                  flush=True)
+            logger.info(f"voice-edit ({language}, {asr_elapsed:.2f}s+"
+                        f"edit {edit_elapsed:.2f}s) "
+                        f"instr: {instruction} | "
+                        f"before: {selection} | "
+                        f"after: {edited}")
         else:
-            print(f"[stt] voice-edit: paste keystroke failed — '{edited}' "
-                  f"on clipboard, press Ctrl+V/Cmd+V manually",
-                  flush=True)
+            logger.warning(f"voice-edit: paste keystroke failed — '{edited}' "
+                           f"on clipboard, press Ctrl+V/Cmd+V manually")
     except Exception as e:
-        print(f"[stt] voice-edit error: {e}", file=sys.stderr, flush=True)
+        logger.error(f"voice-edit error: {e}")
     finally:
         # Restore original clipboard regardless of success/failure path.
         # User's clipboard history should look like nothing happened
@@ -1635,11 +1619,10 @@ def _try_restore_clipboard(original: str | None, *, context: str) -> None:
         return  # nothing to restore (clipboard was empty pre-capture)
     try:
         if not _pasteboard.set_text(original):
-            print(f"[stt] voice-edit: clipboard restore failed ({context})",
-                  flush=True)
+            logger.warning(f"voice-edit: clipboard restore failed ({context})")
     except Exception as e:
-        print(f"[stt] voice-edit: clipboard restore raised ({context}): "
-              f"{e}", flush=True)
+        logger.warning(f"voice-edit: clipboard restore raised ({context}): "
+                       f"{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1686,16 +1669,16 @@ def _on_press(key) -> None:
         captured = _capture_selection(_pasteboard)
         if captured is None:
             _play_beep(BEEP_FAIL_HZ)
-            print("[stt] voice-edit: no selection captured", flush=True)
+            logger.info("voice-edit: no selection captured")
             return  # DO NOT start recording
         # Verify polisher actually has edit capability — NoopPolisher's
         # edit() returns None unconditionally, so starting a recording
         # we know can't succeed would just waste 1-5s of user effort.
         if _polisher.__class__.__name__ == "NoopPolisher":
             _play_beep(BEEP_FAIL_HZ)
-            print("[stt] voice-edit: POLISH_ENABLED is False — voice-edit "
-                  "requires polish (LLM does the editing). Enable polish "
-                  "or unset EDIT_TRIGGER_KEYS.", flush=True)
+            logger.warning("voice-edit: POLISH_ENABLED is False — voice-edit "
+                           "requires polish (LLM does the editing). Enable polish "
+                           "or unset EDIT_TRIGGER_KEYS.")
             _try_restore_clipboard(captured[1], context="noop-polisher")
             return
 
@@ -1741,7 +1724,7 @@ def _on_press(key) -> None:
             except queue.Empty:
                 break
     edit_tag = " [edit]" if is_edit else ""
-    print(f"[stt] REC ({key}){edit_tag}", flush=True)
+    logger.info(f"REC ({key}){edit_tag}")
     _play_beep(BEEP_START_HZ)
 
 
@@ -1790,7 +1773,7 @@ def _on_release(key) -> None:
             edit_selection_snap = _edit_selection
             edit_original_snap = _edit_original_clipboard
     if abort:
-        print("[stt] release aborted by new press during drain", flush=True)
+        logger.info("release aborted by new press during drain")
         return
     # v0.8.0: signal the encoder worker (if any) to drain remaining queue
     # and exit. _transcribe_and_emit will join the worker before calling
@@ -1800,22 +1783,42 @@ def _on_release(key) -> None:
     if _encoder_active:
         _encoder_stop_event.set()
     if edit_mode_snap:
-        print("[stt] voice-edit processing...", flush=True)
+        logger.info("voice-edit processing...")
         threading.Thread(
             target=_transcribe_and_emit_edit,
             args=(edit_selection_snap, edit_original_snap),
             daemon=True,
         ).start()
     else:
-        print("[stt] processing...", flush=True)
+        logger.info("processing...")
         threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _setup_logging() -> None:
+    """Configure the 'stt' logger hierarchy.
+
+    Format matches the legacy `[stt] <message>` pattern so existing log
+    parsers (home_stt.py status) continue to work. Log level can be
+    overridden via HOME_STT_LOG_LEVEL env var."""
+    level_name = os.environ.get("HOME_STT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("[stt] %(message)s"))
+
+    root = logging.getLogger("stt")
+    root.setLevel(level)
+    root.addHandler(handler)
+
+
 def main() -> None:
     global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
+
+    _setup_logging()
 
     # Load user config (TOML file + env overrides) and apply to module globals.
     import stt_config as _cfg
@@ -1824,22 +1827,22 @@ def main() -> None:
     _cfg.apply_to_module(_user_cfg, _this)
     _cf_path = _cfg.config_path()
     if _cf_path.exists():
-        print(f"[stt] config: {_cf_path}", flush=True)
+        logger.info(f"config: {_cf_path}")
 
     _pasteboard = build_pasteboard()
     n_native = _pasteboard.register_native_libs()
 
-    print(f"[stt] home-stt v{__version__} starting", flush=True)
-    print(f"[stt] platform: {sys.platform} ({_host_platform.machine()}) | "
-          f"native libs registered: {n_native}", flush=True)
-    print(f"[stt] backend: {STT_BACKEND} | model: {STT_MODEL}", flush=True)
+    logger.info(f"home-stt v{__version__} starting")
+    logger.info(f"platform: {sys.platform} ({_host_platform.machine()}) | "
+                f"native libs registered: {n_native}")
+    logger.info(f"backend: {STT_BACKEND} | model: {STT_MODEL}")
     paste_desc = _pasteboard.describe_paste_path()
     if paste_desc:
-        print(f"[stt] paste path: {paste_desc}", flush=True)
+        logger.info(f"paste path: {paste_desc}")
 
     global _polisher
     _polisher = build_polisher(POLISH_ENABLED, POLISH_MODEL, POLISH_PROMPT)
-    print(f"[stt] polish: {_polisher.device_label}", flush=True)
+    logger.info(f"polish: {_polisher.device_label}")
 
     _backend = build_backend_with_fallback()
 
@@ -1851,7 +1854,7 @@ def main() -> None:
     if EDIT_TRIGGER_KEYS is None:
         EDIT_TRIGGER_KEYS = _pasteboard.default_edit_trigger_keys
 
-    print(f"[stt] warming up on {_backend.device_label}...", flush=True)
+    logger.info(f"warming up on {_backend.device_label}...")
     t0 = time.time()
     _backend.warmup()
     trigger_labels = ", ".join(str(k) for k in TRIGGER_KEYS)
@@ -1861,15 +1864,14 @@ def main() -> None:
         # None). Warn at startup so user isn't surprised when the fail
         # beep plays on every edit press.
         if _polisher.__class__.__name__ == "NoopPolisher":
-            print(f"[stt] WARN: EDIT_TRIGGER_KEYS set ({edit_labels}) but "
-                  f"polish is disabled — voice-edit will fail-beep on every "
-                  f"press. Enable polish or unset EDIT_TRIGGER_KEYS.",
-                  file=sys.stderr, flush=True)
-        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
-              f"to dictate, hold {edit_labels} to voice-edit.", flush=True)
+            logger.warning(f"EDIT_TRIGGER_KEYS set ({edit_labels}) but "
+                           f"polish is disabled — voice-edit will fail-beep on every "
+                           f"press. Enable polish or unset EDIT_TRIGGER_KEYS.")
+        logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+                    f"to dictate, hold {edit_labels} to voice-edit.")
     else:
-        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
-              f"to record.", flush=True)
+        logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+                    f"to record.")
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -1884,7 +1886,7 @@ def main() -> None:
     try:
         listener.join()
     except KeyboardInterrupt:
-        print("[stt] bye", flush=True)
+        logger.info("bye")
     finally:
         stream.stop()
         stream.close()
