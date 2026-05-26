@@ -189,7 +189,7 @@ def _read_lines(path: Path) -> list[str]:
 
 # ---- subcommand handlers ----------------------------------------------------
 
-def cmd_start(_args) -> int:
+def cmd_start(args) -> int:
     if sys.platform == "win32":
         script = SCRIPTS_DIR / "stt-start.ps1"
         cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
@@ -199,7 +199,25 @@ def cmd_start(_args) -> int:
     if not script.exists():
         print(f"home-stt: missing start script {script}", file=sys.stderr)
         return 1
-    return subprocess.call(cmd)
+    rc = subprocess.call(cmd)
+    if rc == 0 and getattr(args, "tray", False):
+        _launch_tray_background()
+    return rc
+
+
+def _launch_tray_background() -> None:
+    """Spawn the tray icon as a detached background process."""
+    tray_script = SCRIPTS_DIR / "stt_tray.py"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(tray_script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        print("Tray icon launched.")
+    except Exception as e:
+        print(f"home-stt: tray launch failed: {e}", file=sys.stderr)
 
 
 def cmd_stop(_args) -> int:
@@ -663,9 +681,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Print daemon version and exit.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sub.add_parser("start",   help="Start the daemon, or report it is already running.")
+    p_start = sub.add_parser("start",   help="Start the daemon, or report it is already running.")
+    p_start.add_argument("--tray", action="store_true",
+                         help="Also launch the system tray icon.")
     sub.add_parser("stop",    help="Stop the daemon.")
-    sub.add_parser("restart", help="Stop, settle, then start. Use after config edits.")
+    p_restart = sub.add_parser("restart", help="Stop, settle, then start. Use after config edits.")
+    p_restart.add_argument("--tray", action="store_true",
+                           help="Also launch the system tray icon after restart.")
     sub.add_parser("status",  help="Print PID / uptime / RSS / backend / polish / paste / recent transcribes.")
 
     p_log = sub.add_parser("log", help="Show the daemon log.")
