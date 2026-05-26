@@ -9,15 +9,37 @@ description = "Hold-to-talk speech-to-text daemon with LLM polish (macOS + Windo
 readme = "README.md"
 requires-python = ">=3.10"
 
-# Runtime dependencies are intentionally NOT listed here. They are
-# platform-conditional (mlx-lm on Apple Silicon, torch+CUDA on Windows)
-# and README.md is the source of truth for the per-platform install
-# commands. This manifest exists solely to register the `home-stt`
-# console-script entry point so `pip install -e .` puts it on PATH.
+dependencies = [
+    "numpy>=1.24",
+    "sounddevice>=0.4",
+    "pynput>=1.7",
+    "opencc-python-reimplemented>=0.1.7",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "qwen-asr>=0.1",
+]
+mlx = [
+    "mlx>=0.10",
+    "mlx-lm>=0.10",
+    "mlx-qwen3-asr>=0.1",
+]
+whisper = [
+    "faster-whisper>=1.0",
+]
+toml = [
+    "tomli>=2.0; python_version < '3.11'",
+]
+dev = [
+    "pytest>=7.0",
+]
 
 [project.scripts]
 home-stt = "home_stt:main"
 
 [tool.setuptools]
 package-dir = {"" = "scripts"}
-py-modules = ["home_stt"]
+py-modules = ["home_stt", "stt_config"]

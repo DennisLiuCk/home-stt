@@ -38,6 +38,10 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 DAEMON_SCRIPT = SCRIPTS_DIR / "stt-daemon.py"
 PID_FILE = SCRIPTS_DIR / "stt-daemon.pid"
 
+# Add scripts dir to sys.path so stt_config can be imported.
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 
 def _log_paths() -> tuple[Path, Path]:
     """Match the log paths chosen by stt-start.sh / stt-start.ps1."""
@@ -46,7 +50,13 @@ def _log_paths() -> tuple[Path, Path]:
 
 
 def _daemon_version() -> str:
-    """Read __version__ from stt-daemon.py without importing it."""
+    """Get version from importlib.metadata (pip install), falling back to
+    reading __version__ from stt-daemon.py for dev/standalone runs."""
+    try:
+        from importlib.metadata import version
+        return version("home-stt")
+    except Exception:
+        pass
     try:
         for line in DAEMON_SCRIPT.read_text(encoding="utf-8").splitlines()[:200]:
             m = re.match(r'^__version__\s*=\s*["\']([^"\']+)["\']', line)
@@ -318,33 +328,43 @@ def _follow_log(path: Path) -> int:
         return 1
 
 
-_CONFIG_KEYS = (
-    "STT_BACKEND", "STT_MODEL",
-    "POLISH_ENABLED", "POLISH_MODEL",
-    "TRIGGER_KEYS", "EDIT_TRIGGER_KEYS",
-    "MAX_AUDIO_SEC", "SAMPLE_RATE",
-)
-
-
 def cmd_config(args) -> int:
+    from stt_config import config_path, init_config, load_config, generate_default_config
+
+    if args.init:
+        path = config_path()
+        existed = path.exists()
+        init_config()
+        print(f"Config file: {path}")
+        if existed:
+            print("(already existed — not overwritten)")
+        else:
+            print("(created)")
+        return 0
+
     if args.edit:
+        path = config_path()
+        if not path.exists():
+            init_config()
+            print(f"Created default config: {path}")
         editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR")
                   or ("notepad" if sys.platform == "win32" else "nano"))
-        return subprocess.call([editor, str(DAEMON_SCRIPT)])
-    text = DAEMON_SCRIPT.read_text(encoding="utf-8")
-    print(f"Config (from {DAEMON_SCRIPT}):")
-    seen: set[str] = set()
-    for raw in text.splitlines()[:300]:
-        stripped = raw.lstrip()
-        for key in _CONFIG_KEYS:
-            if key in seen:
-                continue
-            if stripped.startswith(key) and ("=" in stripped):
-                # Trim inline comments for readability.
-                cleaned = raw.split("#", 1)[0].rstrip()
-                print(f"  {cleaned.strip()}")
-                seen.add(key)
-                break
+        return subprocess.call([editor, str(path)])
+
+    if args.path:
+        print(config_path())
+        return 0
+
+    path = config_path()
+    if path.exists():
+        cfg = load_config()
+        print(f"Config (from {path}):")
+        for key, val in sorted(cfg.items()):
+            print(f"  {key} = {val!r}")
+    else:
+        print(f"No config file found. Using code defaults.")
+        print(f"  Config path: {path}")
+        print(f"  Run `home-stt config --init` to create one.")
     return 0
 
 
@@ -378,9 +398,13 @@ def main(argv: list[str] | None = None) -> int:
                        help="Follow new output (Ctrl+C to exit).")
 
     p_cfg = sub.add_parser("config",
-                           help="Print or edit the Config block in stt-daemon.py.")
+                           help="Show, create, or edit the TOML config file.")
+    p_cfg.add_argument("--init", action="store_true",
+                       help="Create a default config.toml if one doesn't exist.")
     p_cfg.add_argument("--edit", action="store_true",
-                       help="Open stt-daemon.py in $VISUAL / $EDITOR / notepad.")
+                       help="Open config.toml in $VISUAL / $EDITOR / notepad.")
+    p_cfg.add_argument("--path", action="store_true",
+                       help="Print the config file path and exit.")
 
     sub.add_parser("version", help="Print home-stt version (same as --version).")
 

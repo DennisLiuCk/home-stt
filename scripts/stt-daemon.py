@@ -1817,6 +1817,15 @@ def _on_release(key) -> None:
 def main() -> None:
     global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
 
+    # Load user config (TOML file + env overrides) and apply to module globals.
+    import stt_config as _cfg
+    _user_cfg = _cfg.load_config()
+    _this = sys.modules[__name__]
+    _cfg.apply_to_module(_user_cfg, _this)
+    _cf_path = _cfg.config_path()
+    if _cf_path.exists():
+        print(f"[stt] config: {_cf_path}", flush=True)
+
     _pasteboard = build_pasteboard()
     n_native = _pasteboard.register_native_libs()
 
