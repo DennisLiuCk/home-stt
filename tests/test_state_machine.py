@@ -661,7 +661,7 @@ def test_100_press_release_cycles_no_deadlock(fresh_daemon):
     # them all. So 0 expected from this test.
     leaked = [t for t in alive
               if getattr(t, "_target", None) is not None
-              and getattr(t._target, "__name__", "") == "_encoder_worker"]
+              and getattr(t._target, "__name__", "") == "_worker"]
     assert leaked == [], f"leaked encoder workers: {leaked}"
 
 

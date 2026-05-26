@@ -76,12 +76,8 @@ class EncoderPipeline:
             except Exception:
                 break
 
-    def on_chunk(
-        self, chunk: np.ndarray, is_silent: bool, backend: Any,
-    ) -> None:
-        """Called from _audio_callback under _state_lock for silence tracking,
-        then outside lock for spawn/push. Returns after dispatching."""
-        # Silence tracking (caller holds _state_lock)
+    def track_silence(self, chunk: np.ndarray, is_silent: bool) -> None:
+        """Update silence tracking counters. Called under _st.lock."""
         if is_silent:
             self.silence_run_samples += chunk.shape[0]
             if (self.silence_run_samples >=
@@ -91,7 +87,10 @@ class EncoderPipeline:
         else:
             self.silence_run_samples = 0
 
-        # Spawn decision
+    def on_chunk(
+        self, chunk: np.ndarray, is_silent: bool, backend: Any,
+    ) -> None:
+        """Encoder spawn + queue push. Called OUTSIDE _st.lock."""
         should_spawn = (
             not self.active
             and ENCODER_PIPELINING
@@ -163,7 +162,13 @@ class EncoderPipeline:
         if self._thread is not None and self._thread.is_alive():
             logger.warning(f"encoder join timed out after "
                            f"{join_elapsed:.1f}s — falling back to batch path")
-            self.abort(backend)
+            self._stop_event.set()
+            if self._handle is not None and backend is not None:
+                try:
+                    backend.abort(self._handle)
+                except Exception:
+                    pass
+            self.active = False
             self.failed = True
             self.consecutive_failures += 1
             return None

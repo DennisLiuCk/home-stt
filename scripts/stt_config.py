@@ -38,14 +38,20 @@ def config_path() -> Path:
 def _parse_key(name: str):
     """Convert a string key name to a pynput Key or character.
 
-    Accepts: 'alt_r', 'cmd_r', 'f13', 'a', etc.
+    Accepts: 'alt_r', 'cmd_r', 'f13', 'a', 'vk_123', etc.
     """
-    from pynput.keyboard import Key
-    upper = name.strip().lower()
-    if hasattr(Key, upper):
-        return getattr(Key, upper)
-    if len(name.strip()) == 1:
-        return name.strip()
+    from pynput.keyboard import Key, KeyCode
+    stripped = name.strip()
+    lower = stripped.lower()
+    if hasattr(Key, lower):
+        return getattr(Key, lower)
+    if len(stripped) == 1:
+        return stripped
+    if lower.startswith("vk_"):
+        try:
+            return KeyCode.from_vk(int(lower[3:]))
+        except (ValueError, TypeError):
+            pass
     raise ValueError(f"Unknown key: {name!r}")
 
 
@@ -219,9 +225,19 @@ def init_config() -> Path:
 
 def _key_to_str(key) -> str:
     """Convert a pynput Key or character back to a config-file string."""
-    from pynput.keyboard import Key
+    from pynput.keyboard import Key, KeyCode
     if isinstance(key, Key):
         return key.name
+    if isinstance(key, KeyCode):
+        if key.char:
+            return key.char
+        if key.vk is not None:
+            vk = key.vk
+            from pynput.keyboard import Key as _K
+            for member in _K:
+                if hasattr(member.value, 'vk') and member.value.vk == vk:
+                    return member.name
+            return f"vk_{vk}"
     return str(key)
 
 
@@ -255,7 +271,7 @@ def update_trigger_keys(
             r"^#?\s*" + _re.escape(key_name) + r"\s*=.*$", _re.MULTILINE
         )
         if pattern.search(content):
-            content = pattern.sub(line, content, count=1)
+            content = pattern.sub(line, content, count=0)
         else:
             # Append after the trigger-keys section header
             marker = "# ── Trigger keys"
@@ -327,7 +343,11 @@ def apply_to_module(cfg: dict[str, Any], module) -> None:
                                ("edit_trigger_keys", "EDIT_TRIGGER_KEYS")]:
         val = cfg.get(cfg_key)
         if val is not None:
-            parsed = _parse_key_set(val)
+            try:
+                parsed = _parse_key_set(val)
+            except ValueError as e:
+                logger.warning("bad %s in config: %s — using default", cfg_key, e)
+                continue
             if parsed is not None:
                 setattr(module, mod_attr, parsed)
 

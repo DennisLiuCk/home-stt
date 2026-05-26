@@ -340,6 +340,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
     is_silent = chunk_rms < _ENCODER_SILENCE_THRESHOLD
 
     auto_stop = False
+    do_encoder = False
     with _st.lock:
         if not _st.recording:
             return
@@ -349,7 +350,11 @@ def _audio_callback(indata, frames, time_info, status) -> None:
             _st.recording = False
             auto_stop = True
         if _encoder is not None:
-            _encoder.on_chunk(chunk, is_silent, _backend)
+            _encoder.track_silence(chunk, is_silent)
+            do_encoder = True
+
+    if do_encoder:
+        _encoder.on_chunk(chunk, is_silent, _backend)
 
     if auto_stop:
         logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
@@ -569,6 +574,7 @@ def _transcribe_and_emit_edit(selection: str,
     gating (the LLM is given an EXPLICIT language-handling rule via
     EDIT_PROMPT, so all language combinations route here)."""
 
+    busy_drop = False
     with _st.lock:
         if _st.processing:
             dropped_chunks = len(_st.buffer)
@@ -578,14 +584,15 @@ def _transcribe_and_emit_edit(selection: str,
             if dropped_chunks > 0:
                 logger.info(f"busy — dropped {dropped_sec:.2f}s of voice-edit "
                             f"audio ({dropped_chunks} blocks)")
-            # Still need to restore the original clipboard even on busy-
-            # drop, because _on_press already overwrote it via simulate_copy.
-            _try_restore_clipboard(original_clipboard, context="busy-drop")
-            return
-        _st.processing = True
-        chunks = _st.buffer
-        _st.buffer = []
-        _st.recording_samples = 0
+            busy_drop = True
+        else:
+            _st.processing = True
+            chunks = _st.buffer
+            _st.buffer = []
+            _st.recording_samples = 0
+    if busy_drop:
+        _try_restore_clipboard(original_clipboard, context="busy-drop")
+        return
     try:
         if not chunks:
             logger.info("voice-edit: empty audio (no instruction)")
@@ -728,7 +735,6 @@ def _on_press(key) -> None:
             return
         _st.active_trigger = key
         _st.recording = True
-        _write_state(RECORDING, edit_mode=bool(captured))
         _st.buffer.clear()
         # v0.7.2: reset sample counter for MAX_AUDIO_SEC tracking. Without
         # this, a previous transcribe that left a stale count + a new press
@@ -742,6 +748,7 @@ def _on_press(key) -> None:
             _st.edit_selection, _st.edit_original_clipboard = captured
         if _encoder is not None:
             _encoder.reset()
+    _write_state(RECORDING, edit_mode=bool(captured))
     edit_tag = " [edit]" if is_edit else ""
     logger.info(f"REC ({key}){edit_tag}")
     _play_beep(BEEP_START_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
@@ -787,13 +794,13 @@ def _on_release(key) -> None:
             abort = True
         else:
             _st.recording = False
-            _write_state(PROCESSING, edit_mode=_st.edit_mode)
             edit_mode_snap = _st.edit_mode
             edit_selection_snap = _st.edit_selection
             edit_original_snap = _st.edit_original_clipboard
     if abort:
         logger.info("release aborted by new press during drain")
         return
+    _write_state(PROCESSING, edit_mode=edit_mode_snap)
     # v0.8.0: signal the encoder worker (if any) to drain remaining queue
     # and exit. _transcribe_and_emit will join the worker before calling
     # finalize. Setting the event BEFORE the spawn ensures the worker

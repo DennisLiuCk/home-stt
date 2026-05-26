@@ -77,6 +77,7 @@ _ORIGINAL_ENCODER_PIPELINING = daemon.ENCODER_PIPELINING
 # v0.7.5: same pattern for EDIT_TRIGGER_KEYS — voice-edit state-machine
 # tests set this to {Key.f13} locally; restore between tests.
 _ORIGINAL_EDIT_TRIGGER_KEYS = daemon.EDIT_TRIGGER_KEYS
+_ORIGINAL_TRIGGER_KEYS = daemon.TRIGGER_KEYS
 
 # Mute beeps globally for the test session. Several tests exercise
 # _on_press which calls _play_beep, which calls sd.query_devices() +
@@ -105,6 +106,11 @@ def _reset_daemon_state():
     import stt_streaming as _stt_streaming
     _stt_streaming.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
     daemon.EDIT_TRIGGER_KEYS = _ORIGINAL_EDIT_TRIGGER_KEYS
+    daemon.TRIGGER_KEYS = _ORIGINAL_TRIGGER_KEYS
+    if daemon._encoder is not None:
+        daemon._encoder._stop_event.set()
+        if daemon._encoder._thread is not None and daemon._encoder._thread.is_alive():
+            daemon._encoder._thread.join(timeout=2.0)
     daemon._encoder = EncoderPipeline(daemon.SAMPLE_RATE)
 
 
