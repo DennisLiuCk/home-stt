@@ -89,7 +89,14 @@ def read_state() -> dict | None:
 
     now = time.time()
     file_age = now - data.get("ts", 0) if data else 999
-    if file_age > 10:
+    state = data.get("state") if data else None
+    # Check PID when: file is stale (>10s), or state is transient
+    # (recording/processing shouldn't last >60s without an update).
+    need_pid_check = (
+        file_age > 10
+        or (state in ("recording", "processing") and file_age > 5)
+    )
+    if need_pid_check:
         if now - _pid_cache_ts > 5:
             _pid_cache_alive = _daemon_alive()
             _pid_cache_ts = now
