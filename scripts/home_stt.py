@@ -368,6 +368,154 @@ def cmd_config(args) -> int:
     return 0
 
 
+def _check(label: str, ok: bool, detail: str = "") -> bool:
+    mark = "PASS" if ok else "FAIL"
+    line = f"  [{mark}] {label}"
+    if detail:
+        line += f"  ({detail})"
+    print(line)
+    return ok
+
+
+def cmd_doctor(_args) -> int:
+    """Run environment health checks and print a pass/fail checklist."""
+    import platform as _platform
+
+    print(f"home-stt v{_daemon_version()} doctor\n")
+    all_ok = True
+
+    # 1. Python version
+    v = sys.version_info
+    py_ok = v >= (3, 10)
+    all_ok &= _check("Python >= 3.10", py_ok,
+                      f"{v.major}.{v.minor}.{v.micro}")
+
+    # 2. Core dependencies
+    for pkg_name, import_name in [
+        ("numpy", "numpy"),
+        ("sounddevice", "sounddevice"),
+        ("pynput", "pynput"),
+        ("opencc", "opencc"),
+    ]:
+        try:
+            mod = __import__(import_name)
+            ver = getattr(mod, "__version__", getattr(mod, "VERSION", "ok"))
+            all_ok &= _check(f"{pkg_name}", True, str(ver))
+        except ImportError:
+            all_ok &= _check(f"{pkg_name}", False, "not installed")
+
+    # 3. TOML support (Python 3.11+ built-in, or tomli fallback)
+    toml_ok = False
+    toml_detail = ""
+    try:
+        import tomllib  # noqa: F811
+        toml_ok = True
+        toml_detail = "tomllib (built-in)"
+    except ModuleNotFoundError:
+        try:
+            import tomli  # noqa: F811
+            toml_ok = True
+            toml_detail = f"tomli {tomli.__version__}"
+        except ModuleNotFoundError:
+            toml_detail = "neither tomllib nor tomli available"
+    all_ok &= _check("TOML support", toml_ok, toml_detail)
+
+    # 4. Platform-specific STT backends
+    print()
+    is_mac = sys.platform == "darwin" and _platform.machine() == "arm64"
+
+    if is_mac:
+        # MLX backend
+        try:
+            import mlx  # noqa: F401
+            all_ok &= _check("mlx", True, getattr(mlx, "__version__", "ok"))
+        except ImportError:
+            _check("mlx", False, "not installed (needed for mlx-whisper / qwen3-asr on Mac)")
+        try:
+            import mlx_lm  # noqa: F401
+            all_ok &= _check("mlx-lm (polish)", True,
+                             getattr(mlx_lm, "__version__", "ok"))
+        except ImportError:
+            _check("mlx-lm (polish)", False, "not installed — polish will be disabled")
+    else:
+        # CUDA backend
+        try:
+            import torch
+            cuda_ok = torch.cuda.is_available()
+            if cuda_ok:
+                gpu_name = torch.cuda.get_device_name(0)
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                all_ok &= _check("torch + CUDA", True,
+                                 f"{torch.__version__}, {gpu_name}, "
+                                 f"{vram_gb:.1f} GB VRAM")
+            else:
+                all_ok &= _check("torch + CUDA", False,
+                                 f"torch {torch.__version__} but CUDA not available")
+        except ImportError:
+            all_ok &= _check("torch", False, "not installed")
+
+        try:
+            import transformers
+            all_ok &= _check("transformers", True, transformers.__version__)
+        except ImportError:
+            all_ok &= _check("transformers", False, "not installed")
+
+        # qwen-asr (default backend)
+        try:
+            import qwen_asr  # noqa: F401
+            all_ok &= _check("qwen-asr", True,
+                             getattr(qwen_asr, "__version__", "ok"))
+        except ImportError:
+            _check("qwen-asr", False,
+                   "not installed (default STT backend — see README)")
+
+        # faster-whisper (fallback backend)
+        try:
+            import faster_whisper
+            _check("faster-whisper (fallback)", True,
+                   faster_whisper.__version__)
+        except ImportError:
+            _check("faster-whisper (fallback)", False,
+                   "not installed — ok if qwen-asr is available")
+
+    # 5. Microphone
+    print()
+    try:
+        import sounddevice as sd
+        dev = sd.query_devices(kind="input")
+        mic_name = dev.get("name", "unknown")
+        sr = int(dev.get("default_samplerate", 0))
+        all_ok &= _check("Microphone", True, f"{mic_name} ({sr} Hz)")
+    except Exception as e:
+        all_ok &= _check("Microphone", False, str(e))
+
+    # 6. macOS permissions hint
+    if sys.platform == "darwin":
+        print()
+        print("  macOS permissions needed (grant in System Settings → "
+              "Privacy & Security):")
+        print("    - Input Monitoring (for global keyboard listener)")
+        print("    - Accessibility (for IME-safe paste via Quartz)")
+        print("    - Microphone (for audio capture)")
+        py_path = sys.executable
+        print(f"    Python binary: {py_path}")
+
+    # 7. Config file
+    print()
+    from stt_config import config_path
+    cp = config_path()
+    _check("Config file", cp.exists(), str(cp))
+
+    # Summary
+    print()
+    if all_ok:
+        print("All checks passed. Run `home-stt start` to launch.")
+    else:
+        print("Some checks failed. Fix the issues above and re-run "
+              "`home-stt doctor`.")
+    return 0 if all_ok else 1
+
+
 def cmd_version(_args) -> int:
     print(f"home-stt v{_daemon_version()}")
     return 0
@@ -406,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     p_cfg.add_argument("--path", action="store_true",
                        help="Print the config file path and exit.")
 
+    sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
+
     sub.add_parser("version", help="Print home-stt version (same as --version).")
 
     args = parser.parse_args(argv)
@@ -422,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
         "status":  cmd_status,
         "log":     cmd_log,
         "config":  cmd_config,
+        "doctor":  cmd_doctor,
         "version": cmd_version,
     }
     return handlers[args.command](args)
