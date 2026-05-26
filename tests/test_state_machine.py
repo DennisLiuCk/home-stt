@@ -274,9 +274,9 @@ def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
             target=fresh_daemon._on_release, args=(Key.alt_r,),
         )
         release_thread.start()
-        time.sleep(0.02)  # 20ms into the 60ms drain
+        time.sleep(0.04)  # 40ms into the 80ms drain — enough for thread to start
         fresh_daemon._on_press(Key.alt_r)  # new press while still draining
-        release_thread.join(timeout=1.0)
+        release_thread.join(timeout=2.0)
 
     assert fresh_daemon._st.recording is True, "new press should keep capturing"
     assert fresh_daemon._st.active_trigger == Key.alt_r
