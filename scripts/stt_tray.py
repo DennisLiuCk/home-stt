@@ -169,9 +169,11 @@ def main() -> None:
         menu=menu,
     )
 
-    poller = threading.Thread(target=_poll_state, args=(icon,), daemon=True)
-    poller.start()
-    icon.run()
+    def _on_setup(icon):
+        icon.visible = True
+        _poll_state(icon)
+
+    icon.run(setup=_on_setup)
 
 
 if __name__ == "__main__":
