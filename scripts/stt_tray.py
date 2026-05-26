@@ -125,16 +125,15 @@ def _poll_state(icon, interval: float = 0.3) -> None:
             icon.icon = _make_icon(state)
             icon.title = _LABELS.get(state, f"home-stt: {state}")
             anim_phase = 0
-
-        # Toast notification when transcription completes
-        if prev_state == "processing" and state == "idle" and data:
-            text = data.get("last_text", "")
-            if text:
-                try:
-                    label = "Voice-Edit" if data.get("edit_mode") else "Dictate"
-                    icon.notify(text[:150], f"home-stt {label}")
-                except Exception:
-                    pass
+            # Toast notification when transcription completes
+            if prev_state in ("processing", "recording") and state == "idle" and data:
+                text = data.get("last_text", "")
+                if text:
+                    try:
+                        label = "Voice-Edit" if data.get("edit_mode") else "Dictate"
+                        icon.notify(text[:150], f"home-stt {label}")
+                    except Exception:
+                        pass
 
         prev_state = state
         time.sleep(interval)

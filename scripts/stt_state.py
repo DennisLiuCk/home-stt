@@ -73,18 +73,31 @@ def _daemon_alive() -> bool:
         return False
 
 
+_pid_cache_ts: float = 0.0
+_pid_cache_alive: bool = False
+
+
 def read_state() -> dict | None:
-    """Read current daemon state. Uses PID file to detect stopped daemon."""
+    """Read current daemon state. PID check cached for 5s to avoid
+    expensive tasklist subprocess on every poll."""
+    global _pid_cache_ts, _pid_cache_alive
+
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, KeyError):
         data = None
 
-    if not _daemon_alive():
-        if data is not None:
-            data["state"] = "stopped"
-        else:
-            return {"state": "stopped", "ts": 0}
+    now = time.time()
+    file_age = now - data.get("ts", 0) if data else 999
+    if file_age > 10:
+        if now - _pid_cache_ts > 5:
+            _pid_cache_alive = _daemon_alive()
+            _pid_cache_ts = now
+        if not _pid_cache_alive:
+            if data is not None:
+                data["state"] = "stopped"
+            else:
+                return {"state": "stopped", "ts": 0}
 
     return data
 
