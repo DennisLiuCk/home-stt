@@ -90,16 +90,53 @@ def _on_quit(icon, item):
     icon.stop()
 
 
-def _poll_state(icon, interval: float = 0.5) -> None:
-    """Background thread: poll daemon state and update icon + tooltip."""
+def _make_recording_frame(phase: int):
+    """Generate a recording-animation frame with pulsing inner ring."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([8, 8, 56, 56], fill=_COLOURS["recording"])
+    # Pulse: inner circle radius oscillates between 8 and 14
+    r = 8 + (phase % 6) if phase < 6 else 14 - (phase % 6)
+    cx, cy = 32, 32
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 200))
+    return img
+
+
+def _poll_state(icon, interval: float = 0.3) -> None:
+    """Background thread: poll daemon state and update icon + tooltip.
+
+    Features:
+    - Icon colour changes per state (grey/red/amber/dark)
+    - Recording: icon pulses with animation frames
+    - Transcription complete: toast notification with the text
+    """
     prev_state = None
+    anim_phase = 0
     while icon.visible:
         data = read_state()
         state = data["state"] if data else "stopped"
-        if state != prev_state:
+
+        if state == "recording":
+            icon.icon = _make_recording_frame(anim_phase)
+            icon.title = "home-stt: recording…"
+            anim_phase = (anim_phase + 1) % 12
+        elif state != prev_state:
             icon.icon = _make_icon(state)
             icon.title = _LABELS.get(state, f"home-stt: {state}")
-            prev_state = state
+            anim_phase = 0
+
+        # Toast notification when transcription completes
+        if prev_state == "processing" and state == "idle" and data:
+            text = data.get("last_text", "")
+            if text:
+                try:
+                    label = "Voice-Edit" if data.get("edit_mode") else "Dictate"
+                    icon.notify(text[:150], f"home-stt {label}")
+                except Exception:
+                    pass
+
+        prev_state = state
         time.sleep(interval)
 
 
