@@ -40,12 +40,15 @@ Find the real Python binary path (NOT the pyenv shim) via:
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 
 from pynput.keyboard import Key
 
 from stt_platform import Pasteboard
+
+logger = logging.getLogger("stt.platform")
 
 
 # AppleScript fallback that asks System Events to send Cmd+V to the focused
@@ -95,9 +98,8 @@ def _try_load_nspasteboard() -> bool:
     except Exception as e:
         # Don't print at module import — only at first use, so users who
         # never actually paste don't see noise.
-        print(f"[stt] clipboard: AppKit NSPasteboard unavailable ({e}); "
-              f"falling back to pbcopy subprocess (slower but functional)",
-              file=sys.stderr, flush=True)
+        logger.warning("clipboard: AppKit NSPasteboard unavailable (%s); "
+                       "falling back to pbcopy subprocess (slower but functional)", e)
         return False
 
 
@@ -107,8 +109,7 @@ def _set_clipboard_via_pbcopy(text: str) -> bool:
     proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     proc.communicate(input=text.encode("utf-8"))
     if proc.returncode != 0:
-        print(f"[stt] pbcopy failed (rc={proc.returncode})",
-              file=sys.stderr, flush=True)
+        logger.warning("pbcopy failed (rc=%d)", proc.returncode)
         return False
     return True
 
@@ -127,15 +128,13 @@ def _set_clipboard_via_nspasteboard(text: str) -> bool:
         _NS_PASTEBOARD.clearContents()
         ok = _NS_PASTEBOARD.setString_forType_(text, _NS_PASTEBOARD_TYPE)
         if not ok:
-            print("[stt] clipboard: NSPasteboard setString returned False; "
-                  "falling back to pbcopy for this write",
-                  file=sys.stderr, flush=True)
+            logger.warning("clipboard: NSPasteboard setString returned False; "
+                          "falling back to pbcopy for this write")
             return _set_clipboard_via_pbcopy(text)
         return True
     except Exception as e:
-        print(f"[stt] clipboard: NSPasteboard failed ({e}); "
-              f"falling back to pbcopy for this write",
-              file=sys.stderr, flush=True)
+        logger.warning("clipboard: NSPasteboard failed (%s); "
+                       "falling back to pbcopy for this write", e)
         return _set_clipboard_via_pbcopy(text)
 
 
@@ -152,17 +151,15 @@ def _get_clipboard_via_nspasteboard() -> str | None:
                 return None  # empty or non-text format
             return str(value)
         except Exception as e:
-            print(f"[stt] clipboard: NSPasteboard read failed ({e}); "
-                  f"falling back to pbpaste for this read",
-                  file=sys.stderr, flush=True)
+            logger.warning("clipboard: NSPasteboard read failed (%s); "
+                          "falling back to pbpaste for this read", e)
     # pbpaste fallback path — works without AppKit
     try:
         proc = subprocess.run(
             ["pbpaste"], capture_output=True, text=True, check=False, timeout=2,
         )
     except subprocess.TimeoutExpired:
-        print("[stt] clipboard: pbpaste timed out (2s)",
-              file=sys.stderr, flush=True)
+        logger.warning("clipboard: pbpaste timed out (2s)")
         return None
     if proc.returncode != 0:
         return None
@@ -262,8 +259,7 @@ class MacOSPasteboard(Pasteboard):
         try:
             return int(_NS_PASTEBOARD.changeCount())
         except Exception as e:
-            print(f"[stt] clipboard: NSPasteboard.changeCount failed ({e})",
-                  file=sys.stderr, flush=True)
+            logger.warning("clipboard: NSPasteboard.changeCount failed (%s)", e)
             return None
 
     def simulate_copy(self) -> bool:
@@ -339,17 +335,11 @@ class MacOSPasteboard(Pasteboard):
             # System Events occasionally hangs after macOS upgrades or
             # Stage Manager glitches. Without timeout this would block the
             # transcription thread forever.
-            print(
-                f"[stt] {action} timed out (5s) — System Events not "
-                f"responding; {manual_hint}.",
-                flush=True,
-            )
+            logger.warning("%s timed out (5s) — System Events not "
+                          "responding; %s.", action, manual_hint)
             return False
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()
-            # error 1002 = errAEEventNotPermitted: System Events doesn't have
-            # Accessibility permission. Match across locales since osascript
-            # localizes stderr to the system language.
             err_lower = err.lower()
             denied = (
                 "1002" in err
@@ -363,17 +353,15 @@ class MacOSPasteboard(Pasteboard):
                 or "nicht erlaubt" in err_lower  # de
             )
             if denied:
-                print(
-                    f"[stt] {action} failed: macOS denied osascript/System "
-                    f"Events the Accessibility permission needed to send "
-                    f"Cmd+{key_letter}. Grant it in 系統設定 → 隱私權與安全性 "
-                    f"→ 輔助使用 (add 'System Events').",
-                    file=sys.stderr, flush=True,
+                logger.warning(
+                    "%s failed: macOS denied osascript/System Events the "
+                    "Accessibility permission needed to send Cmd+%s. Grant "
+                    "it in 系統設定 → 隱私權與安全性 → 輔助使用 (add 'System "
+                    "Events').", action, key_letter,
                 )
-                print(f"[stt] {action} blocked — {manual_hint}.", flush=True)
+                logger.info("%s blocked — %s.", action, manual_hint)
             else:
-                print(f"[stt] {action} failed: {err}",
-                      file=sys.stderr, flush=True)
-                print(f"[stt] {action} blocked — {manual_hint}.", flush=True)
+                logger.warning("%s failed: %s", action, err)
+                logger.info("%s blocked — %s.", action, manual_hint)
             return False
         return True

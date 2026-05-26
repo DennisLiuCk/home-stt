@@ -37,8 +37,11 @@ Design notes:
 """
 from __future__ import annotations
 
+import logging
 import sys
 from abc import ABC, abstractmethod
+
+logger = logging.getLogger("stt.polisher")
 
 
 def _format_polish_user_msg(text: str) -> str:
@@ -219,8 +222,7 @@ class MlxLocalLlmPolisher(TextPostProcessor):
             )
             return polished or text  # empty → degrade to raw ASR
         except Exception as e:
-            print(f"[stt] polish failed, returning raw: {e}",
-                  file=sys.stderr, flush=True)
+            logger.warning("polish failed, returning raw: %s", e)
             return text
 
     def edit(self, selection: str, instruction: str) -> str | None:
@@ -240,7 +242,7 @@ class MlxLocalLlmPolisher(TextPostProcessor):
             out = self._run_generation(EDIT_PROMPT, user_msg, budget)
             return out.strip() or None
         except Exception as e:
-            print(f"[stt] edit failed: {e}", file=sys.stderr, flush=True)
+            logger.warning("edit failed: %s", e)
             return None
 
 
@@ -546,14 +548,12 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             # better than pasting a truncated sentence.
             target_max = max(64, min(int(input_len * 1.2), self._max_tokens))
             if n_new >= target_max and last_token != self._pad_token_id:
-                print(f"[stt] polish truncated at {target_max} tok "
-                      f"(input {input_len} tok); using raw ASR text",
-                      file=sys.stderr, flush=True)
+                logger.warning("polish truncated at %d tok (input %d tok); "
+                               "using raw ASR text", target_max, input_len)
                 return text
             return polished or text  # empty → degrade to raw ASR
         except Exception as e:
-            print(f"[stt] polish failed, returning raw: {e}",
-                  file=sys.stderr, flush=True)
+            logger.warning("polish failed, returning raw: %s", e)
             return text
 
     def edit(self, selection: str, instruction: str) -> str | None:
@@ -593,13 +593,11 @@ class TorchLocalLlmPolisher(TextPostProcessor):
             # edit output). Decision: log + return truncated result. User
             # can re-trigger if they want.
             if n_new >= budget and last_token != self._pad_token_id:
-                print(f"[stt] edit truncated at {budget} tok "
-                      f"(selection {selection_tokens} tok); "
-                      f"returning partial result",
-                      file=sys.stderr, flush=True)
+                logger.warning("edit truncated at %d tok (selection %d tok); "
+                               "returning partial result", budget, selection_tokens)
             return text.strip() or None
         except Exception as e:
-            print(f"[stt] edit failed: {e}", file=sys.stderr, flush=True)
+            logger.warning("edit failed: %s", e)
             return None
 
 
@@ -620,12 +618,11 @@ def build_polisher(
             return MlxLocalLlmPolisher(model_name, system_prompt)
         return TorchLocalLlmPolisher(model_name, system_prompt)
     except (ImportError, ModuleNotFoundError) as e:
-        print(
-            f"[stt] polish disabled — required package missing for "
-            f"{model_name}: {e}. Install torch+CUDA and transformers "
-            f"(see README → Windows 安裝步驟), or set POLISH_ENABLED = "
-            f"False to silence this.",
-            file=sys.stderr, flush=True,
+        logger.warning(
+            "polish disabled — required package missing for %s: %s. "
+            "Install torch+CUDA and transformers (see README → Windows "
+            "安裝步驟), or set POLISH_ENABLED = False to silence this.",
+            model_name, e,
         )
         return NoopPolisher()
     except Exception as e:
@@ -667,24 +664,23 @@ def build_polisher(
                     _torch.cuda.empty_cache()
                 except Exception:
                     pass
-            print(
-                f"[stt] polish disabled — CUDA OOM loading {model_name}: "
-                f"{e}. Try POLISH_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct' "
-                f"(~3 GB VRAM), or set POLISH_ENABLED = False.",
-                file=sys.stderr, flush=True,
+            logger.warning(
+                "polish disabled — CUDA OOM loading %s: %s. "
+                "Try POLISH_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct' "
+                "(~3 GB VRAM), or set POLISH_ENABLED = False.",
+                model_name, e,
             )
         elif is_dll:
-            print(
-                f"[stt] polish disabled — CUDA DLL load failed for "
-                f"{model_name}: {e}. Install nvidia-cudnn-cu12 + "
-                f"nvidia-cublas-cu12 (Windows), or reinstall torch with "
-                f"the CUDA wheel (see README -> Windows 安裝步驟).",
-                file=sys.stderr, flush=True,
+            logger.warning(
+                "polish disabled — CUDA DLL load failed for %s: %s. "
+                "Install nvidia-cudnn-cu12 + nvidia-cublas-cu12 (Windows), "
+                "or reinstall torch with the CUDA wheel "
+                "(see README -> Windows 安裝步驟).",
+                model_name, e,
             )
         else:
-            print(
-                f"[stt] polish disabled — could not initialise "
-                f"{model_name}: {e}",
-                file=sys.stderr, flush=True,
+            logger.warning(
+                "polish disabled — could not initialise %s: %s",
+                model_name, e,
             )
         return NoopPolisher()

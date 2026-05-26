@@ -39,15 +39,16 @@ Platform abstraction
 """
 from __future__ import annotations
 
+import logging
 import os
 import platform as _host_platform
 import queue
-import re
 import sys
 import threading
 import time
-from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger("stt")
 
 # v0.7.1: PyTorch CUDA allocator hint — reduces fragmentation from the
 # polish KV cache + tokenizer scratch allocations that happen on every
@@ -70,10 +71,11 @@ except Exception:
 
 import numpy as np
 import sounddevice as sd
-from opencc import OpenCC
 from pynput import keyboard
 from pynput.keyboard import Key
 
+from stt_audio import post_process, _play_beep, _trim_silence
+from stt_backends import STTBackend, build_backend, build_backend_with_fallback
 from stt_platform import Pasteboard, build_pasteboard
 from text_polisher import TextPostProcessor, build_polisher
 
@@ -326,653 +328,6 @@ BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 
 
 # ---------------------------------------------------------------------------
-# Text post-processing (backend-agnostic)
-#
-# `s2twp` (not plain `s2tw`) does character-level Simplified→Traditional
-# conversion PLUS phrase-level mapping to Taiwan vocabulary:
-#   软件→軟體 (not 軟件), 视频→影片 (not 視頻), 异步→非同步 (not 異步),
-#   函数→函式 (not 函數), 代码→程式碼 (not 代碼). For a TW-target daemon
-# this is strictly better than s2tw. Cost difference is ~0.1ms (microsecond
-# range either way).
-#
-# post_process() is called TWICE per transcribe:
-#   1. on raw ASR output (Qwen3-ASR-0.6B outputs simplified natively — so
-#      polish always sees clean traditional + TW-vocab input, less risk of
-#      the small polish model being primed into a simplified output register)
-#   2. on polish output (deterministic backstop — polish models occasionally
-#      leak simplified glyphs back in despite the prompt rule; OpenCC is
-#      cheaper and more reliable than fighting that with prompt engineering)
-# Both calls are idempotent: re-running on already-traditional+spaced text
-# is a no-op.
-# ---------------------------------------------------------------------------
-_s2twp = OpenCC("s2twp")
-_CJK   = r"[㐀-鿿]"
-_AW    = r"[A-Za-z0-9]"
-
-
-def post_process(text: str) -> str:
-    """Simplified → Taiwan-traditional (with TW phrase mapping via s2twp),
-    then add spaces at CJK ↔ ASCII edges. Idempotent."""
-    text = _s2twp.convert(text)
-    text = re.sub(f"({_CJK})({_AW})", r"\1 \2", text)
-    text = re.sub(f"({_AW})({_CJK})", r"\1 \2", text)
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Audio feedback (cross-platform — uses sounddevice which we already need
-# for capture). Generates a short sine wave and plays it non-blocking via
-# sd.play().
-#
-# A few subtleties that bit us on macOS:
-#   - The mic stream is open at SAMPLE_RATE (16 kHz), but the default OS
-#     output device is usually 44.1/48 kHz. If we hand sd.play() a 16 kHz
-#     buffer, CoreAudio resamples it, and the resampling artifacts on a
-#     short (~80 ms) tone are audible as a "broken" / "double-ding" sound.
-#     Fix: generate the wave at the OUTPUT device's native rate.
-#   - sd.play() opens a fresh OutputStream every call, and on macOS the
-#     stream-open transient is a brief audible click. Fix: prepend a tiny
-#     (~5 ms) silence pad so the click happens during silence, not on top
-#     of the sine attack.
-#   - Linear fades produce harsher edges than half-cosine ramps; using a
-#     raised-cosine envelope makes the tone sound "tighter".
-# ---------------------------------------------------------------------------
-def _detect_output_samplerate() -> int:
-    """Return the default output device's preferred sample rate, falling
-    back to 44.1 kHz if querying fails. Cached at module load."""
-    try:
-        return int(sd.query_devices(kind="output")["default_samplerate"])
-    except Exception:
-        return 44100
-
-
-# Populated lazily by _get_beep_sr() on first beep — keeps PortAudio /
-# CoreAudio out of the import path so the daemon can start on macOS
-# LaunchAgent (pre-login session, audio HAL not yet ready) or other
-# headless contexts without emitting noisy errors before any [stt] log
-# line. By the time the first beep fires (on first key press) the
-# listener / audio stream are already up, so HAL is in a known state.
-_BEEP_SR: int | None = None
-
-
-def _get_beep_sr() -> int:
-    global _BEEP_SR
-    if _BEEP_SR is None:
-        _BEEP_SR = _detect_output_samplerate()
-    return _BEEP_SR
-
-
-def _play_beep(freq_hz: float,
-               duration_ms: int = BEEP_DURATION_MS,
-               volume: float = BEEP_VOLUME) -> None:
-    if not BEEPS_ENABLED:
-        return
-    try:
-        sr = _get_beep_sr()
-        n = int(sr * duration_ms / 1000)
-        if n <= 0:
-            return
-        t = np.arange(n) / sr
-        wave = (volume * np.sin(2 * np.pi * freq_hz * t)).astype(np.float32)
-
-        # Raised-cosine fade in/out (~15 ms each) — smoother than linear,
-        # eliminates click pops at start/end of the tone.
-        fade = min(int(sr * 0.015), n // 2)
-        if fade > 0:
-            ramp = (0.5 * (1 - np.cos(np.pi * np.arange(fade) / fade))).astype(np.float32)
-            wave[:fade]  *= ramp
-            wave[-fade:] *= ramp[::-1]
-
-        # Silence pad at the start: CoreAudio's first-buffer transient
-        # (when sd.play() opens a new OutputStream) lands in this silence
-        # rather than on top of the sine attack, so the user hears one
-        # clean "ding" instead of "click-ding".
-        pad = np.zeros(int(sr * 0.005), dtype=np.float32)
-        wave = np.concatenate([pad, wave])
-
-        sd.play(wave, samplerate=sr)
-    except Exception as e:
-        # Beep is purely cosmetic — never let it break transcription.
-        print(f"[stt] beep failed: {e}", file=sys.stderr, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# STT Backend abstraction
-#
-# Concrete backends own model loading, warmup, and inference. The pipeline
-# only needs `transcribe(samples) -> (text, language)` and an optional
-# `warmup()` to pay one-time JIT costs up front.
-# ---------------------------------------------------------------------------
-class STTBackend(ABC):
-    """Interface for speech-to-text engines. Implementations decide their
-    own model + device + precision; the daemon just hands them raw float32
-    audio at 16 kHz mono and expects a (text, language) tuple back."""
-
-    name: str = "abstract"
-
-    @abstractmethod
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        """Run inference on a 1-D float32 PCM array (16 kHz, mono).
-        Returns (raw_text, language_code). Backends do NOT post-process
-        text (no s2twp, no spacing) — that's done downstream."""
-
-    def warmup(self) -> None:
-        """Optional: do a dummy inference so the first real request is fast.
-        Default is no-op; backends override if they have a cold start."""
-
-    @property
-    def device_label(self) -> str:
-        """Short human label like 'CUDA (float16)' for startup logging."""
-        return "unknown"
-
-    # ----------------------------------------------------------------
-    # v0.8.0: optional streaming/encoder-pipelining API
-    #
-    # The default implementations below let existing batch-only backends
-    # (FasterWhisperBackend, MlxWhisperBackend) opt out automatically —
-    # they need ZERO changes for the v0.8.0 daemon refactor. Only
-    # Qwen3AsrBackend overrides supports_streaming()→True and implements
-    # the four streaming methods.
-    #
-    # Lifecycle:
-    #     handle = backend.start_encoder()       # on first audio chunk
-    #     backend.push_chunk(handle, slab)       # every ENCODER_CHUNK_SEC
-    #     ...
-    #     text, lang = backend.finalize(handle, tail)   # on release
-    #         # tail = leftover audio not yet encoded; finalize must
-    #         # encode it as the last slab before running the decoder.
-    #
-    # Or, on any failure / abort:
-    #     backend.abort(handle)                  # release GPU buffers
-    #
-    # The handle type is opaque to the daemon (typed `Any`). Backends
-    # define their own dataclass (e.g. holding a list of hidden-state
-    # tensors). The daemon never touches it.
-    #
-    # All methods MUST be safe to call from a non-main thread — the
-    # encoder runs on a dedicated worker thread (see _encoder_worker
-    # in this file).
-    # ----------------------------------------------------------------
-
-    def supports_streaming(self) -> bool:
-        """Override + return True to opt into press-time encoder pipelining.
-
-        Default False — daemon will use the existing batch `transcribe(samples)`
-        path for this backend, same behaviour as v0.7.2.
-        """
-        return False
-
-    def start_encoder(self) -> Any:
-        """Return an opaque handle that subsequent push_chunk / finalize /
-        abort calls thread through. Called once at the start of each
-        recording (on first audio block, lazy)."""
-        raise NotImplementedError(
-            f"{self.name}: start_encoder requires supports_streaming()=True"
-        )
-
-    def push_chunk(self, handle: Any, samples: np.ndarray) -> None:
-        """Run the encoder forward on a ~ENCODER_CHUNK_SEC slab of audio
-        and accumulate the resulting hidden states on `handle`. Called
-        many times per recording, on the worker thread."""
-        raise NotImplementedError(
-            f"{self.name}: push_chunk requires supports_streaming()=True"
-        )
-
-    def finalize(self, handle: Any, tail_samples: np.ndarray) -> tuple[str, str]:
-        """Encode the residual `tail_samples` as the final slab, concatenate
-        all accumulated hidden states, run the decoder, return
-        (raw_text, language_code) — matching the existing `transcribe()`
-        contract. Called once per recording on the transcribe thread.
-
-        `tail_samples` may be empty (length 0) if the user released right
-        at a chunk boundary."""
-        raise NotImplementedError(
-            f"{self.name}: finalize requires supports_streaming()=True"
-        )
-
-    def abort(self, handle: Any) -> None:
-        """Release any GPU buffers / state on `handle` without running the
-        decoder. Called when the daemon decides to fall back to the batch
-        path mid-recording (encoder crashed, silence-detected, etc.).
-        MUST NOT raise — best-effort cleanup only."""
-        raise NotImplementedError(
-            f"{self.name}: abort requires supports_streaming()=True"
-        )
-
-
-class FasterWhisperBackend(STTBackend):
-    """OpenAI Whisper via CTranslate2 (faster-whisper). Tries CUDA float16
-    first, falls back to CPU int8 if CUDA initialisation fails."""
-
-    name = "faster-whisper"
-
-    def __init__(self, model_name: str):
-        # Lazy import — keeps `faster_whisper` out of the import graph when
-        # a different backend is selected.
-        from faster_whisper import WhisperModel
-
-        try:
-            self._model = WhisperModel(model_name, device="cuda",
-                                       compute_type="float16")
-            self._device_label = "CUDA (float16)"
-        except Exception as e:
-            print(f"[stt] CUDA load failed ({e}); falling back to CPU int8.",
-                  flush=True)
-            self._model = WhisperModel(model_name, device="cpu",
-                                       compute_type="int8")
-            self._device_label = "CPU (int8)"
-
-    @property
-    def device_label(self) -> str:
-        return self._device_label
-
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        segments, info = self._model.transcribe(
-            samples,
-            beam_size=1,                       # greedy — 3-5x faster, near-identical quality
-            condition_on_previous_text=False,  # avoids cross-segment carryover
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
-        )
-        text = "".join(s.text for s in segments).strip()
-        return text, info.language
-
-    def warmup(self) -> None:
-        # Cold-start CUDA JIT compile on Blackwell can take ~10s; once
-        # cached it's sub-second. Pay it now so the user's first
-        # hold-to-talk doesn't eat it.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        list(self._model.transcribe(warm_audio, beam_size=1,
-                                    vad_filter=False)[0])
-
-
-class MlxWhisperBackend(STTBackend):
-    """Whisper via Apple MLX (Metal-native).
-
-    Accepts either a short Whisper model name like ``large-v3-turbo`` (auto-
-    resolved to ``mlx-community/whisper-large-v3-turbo``) or a fully-
-    qualified HuggingFace repo id. Apple Silicon only — other platforms
-    should use ``faster-whisper``.
-    """
-
-    name = "mlx-whisper"
-
-    def __init__(self, model_name: str):
-        import mlx_whisper  # lazy import (Apple Silicon only)
-
-        self._mlx_whisper = mlx_whisper
-        if "/" not in model_name:
-            model_name = f"mlx-community/whisper-{model_name}"
-        self._model_name = model_name
-        self._device_label = "Apple Silicon (Metal, MLX)"
-
-    @property
-    def device_label(self) -> str:
-        return self._device_label
-
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        result = self._mlx_whisper.transcribe(
-            samples,
-            path_or_hf_repo=self._model_name,
-            # Lock temperature to greedy decoding. mlx_whisper's default
-            # schedule (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) retries up to 6 times
-            # on low-confidence clips (background noise, mumbles, single
-            # English word) — that can push latency from ~0.3s to ~2s.
-            # Matches FasterWhisperBackend's beam_size=1 no-retry behaviour.
-            temperature=0.0,
-            condition_on_previous_text=False,
-            verbose=None,
-        )
-        text = (result.get("text") or "").strip()
-        language = result.get("language") or ""
-        return text, language
-
-    def warmup(self) -> None:
-        # First call materialises model weights + Metal kernels. Once warm,
-        # subsequent transcribes are sub-second on Apple Silicon turbo.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        self._mlx_whisper.transcribe(
-            warm_audio,
-            path_or_hf_repo=self._model_name,
-            temperature=0.0,
-            verbose=None,
-        )
-
-
-class Qwen3AsrBackend(STTBackend):
-    """Qwen3-ASR — Apple Silicon goes via mlx-qwen3-asr (Metal-native);
-    Windows / Linux go via qwen-asr (PyTorch + transformers + NVIDIA CUDA).
-
-    Alibaba's Qwen3-ASR, released 2026-01 under Apache-2.0. Two model sizes:
-        Qwen/Qwen3-ASR-0.6B  — default, ~1.2 GB fp16, 92ms TTFT
-        Qwen/Qwen3-ASR-1.7B  — higher accuracy, ~3.4 GB fp16
-
-    Strengths vs Whisper turbo for this daemon's typical usage:
-      - Native Chinese punctuation (Qwen3 LLM backbone — text generation is
-        a first-class objective, unlike Whisper which trained on subtitles
-        where punctuation is inconsistent).
-      - Native code-switching: zh + occasional English proper nouns
-        (Python, MLX, async, function, …) handled in one pass without
-        the model needing to flip language mid-sentence.
-      - 52 languages + 22 Chinese dialects in the training mix.
-
-    Accepts:
-      - Fully qualified HF repo ids ("Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B")
-      - Short aliases ("0.6B", "1.7B", case-insensitive)
-      - Anything else falls back to the 0.6B default — so a user with
-        STT_MODEL = "large-v3-turbo" who just flips STT_BACKEND still
-        gets a working setup without editing two lines.
-    """
-
-    name = "qwen3-asr"
-
-    # Map upstream's human-readable language names back to the ISO-ish short
-    # codes used elsewhere in the daemon log ("zh", "en", ...). Both the
-    # MLX and Torch impls go through this normaliser via the outer class.
-    _LANG_NORM = {
-        "chinese":    "zh",
-        "english":    "en",
-        "japanese":   "ja",
-        "korean":     "ko",
-        "french":     "fr",
-        "german":     "de",
-        "spanish":    "es",
-        "portuguese": "pt",
-        "russian":    "ru",
-        "italian":    "it",
-        "arabic":     "ar",
-    }
-
-    def __init__(self, model_name: str):
-        self._model_name = self._resolve_model_name(model_name)
-        if sys.platform == "darwin" and _host_platform.machine() == "arm64":
-            self._impl = _Qwen3MlxImpl(self._model_name)
-        else:
-            self._impl = _Qwen3TorchImpl(self._model_name)
-
-    @staticmethod
-    def _resolve_model_name(model_name: str) -> str:
-        # Already a HF repo id — pass through (covers community forks too).
-        if "/" in model_name:
-            return model_name
-        m = model_name.lower()
-        if "1.7b" in m or "1_7" in m:
-            return "Qwen/Qwen3-ASR-1.7B"
-        if "0.6b" in m or "0_6" in m:
-            return "Qwen/Qwen3-ASR-0.6B"
-        # User probably has STT_MODEL = "large-v3-turbo" left over from the
-        # Whisper path; pick the smaller Qwen3-ASR variant by default.
-        return "Qwen/Qwen3-ASR-0.6B"
-
-    @property
-    def device_label(self) -> str:
-        return self._impl.device_label
-
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.transcribe(samples)
-        text = (result.get("text") or "").strip()
-        raw_lang = (result.get("language") or "").strip().lower()
-        # Normalise "Chinese" → "zh", "English" → "en", etc. Falls back to
-        # the first two letters of whatever the model returned so unknown
-        # languages still produce something sensible in the log line.
-        language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
-        return text, language
-
-    def warmup(self) -> None:
-        self._impl.warmup()
-
-    # ----------------------------------------------------------------
-    # v0.8.0 streaming delegation. Outer wrapper just routes to the
-    # platform impl (MLX or Torch) which makes its own decision about
-    # whether streaming is wired. Lang normalisation via _LANG_NORM
-    # mirrors transcribe().
-    # ----------------------------------------------------------------
-    def supports_streaming(self) -> bool:
-        return self._impl.supports_streaming()
-
-    def start_encoder(self) -> Any:
-        return self._impl.start_encoder()
-
-    def push_chunk(self, handle: Any, samples: np.ndarray) -> None:
-        self._impl.push_chunk(handle, samples)
-
-    def finalize(self, handle: Any, tail_samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.finalize(handle, tail_samples)
-        text = (result.get("text") or "").strip()
-        raw_lang = (result.get("language") or "").strip().lower()
-        language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
-        return text, language
-
-    def abort(self, handle: Any) -> None:
-        self._impl.abort(handle)
-
-
-class _Qwen3MlxImpl:
-    """Apple Silicon path — mlx-qwen3-asr (Metal native)."""
-
-    def __init__(self, model_name: str):
-        import mlx_qwen3_asr  # lazy import (Apple Silicon only)
-
-        self._mqa = mlx_qwen3_asr
-        self._model_name = model_name
-        self.device_label = "Apple Silicon (Metal, MLX) — Qwen3-ASR"
-
-    def supports_streaming(self) -> bool:
-        # v0.8.0 ships Torch path only. MLX deferred to v0.8.1 — see
-        # tasks list. Returning False here means the daemon's batch
-        # transcribe path runs unchanged on Mac (zero v0.7.2 regression).
-        return False
-
-    def transcribe(self, samples: np.ndarray) -> dict:
-        result = self._mqa.transcribe(
-            samples,
-            model=self._model_name,
-            verbose=False,
-        )
-        return {
-            "text": getattr(result, "text", "") or "",
-            "language": getattr(result, "language", "") or "",
-        }
-
-    def warmup(self) -> None:
-        # First call downloads weights (~1.2 GB for 0.6B) on first run and
-        # materialises Metal kernels. Once warm, the next transcribe is
-        # near the ~92ms time-to-first-token claimed by the upstream MLX
-        # port.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        self._mqa.transcribe(
-            warm_audio,
-            model=self._model_name,
-            verbose=False,
-        )
-
-
-class _Qwen3TorchImpl:
-    """Windows / Linux path — qwen-asr (PyTorch + transformers + NVIDIA CUDA).
-
-    Hard-requires CUDA. On CPU the Qwen3-ASR-0.6B is ~30-60× slower per
-    transcribe — way over the hold-to-talk perceptual budget. Mirroring
-    TorchLocalLlmPolisher's pattern, __init__ raises RuntimeError if CUDA
-    is unavailable so the daemon's build_backend_with_fallback can route
-    to faster-whisper (which has its own working CPU int8 fallback inside
-    its __init__). Refusing CPU here is much better UX than silently
-    delivering 30-60 s transcribes.
-    """
-
-    def __init__(self, model_name: str):
-        # Heavy lazy imports — only paid on Win/Linux + qwen3-asr backend.
-        import torch
-        # v0.8.0: use the streaming-capable subclass. transcribe()
-        # behaviour is inherited unchanged from Qwen3ASRModel; the
-        # streaming methods are additive. If the wrapper import fails
-        # (qwen-asr upstream refactor broke our private-attr access),
-        # caller can catch ImportError and fall back to the original
-        # Qwen3ASRModel — but for now the spike-verified path is
-        # production code.
-        from qwen3_asr_streaming import StreamingQwen3ASRModel
-
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "_Qwen3TorchImpl requires CUDA. On CPU the Qwen3-ASR "
-                "model is 30-60x slower per transcribe — unusable for "
-                "hold-to-talk UX. Install torch with CUDA support, or "
-                "set STT_BACKEND = 'faster-whisper' which has a working "
-                "CPU int8 fallback."
-            )
-
-        device = "cuda:0"
-        dtype = torch.bfloat16
-        try:
-            # torch returns e.g. "NVIDIA GeForce RTX 5080" — already has
-            # vendor prefix; don't add a second "NVIDIA ".
-            gpu_name = torch.cuda.get_device_name(0)
-        except Exception:
-            gpu_name = "CUDA device"
-        self._model = StreamingQwen3ASRModel.from_pretrained(
-            model_name,
-            dtype=dtype,
-            device_map=device,
-            max_inference_batch_size=1,
-            max_new_tokens=256,
-        )
-        self._model_name = model_name
-        # Probe whether streaming is actually wired (upstream attr
-        # availability check). If it returns False, supports_streaming()
-        # below also reports False and the daemon stays on batch path —
-        # zero v0.7.2 regression.
-        self._streaming_ok = StreamingQwen3ASRModel._streaming_supported(self._model)
-        stream_tag = " + streaming" if self._streaming_ok else ""
-        self.device_label = f"{gpu_name} (bfloat16) — Qwen3-ASR{stream_tag}"
-        if not self._streaming_ok:
-            print("[stt] qwen-asr streaming attrs missing — encoder "
-                  "pipelining disabled for this session, daemon will "
-                  "use batch path (v0.7.2 behaviour)",
-                  file=sys.stderr, flush=True)
-
-    def supports_streaming(self) -> bool:
-        # Both ENCODER_PIPELINING (daemon-side switch) AND _streaming_ok
-        # (upstream-API probe) gate the streaming path; either one False
-        # routes to batch transcribe.
-        return self._streaming_ok
-
-    def start_encoder(self) -> Any:
-        return self._model.start_encoder()
-
-    def push_chunk(self, handle: Any, samples: np.ndarray) -> None:
-        self._model.encode_chunk(handle, samples)
-
-    def finalize(self, handle: Any, tail_samples: np.ndarray) -> dict:
-        text, language = self._model.finalize_with_features(handle, tail_samples)
-        return {"text": text, "language": language}
-
-    def abort(self, handle: Any) -> None:
-        self._model.abort(handle)
-
-    def transcribe(self, samples: np.ndarray) -> dict:
-        results = self._model.transcribe(
-            audio=(samples, SAMPLE_RATE),
-            language=None,
-        )
-        if not results:
-            return {"text": "", "language": ""}
-        r = results[0]
-        return {
-            "text": getattr(r, "text", "") or "",
-            "language": getattr(r, "language", "") or "",
-        }
-
-    def warmup(self) -> None:
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        self._model.transcribe(
-            audio=(warm_audio, SAMPLE_RATE),
-            language=None,
-        )
-
-
-def build_backend(name: str, model: str) -> STTBackend:
-    """Factory. To add a new backend: implement STTBackend in a new class,
-    add a branch here, and update STT_BACKEND in the Config section."""
-    if name == "faster-whisper":
-        return FasterWhisperBackend(model)
-    if name == "mlx-whisper":
-        return MlxWhisperBackend(model)
-    if name == "qwen3-asr":
-        return Qwen3AsrBackend(model)
-    # ── Future backends ────────────────────────────────────────────────
-    # elif name == "sense-voice":
-    #     return SenseVoiceBackend(model)
-    # elif name == "paraformer":
-    #     return ParaformerBackend(model)
-    raise ValueError(f"Unknown STT backend: {name!r}")
-
-
-def build_backend_with_fallback() -> STTBackend:
-    """Try the configured STT backend; on ImportError (missing package) or
-    CUDA OOM, fall back to faster-whisper with a loud actionable stderr
-    message. If that also fails, exit cleanly — the daemon can't run
-    without an STT backend, and a half-initialised state is worse than a
-    clear-cut exit. Mirrors build_polisher's degrade-gracefully pattern."""
-    try:
-        return build_backend(STT_BACKEND, STT_MODEL)
-    except (ImportError, ModuleNotFoundError) as e:
-        print(
-            f"[stt] backend '{STT_BACKEND}' missing required package: "
-            f"{e}. Falling back to faster-whisper. To enable "
-            f"{STT_BACKEND}, see README -> Windows 安裝步驟 (install "
-            f"torch+CUDA wheel before `pip install qwen-asr`).",
-            file=sys.stderr, flush=True,
-        )
-    except Exception as e:
-        # Three actionable failure classes (mirrors build_polisher):
-        #   - CUDA OOM: hint to free polish VRAM or pick smaller STT model
-        #   - DLL load failure: hint to install NVIDIA cuDNN/cuBLAS wheels
-        #   - Other: surface raw exception
-        msg = str(e)
-        # isinstance check beats string-typed class name compare — future
-        # torch renames/wraps won't silently break OOM detection.
-        try:
-            import torch as _torch
-            oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
-        except Exception:
-            oom_cls = None
-        is_oom = (
-            (oom_cls is not None and isinstance(e, oom_cls))
-            or "out of memory" in msg.lower()
-        )
-        is_dll = isinstance(e, OSError) and any(
-            s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
-        )
-        if is_oom:
-            hint = (
-                " (CUDA OOM — try POLISH_ENABLED = False to free ~3-8 GB, "
-                "or pick a smaller STT_MODEL)"
-            )
-        elif is_dll:
-            hint = (
-                " (CUDA DLL load failed — install nvidia-cudnn-cu12 + "
-                "nvidia-cublas-cu12 or reinstall torch with CUDA wheel)"
-            )
-        else:
-            hint = ""
-        print(
-            f"[stt] backend '{STT_BACKEND}' init failed: {e}{hint}. "
-            f"Falling back to faster-whisper.",
-            file=sys.stderr, flush=True,
-        )
-
-    try:
-        return build_backend("faster-whisper", "large-v3-turbo")
-    except Exception as e:
-        print(
-            f"[stt] fatal: faster-whisper fallback also failed: {e}. "
-            f"Daemon cannot continue — install dependencies per README "
-            f"-> Windows 安裝步驟 and restart.",
-            file=sys.stderr, flush=True,
-        )
-        raise SystemExit(1)
-
-
-# ---------------------------------------------------------------------------
 # Audio capture state
 # ---------------------------------------------------------------------------
 _state_lock = threading.Lock()
@@ -1017,45 +372,6 @@ _edit_original_clipboard: str | None = None  # to restore in finally
 _ENCODER_SILENCE_THRESHOLD = 10.0 ** (-50.0 / 20.0)
 
 
-# v0.7.2: RMS-based silence trimmer. Cheap (numpy-only, microseconds for
-# typical hold-to-talk clips) substitute for proper VAD. Two motivations:
-#
-#   1. Qwen3-ASR is LLM-backbone — the HF model card explicitly lists
-#      "silence hallucination, mispronunciations, long-form drift" as known
-#      edge cases. When the encoder sees significant silence the decoder
-#      can emit a learned phrase that "fits" silence in training data —
-#      Chinese voice-blog signoffs ("好好好好") or English "Thanks for
-#      watching"-type artefacts. Trimming leading/trailing silence kills
-#      this trigger before it reaches the model.
-#
-#   2. Trimmed audio is shorter → encoder forward is faster.
-#
-# Threshold -50 dBFS catches typical room tone (well below speech amplitude
-# ~-20 to -10 dBFS) while not flagging quiet speech onsets. 100 ms margin
-# preserves syllable attacks at the boundary.
-def _trim_silence(samples: np.ndarray,
-                  threshold_dbfs: float = -50.0,
-                  frame_ms: int = 30,
-                  margin_ms: int = 100) -> np.ndarray:
-    if len(samples) < SAMPLE_RATE * 0.1:
-        return samples  # too short to meaningfully trim
-    frame_size = max(1, int(SAMPLE_RATE * frame_ms / 1000))
-    n_frames = len(samples) // frame_size
-    if n_frames == 0:
-        return samples
-    frames = samples[:n_frames * frame_size].reshape(n_frames, frame_size)
-    # RMS per frame, vectorised.
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
-    threshold = 10.0 ** (threshold_dbfs / 20.0)
-    above = rms > threshold
-    if not above.any():
-        return samples[:0]  # all silence — return empty array (correct dtype)
-    first = int(above.argmax())
-    last = n_frames - int(above[::-1].argmax()) - 1
-    margin = int(SAMPLE_RATE * margin_ms / 1000)
-    start = max(0, first * frame_size - margin)
-    end = min(len(samples), (last + 1) * frame_size + margin)
-    return samples[start:end]
 
 
 def _encoder_worker(handle: Any) -> None:
@@ -1120,8 +436,7 @@ def _encoder_worker(handle: Any) -> None:
     except Exception as e:
         # Don't print full traceback — log a one-liner and let the
         # batch-fallback path produce the user-visible transcript.
-        print(f"[stt] encoder worker crashed: {type(e).__name__}: {e}",
-              file=sys.stderr, flush=True)
+        logger.warning(f"encoder worker crashed: {type(e).__name__}: {e}")
         with _state_lock:
             _encoder_failed = True
             _encoder_consecutive_failures += 1
@@ -1147,7 +462,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
     global _encoder_silence_run_samples, _encoder_use_batch_fallback
     global _encoder_failed, _encoder_consecutive_failures
     if status:
-        print(f"[stt] audio status: {status}", file=sys.stderr, flush=True)
+        logger.info("audio status: %s", status)
 
     # Per-callback chunk stats. RMS uses float64 to avoid bf16/fp32 round
     # cancellation on very-low-amplitude room tone.
@@ -1209,8 +524,8 @@ def _audio_callback(indata, frames, time_info, status) -> None:
             # Push the first chunk to the queue too — worker is now ready.
             push_to_encoder = True
         except Exception as e:
-            print(f"[stt] encoder spawn failed: {type(e).__name__}: {e}; "
-                  f"will use batch path", file=sys.stderr, flush=True)
+            logger.warning(f"encoder spawn failed: {type(e).__name__}: {e}; "
+                           f"will use batch path")
             with _state_lock:
                 _encoder_failed = True
                 _encoder_consecutive_failures += 1
@@ -1227,8 +542,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
                 _encoder_use_batch_fallback = True
 
     if auto_stop:
-        print(f"[stt] auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger",
-              file=sys.stderr, flush=True)
+        logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
         threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
@@ -1256,8 +570,8 @@ def _abort_encoder_quiet() -> None:
         try:
             _backend.abort(_encoder_handle)
         except Exception as e:
-            print(f"[stt] encoder abort raised (ignored): "
-                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            logger.warning(f"encoder abort raised (ignored): "
+                           f"{type(e).__name__}: {e}")
     with _state_lock:
         _encoder_active = False
 
@@ -1278,9 +592,9 @@ def _transcribe_and_emit() -> None:
             _buffer = []
             _recording_samples = 0
             if dropped_chunks > 0:
-                print(f"[stt] busy — dropped {dropped_sec:.2f}s of captured "
-                      f"audio ({dropped_chunks} blocks; previous transcribe "
-                      f"still running)", flush=True)
+                logger.info(f"busy — dropped {dropped_sec:.2f}s of captured "
+                            f"audio ({dropped_chunks} blocks; previous transcribe "
+                            f"still running)")
             return
         _processing = True
         chunks = _buffer
@@ -1320,9 +634,8 @@ def _transcribe_and_emit() -> None:
                 _encoder_thread.join(timeout=ENCODER_FINALIZE_TIMEOUT)
             join_elapsed = time.time() - t0
             if _encoder_thread is not None and _encoder_thread.is_alive():
-                print(f"[stt] encoder join timed out after "
-                      f"{join_elapsed:.1f}s — falling back to batch path",
-                      file=sys.stderr, flush=True)
+                logger.warning(f"encoder join timed out after "
+                               f"{join_elapsed:.1f}s — falling back to batch path")
                 _abort_encoder_quiet()
                 with _state_lock:
                     _encoder_failed = True
@@ -1351,9 +664,8 @@ def _transcribe_and_emit() -> None:
                     _encoder_consecutive_failures = 0  # success → reset
                     _encoder_active = False
             except Exception as e:
-                print(f"[stt] encoder finalize raised "
-                      f"{type(e).__name__}: {e}; falling back to batch",
-                      file=sys.stderr, flush=True)
+                logger.warning(f"encoder finalize raised "
+                               f"{type(e).__name__}: {e}; falling back to batch")
                 try:
                     _backend.abort(_encoder_handle)
                 except Exception:
@@ -1371,16 +683,15 @@ def _transcribe_and_emit() -> None:
             _abort_encoder_quiet()
             # v0.7.2: RMS silence trim before ASR. Qwen3-ASR is LLM-backbone
             # and hallucinates on long silence (model card known issue).
-            trimmed = _trim_silence(samples)
+            trimmed = _trim_silence(samples, SAMPLE_RATE)
             if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
                 # Could be (a) too-short tap or (b) all-silence after trim.
                 trim_sec = len(trimmed) / SAMPLE_RATE
                 if trim_sec < raw_sec * 0.5 and raw_sec >= MIN_AUDIO_SEC:
-                    print(f"[stt] silent — trimmed {raw_sec:.2f}s → "
-                          f"{trim_sec:.2f}s; mic muted or very quiet?",
-                          flush=True)
+                    logger.info(f"silent — trimmed {raw_sec:.2f}s → "
+                                f"{trim_sec:.2f}s; mic muted or very quiet?")
                 else:
-                    print(f"[stt] too short ({raw_sec:.2f}s)", flush=True)
+                    logger.info(f"too short ({raw_sec:.2f}s)")
                 return
             t0 = time.time()
             raw, language = _backend.transcribe(trimmed)
@@ -1388,8 +699,7 @@ def _transcribe_and_emit() -> None:
             # path_label already "batch"
 
         if not raw:
-            print(f"[stt] empty ({language}, {elapsed:.2f}s, {path_label})",
-                  flush=True)
+            logger.info(f"empty ({language}, {elapsed:.2f}s, {path_label})")
             return
         text = post_process(raw)
         pre_polish = text  # captured to log diff when polish edits substantively
@@ -1425,9 +735,8 @@ def _transcribe_and_emit() -> None:
         # suppress the success beep + use a different log line so the user
         # sees one consistent signal of what actually happened.
         if not _pasteboard.set_text(text):
-            print(f"[stt] {language} {elapsed:.2f}s clipboard write failed — "
-                  f"'{text}' NOT inserted",
-                  file=sys.stderr, flush=True)
+            logger.error(f"{language} {elapsed:.2f}s clipboard write failed — "
+                         f"'{text}' NOT inserted")
             return
         # v0.7.2: was 0.15 s, dropped to 0.02 s. The original sleep was
         # primarily compensating for PowerShell Set-Clipboard / pbcopy
@@ -1440,7 +749,7 @@ def _transcribe_and_emit() -> None:
         time.sleep(0.02)
         paste_ok = _pasteboard.paste()
         if paste_ok:
-            _play_beep(BEEP_END_HZ)
+            _play_beep(BEEP_END_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
 
         try:
             timing = f"{elapsed:.2f}s"
@@ -1461,21 +770,19 @@ def _transcribe_and_emit() -> None:
             # polish_edited (computed before the OpenCC backstop) so edits
             # that the backstop normalises away are still surfaced.
             if polish_edited:
-                print(f"[stt] {language} raw   -> {pre_polish}", flush=True)
+                logger.info(f"{language} raw   -> {pre_polish}")
             if paste_ok:
-                print(f"[stt] {language} {timing}{path_tag} -> {text}",
-                      flush=True)
+                logger.info(f"{language} {timing}{path_tag} -> {text}")
             else:
                 # paste() already printed a user-facing 'paste blocked' line
                 # to the main log; we record the transcript itself so it's
                 # discoverable even when auto-paste didn't fire.
-                print(f"[stt] {language} {timing}{path_tag} "
-                      f"clipboard-only -> {text}", flush=True)
+                logger.info(f"{language} {timing}{path_tag} "
+                            f"clipboard-only -> {text}")
         except Exception:
-            print(f"[stt] inserted ({elapsed:.2f}s); log encoding failed",
-                  flush=True)
+            logger.info(f"inserted ({elapsed:.2f}s); log encoding failed")
     except Exception as e:
-        print(f"[stt] error: {e}", file=sys.stderr, flush=True)
+        logger.error(f"{e}")
     finally:
         with _state_lock:
             _processing = False
@@ -1547,8 +854,8 @@ def _transcribe_and_emit_edit(selection: str,
             _buffer = []
             _recording_samples = 0
             if dropped_chunks > 0:
-                print(f"[stt] busy — dropped {dropped_sec:.2f}s of voice-edit "
-                      f"audio ({dropped_chunks} blocks)", flush=True)
+                logger.info(f"busy — dropped {dropped_sec:.2f}s of voice-edit "
+                            f"audio ({dropped_chunks} blocks)")
             # Still need to restore the original clipboard even on busy-
             # drop, because _on_press already overwrote it via simulate_copy.
             _try_restore_clipboard(original_clipboard, context="busy-drop")
@@ -1559,24 +866,22 @@ def _transcribe_and_emit_edit(selection: str,
         _recording_samples = 0
     try:
         if not chunks:
-            print("[stt] voice-edit: empty audio (no instruction)",
-                  flush=True)
+            logger.info("voice-edit: empty audio (no instruction)")
             return
         samples_arr = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
         raw_sec = len(samples_arr) / SAMPLE_RATE
-        trimmed = _trim_silence(samples_arr)
+        trimmed = _trim_silence(samples_arr, SAMPLE_RATE)
         if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
-            print(f"[stt] voice-edit: too short ({raw_sec:.2f}s) — "
-                  f"no instruction captured",
-                  flush=True)
+            logger.info(f"voice-edit: too short ({raw_sec:.2f}s) — "
+                        f"no instruction captured")
             return
         # ASR transcribes the spoken instruction
         t0 = time.time()
         instruction_raw, language = _backend.transcribe(trimmed)
         asr_elapsed = time.time() - t0
         if not instruction_raw.strip():
-            print(f"[stt] voice-edit: empty transcript ({language}, "
-                  f"{asr_elapsed:.2f}s)", flush=True)
+            logger.info(f"voice-edit: empty transcript ({language}, "
+                        f"{asr_elapsed:.2f}s)")
             return
         # OpenCC normalisation on the instruction (Qwen3-ASR outputs
         # simplified natively — same logic as polish path).
@@ -1587,36 +892,33 @@ def _transcribe_and_emit_edit(selection: str,
         edited = _polisher.edit(selection, instruction)
         edit_elapsed = time.time() - t1
         if edited is None:
-            _play_beep(BEEP_FAIL_HZ)
-            print(f"[stt] voice-edit: polish.edit returned None "
-                  f"(instruction: {instruction!r})", flush=True)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
+            logger.warning(f"voice-edit: polish.edit returned None "
+                           f"(instruction: {instruction!r})")
             return
         edited = post_process(edited)  # backstop simplified→traditional
 
         # Paste result
         if not _pasteboard.set_text(edited):
-            print(f"[stt] voice-edit: clipboard write failed — "
-                  f"'{edited}' NOT inserted",
-                  file=sys.stderr, flush=True)
+            logger.error(f"voice-edit: clipboard write failed — "
+                         f"'{edited}' NOT inserted")
             return
         time.sleep(0.02)
         paste_ok = _pasteboard.paste()
         if paste_ok:
-            _play_beep(BEEP_END_HZ)
+            _play_beep(BEEP_END_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
             # Compact log: instruction + before/after lets user diff in
             # the daemon log without re-deriving from clipboard history.
-            print(f"[stt] voice-edit ({language}, {asr_elapsed:.2f}s+"
-                  f"edit {edit_elapsed:.2f}s)\n"
-                  f"  instr:  {instruction}\n"
-                  f"  before: {selection}\n"
-                  f"  after:  {edited}",
-                  flush=True)
+            logger.info(f"voice-edit ({language}, {asr_elapsed:.2f}s+"
+                        f"edit {edit_elapsed:.2f}s) "
+                        f"instr: {instruction} | "
+                        f"before: {selection} | "
+                        f"after: {edited}")
         else:
-            print(f"[stt] voice-edit: paste keystroke failed — '{edited}' "
-                  f"on clipboard, press Ctrl+V/Cmd+V manually",
-                  flush=True)
+            logger.warning(f"voice-edit: paste keystroke failed — '{edited}' "
+                           f"on clipboard, press Ctrl+V/Cmd+V manually")
     except Exception as e:
-        print(f"[stt] voice-edit error: {e}", file=sys.stderr, flush=True)
+        logger.error(f"voice-edit error: {e}")
     finally:
         # Restore original clipboard regardless of success/failure path.
         # User's clipboard history should look like nothing happened
@@ -1635,11 +937,10 @@ def _try_restore_clipboard(original: str | None, *, context: str) -> None:
         return  # nothing to restore (clipboard was empty pre-capture)
     try:
         if not _pasteboard.set_text(original):
-            print(f"[stt] voice-edit: clipboard restore failed ({context})",
-                  flush=True)
+            logger.warning(f"voice-edit: clipboard restore failed ({context})")
     except Exception as e:
-        print(f"[stt] voice-edit: clipboard restore raised ({context}): "
-              f"{e}", flush=True)
+        logger.warning(f"voice-edit: clipboard restore raised ({context}): "
+                       f"{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1685,17 +986,17 @@ def _on_press(key) -> None:
     if is_edit:
         captured = _capture_selection(_pasteboard)
         if captured is None:
-            _play_beep(BEEP_FAIL_HZ)
-            print("[stt] voice-edit: no selection captured", flush=True)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
+            logger.info("voice-edit: no selection captured")
             return  # DO NOT start recording
         # Verify polisher actually has edit capability — NoopPolisher's
         # edit() returns None unconditionally, so starting a recording
         # we know can't succeed would just waste 1-5s of user effort.
         if _polisher.__class__.__name__ == "NoopPolisher":
-            _play_beep(BEEP_FAIL_HZ)
-            print("[stt] voice-edit: POLISH_ENABLED is False — voice-edit "
-                  "requires polish (LLM does the editing). Enable polish "
-                  "or unset EDIT_TRIGGER_KEYS.", flush=True)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
+            logger.warning("voice-edit: POLISH_ENABLED is False — voice-edit "
+                           "requires polish (LLM does the editing). Enable polish "
+                           "or unset EDIT_TRIGGER_KEYS.")
             _try_restore_clipboard(captured[1], context="noop-polisher")
             return
 
@@ -1741,8 +1042,8 @@ def _on_press(key) -> None:
             except queue.Empty:
                 break
     edit_tag = " [edit]" if is_edit else ""
-    print(f"[stt] REC ({key}){edit_tag}", flush=True)
-    _play_beep(BEEP_START_HZ)
+    logger.info(f"REC ({key}){edit_tag}")
+    _play_beep(BEEP_START_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
 
 
 def _on_release(key) -> None:
@@ -1790,7 +1091,7 @@ def _on_release(key) -> None:
             edit_selection_snap = _edit_selection
             edit_original_snap = _edit_original_clipboard
     if abort:
-        print("[stt] release aborted by new press during drain", flush=True)
+        logger.info("release aborted by new press during drain")
         return
     # v0.8.0: signal the encoder worker (if any) to drain remaining queue
     # and exit. _transcribe_and_emit will join the worker before calling
@@ -1800,39 +1101,76 @@ def _on_release(key) -> None:
     if _encoder_active:
         _encoder_stop_event.set()
     if edit_mode_snap:
-        print("[stt] voice-edit processing...", flush=True)
+        logger.info("voice-edit processing...")
         threading.Thread(
             target=_transcribe_and_emit_edit,
             args=(edit_selection_snap, edit_original_snap),
             daemon=True,
         ).start()
     else:
-        print("[stt] processing...", flush=True)
+        logger.info("processing...")
         threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _setup_logging() -> None:
+    """Configure the 'stt' logger hierarchy.
+
+    Format matches the legacy `[stt] <message>` pattern so existing log
+    parsers (home_stt.py status) continue to work. Log level can be
+    overridden via HOME_STT_LOG_LEVEL env var."""
+    level_name = os.environ.get("HOME_STT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    fmt = logging.Formatter("[stt] %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(level)
+    stdout_handler.setFormatter(fmt)
+    stdout_handler.addFilter(lambda r: r.levelno < logging.WARNING)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
+
+    root = logging.getLogger("stt")
+    root.setLevel(level)
+    root.addHandler(stdout_handler)
+    root.addHandler(stderr_handler)
+
+
 def main() -> None:
     global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
+
+    _setup_logging()
+
+    # Load user config (TOML file + env overrides) and apply to module globals.
+    import stt_config as _cfg
+    _user_cfg = _cfg.load_config()
+    _this = sys.modules[__name__]
+    _cfg.apply_to_module(_user_cfg, _this)
+    _cf_path = _cfg.config_path()
+    if _cf_path.exists():
+        logger.info(f"config: {_cf_path}")
 
     _pasteboard = build_pasteboard()
     n_native = _pasteboard.register_native_libs()
 
-    print(f"[stt] home-stt v{__version__} starting", flush=True)
-    print(f"[stt] platform: {sys.platform} ({_host_platform.machine()}) | "
-          f"native libs registered: {n_native}", flush=True)
-    print(f"[stt] backend: {STT_BACKEND} | model: {STT_MODEL}", flush=True)
+    logger.info(f"home-stt v{__version__} starting")
+    logger.info(f"platform: {sys.platform} ({_host_platform.machine()}) | "
+                f"native libs registered: {n_native}")
+    logger.info(f"backend: {STT_BACKEND} | model: {STT_MODEL}")
     paste_desc = _pasteboard.describe_paste_path()
     if paste_desc:
-        print(f"[stt] paste path: {paste_desc}", flush=True)
+        logger.info(f"paste path: {paste_desc}")
 
     global _polisher
     _polisher = build_polisher(POLISH_ENABLED, POLISH_MODEL, POLISH_PROMPT)
-    print(f"[stt] polish: {_polisher.device_label}", flush=True)
+    logger.info(f"polish: {_polisher.device_label}")
 
-    _backend = build_backend_with_fallback()
+    _backend = build_backend_with_fallback(STT_BACKEND, STT_MODEL, SAMPLE_RATE)
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
@@ -1842,7 +1180,7 @@ def main() -> None:
     if EDIT_TRIGGER_KEYS is None:
         EDIT_TRIGGER_KEYS = _pasteboard.default_edit_trigger_keys
 
-    print(f"[stt] warming up on {_backend.device_label}...", flush=True)
+    logger.info(f"warming up on {_backend.device_label}...")
     t0 = time.time()
     _backend.warmup()
     trigger_labels = ", ".join(str(k) for k in TRIGGER_KEYS)
@@ -1852,15 +1190,14 @@ def main() -> None:
         # None). Warn at startup so user isn't surprised when the fail
         # beep plays on every edit press.
         if _polisher.__class__.__name__ == "NoopPolisher":
-            print(f"[stt] WARN: EDIT_TRIGGER_KEYS set ({edit_labels}) but "
-                  f"polish is disabled — voice-edit will fail-beep on every "
-                  f"press. Enable polish or unset EDIT_TRIGGER_KEYS.",
-                  file=sys.stderr, flush=True)
-        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
-              f"to dictate, hold {edit_labels} to voice-edit.", flush=True)
+            logger.warning(f"EDIT_TRIGGER_KEYS set ({edit_labels}) but "
+                           f"polish is disabled — voice-edit will fail-beep on every "
+                           f"press. Enable polish or unset EDIT_TRIGGER_KEYS.")
+        logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+                    f"to dictate, hold {edit_labels} to voice-edit.")
     else:
-        print(f"[stt] warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
-              f"to record.", flush=True)
+        logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
+                    f"to record.")
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -1875,7 +1212,7 @@ def main() -> None:
     try:
         listener.join()
     except KeyboardInterrupt:
-        print("[stt] bye", flush=True)
+        logger.info("bye")
     finally:
         stream.stop()
         stream.close()
