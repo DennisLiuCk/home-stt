@@ -38,14 +38,20 @@ def config_path() -> Path:
 def _parse_key(name: str):
     """Convert a string key name to a pynput Key or character.
 
-    Accepts: 'alt_r', 'cmd_r', 'f13', 'a', etc.
+    Accepts: 'alt_r', 'cmd_r', 'f13', 'a', 'vk_123', etc.
     """
-    from pynput.keyboard import Key
-    upper = name.strip().lower()
-    if hasattr(Key, upper):
-        return getattr(Key, upper)
-    if len(name.strip()) == 1:
-        return name.strip()
+    from pynput.keyboard import Key, KeyCode
+    stripped = name.strip()
+    lower = stripped.lower()
+    if hasattr(Key, lower):
+        return getattr(Key, lower)
+    if len(stripped) == 1:
+        return stripped
+    if lower.startswith("vk_"):
+        try:
+            return KeyCode.from_vk(int(lower[3:]))
+        except (ValueError, TypeError):
+            pass
     raise ValueError(f"Unknown key: {name!r}")
 
 
@@ -77,6 +83,7 @@ _DEFAULTS: dict[str, Any] = {
     "beep_fail_hz": 220,
     "beep_duration_ms": 80,
     "beep_volume": 0.15,
+    "mic_device": None,
 }
 
 _ENV_PREFIX = "HOME_STT_"
@@ -100,6 +107,12 @@ def _coerce_env(key: str, raw: str) -> Any:
         return parts if parts else None
     if key in _LIST_STR_KEYS:
         return [s.strip() for s in raw.split(",") if s.strip()]
+    if key == "mic_device":
+        stripped = raw.strip()
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
     return raw
 
 
@@ -176,6 +189,11 @@ _TEMPLATE = """\
 # sample_rate = 16000
 # min_audio_sec = 0.15
 # max_audio_sec = 120
+#
+# Microphone device — name (substring match) or index number.
+# Run `home-stt devices` to list available devices.
+# mic_device = "MacBook Pro Microphone"
+# mic_device = 1
 
 # ── Beep feedback ────────────────────────────────────────────────────
 # beeps_enabled = true
@@ -202,6 +220,70 @@ def init_config() -> Path:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(generate_default_config(), encoding="utf-8")
+    return path
+
+
+def _key_to_str(key) -> str:
+    """Convert a pynput Key or character back to a config-file string."""
+    from pynput.keyboard import Key, KeyCode
+    if isinstance(key, Key):
+        return key.name
+    if isinstance(key, KeyCode):
+        if key.char:
+            return key.char
+        if key.vk is not None:
+            vk = key.vk
+            from pynput.keyboard import Key as _K
+            for member in _K:
+                if hasattr(member.value, 'vk') and member.value.vk == vk:
+                    return member.name
+            return f"vk_{vk}"
+    return str(key)
+
+
+def update_trigger_keys(
+    trigger: list[str] | None = None,
+    edit_trigger: list[str] | None = None,
+) -> Path:
+    """Write trigger key settings into the user's config.toml.
+
+    Creates the file from the default template if it doesn't exist.
+    If it exists, patches the trigger_keys / edit_trigger_keys lines
+    in place; if the keys aren't present yet, appends them to the
+    trigger-keys section.
+    """
+    import re as _re
+
+    path = init_config()
+    content = path.read_text(encoding="utf-8")
+
+    def _format_toml_list(keys: list[str]) -> str:
+        return "[" + ", ".join(f'"{k}"' for k in keys) + "]"
+
+    for key_name, value in [("trigger_keys", trigger),
+                            ("edit_trigger_keys", edit_trigger)]:
+        if value is None:
+            continue
+        toml_val = _format_toml_list(value)
+        line = f"{key_name} = {toml_val}"
+        # Replace existing (commented or not)
+        pattern = _re.compile(
+            r"^#?\s*" + _re.escape(key_name) + r"\s*=.*$", _re.MULTILINE
+        )
+        if pattern.search(content):
+            content = pattern.sub(line, content, count=0)
+        else:
+            # Append after the trigger-keys section header
+            marker = "# ── Trigger keys"
+            idx = content.find(marker)
+            if idx != -1:
+                next_section = content.find("\n# ── ", idx + len(marker))
+                insert_at = next_section if next_section != -1 else len(content)
+                content = content[:insert_at] + line + "\n" + content[insert_at:]
+            else:
+                content = content.rstrip("\n") + "\n\n" + line + "\n"
+
+    path.write_text(content, encoding="utf-8")
     return path
 
 
@@ -246,7 +328,13 @@ def apply_to_module(cfg: dict[str, Any], module) -> None:
             setattr(module, mod_attr, val)
 
     if cfg.get("encoder_pipelining") is not None:
-        module.ENCODER_PIPELINING = bool(cfg["encoder_pipelining"])
+        val = bool(cfg["encoder_pipelining"])
+        module.ENCODER_PIPELINING = val
+        try:
+            import stt_streaming
+            stt_streaming.ENCODER_PIPELINING = val
+        except ImportError:
+            pass
 
     if cfg.get("beeps_enabled") is not None:
         module.BEEPS_ENABLED = bool(cfg["beeps_enabled"])
@@ -255,6 +343,17 @@ def apply_to_module(cfg: dict[str, Any], module) -> None:
                                ("edit_trigger_keys", "EDIT_TRIGGER_KEYS")]:
         val = cfg.get(cfg_key)
         if val is not None:
-            parsed = _parse_key_set(val)
+            try:
+                parsed = _parse_key_set(val)
+            except ValueError as e:
+                logger.warning("bad %s in config: %s — using default", cfg_key, e)
+                continue
             if parsed is not None:
                 setattr(module, mod_attr, parsed)
+
+    mic = cfg.get("mic_device")
+    if mic is not None:
+        if isinstance(mic, int):
+            setattr(module, "MIC_DEVICE", mic)
+        else:
+            setattr(module, "MIC_DEVICE", str(mic))

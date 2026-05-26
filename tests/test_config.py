@@ -152,6 +152,159 @@ class TestInitConfig:
         assert cfg_file.read_text() == "existing"
 
 
+class TestUpdateTriggerKeys:
+    def test_creates_file_if_missing(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"])
+        assert cfg_file.exists()
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["alt_r"]' in content
+
+    def test_updates_commented_line(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '# trigger_keys = ["alt_r"]\n'
+            '# edit_trigger_keys = ["f13"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["f14"], edit_trigger=["f15"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["f14"]' in content
+        assert 'edit_trigger_keys = ["f15"]' in content
+        assert "# trigger_keys" not in content
+        assert "# edit_trigger_keys" not in content
+
+    def test_updates_existing_value(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            'trigger_keys = ["ctrl_r"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["alt_r"]' in content
+        assert "ctrl_r" not in content
+
+    def test_none_skips_key(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            'trigger_keys = ["ctrl_r"]\n'
+            '# edit_trigger_keys = ["f13"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=None, edit_trigger=["f15"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["ctrl_r"]' in content
+        assert 'edit_trigger_keys = ["f15"]' in content
+
+    def test_roundtrip_produces_valid_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"], edit_trigger=["f13"])
+        if stt_config.tomllib is not None:
+            with open(cfg_file, "rb") as f:
+                parsed = stt_config.tomllib.load(f)
+            assert parsed["trigger_keys"] == ["alt_r"]
+            assert parsed["edit_trigger_keys"] == ["f13"]
+
+
+class TestMicDevice:
+    def test_default_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] is None
+
+    def test_string_from_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('mic_device = "Yeti Nano"\n', encoding="utf-8")
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == "Yeti Nano"
+
+    def test_int_from_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("mic_device = 3\n", encoding="utf-8")
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == 3
+
+    def test_env_int_coercion(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        monkeypatch.setenv("HOME_STT_MIC_DEVICE", "5")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == 5
+
+    def test_env_string(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        monkeypatch.setenv("HOME_STT_MIC_DEVICE", "Yeti Nano")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == "Yeti Nano"
+
+
+class TestKeyToStr:
+    def test_pynput_key(self):
+        from pynput.keyboard import Key
+        assert stt_config._key_to_str(Key.alt_r) == "alt_r"
+
+    def test_char(self):
+        assert stt_config._key_to_str("a") == "a"
+
+    def test_keycode_with_char(self):
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_char("z")
+        assert stt_config._key_to_str(kc) == "z"
+
+    def test_keycode_vk_only(self):
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_vk(65437)
+        result = stt_config._key_to_str(kc)
+        assert result.startswith("vk_") or result.isalpha()
+
+    def test_vk_roundtrip(self):
+        """_key_to_str → _parse_key must survive for vk-only keys."""
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_vk(65437)
+        name = stt_config._key_to_str(kc)
+        parsed = stt_config._parse_key(name)
+        assert parsed is not None
+
+
+class TestParseKeyVk:
+    def test_vk_format(self):
+        from pynput.keyboard import KeyCode
+        result = stt_config._parse_key("vk_65437")
+        assert isinstance(result, KeyCode)
+        assert result.vk == 65437
+
+    def test_vk_invalid_number(self):
+        with pytest.raises(ValueError):
+            stt_config._parse_key("vk_notanumber")
+
+
+class TestApplyToModuleBadKeys:
+    def test_bad_key_name_logs_warning_not_crash(self, tmp_path, monkeypatch):
+        """A typo in config trigger_keys should warn, not crash the daemon."""
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        cfg = stt_config.load_config()
+        cfg["trigger_keys"] = ["not_a_real_key"]
+
+        class FakeModule:
+            TRIGGER_KEYS = None
+            EDIT_TRIGGER_KEYS = None
+            ENCODER_PIPELINING = False
+            POLISH_ENABLED = True
+            POLISH_LANGUAGES = {"zh"}
+            BEEPS_ENABLED = True
+
+        mod = FakeModule()
+        stt_config.apply_to_module(cfg, mod)
+        assert mod.TRIGGER_KEYS is None  # should stay default, not crash
+
+
 class TestGenerateDefaultConfig:
     def test_template_is_valid_toml(self, tmp_path):
         content = stt_config.generate_default_config()

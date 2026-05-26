@@ -42,11 +42,9 @@ from __future__ import annotations
 import logging
 import os
 import platform as _host_platform
-import queue
 import sys
 import threading
 import time
-from typing import Any
 
 logger = logging.getLogger("stt")
 
@@ -77,6 +75,8 @@ from pynput.keyboard import Key
 from stt_audio import post_process, _play_beep, _trim_silence
 from stt_backends import STTBackend, build_backend, build_backend_with_fallback
 from stt_platform import Pasteboard, build_pasteboard
+from stt_state import write_state as _write_state, cleanup as _cleanup_state, IDLE, RECORDING, PROCESSING
+from stt_streaming import EncoderPipeline
 from text_polisher import TextPostProcessor, build_polisher
 
 
@@ -101,6 +101,10 @@ MIN_AUDIO_SEC    = 0.15                # taps shorter than this are ignored
 # unbounded. 120 s is well past any reasonable hold-to-talk session;
 # beyond this, _audio_callback force-releases and spawns transcribe.
 MAX_AUDIO_SEC    = 120                 # hard ceiling — auto-release on stuck key
+
+# Microphone device — None = system default. Set via config.toml or
+# HOME_STT_MIC_DEVICE env var. Accepts device name (str) or index (int).
+MIC_DEVICE: str | int | None = None
 
 # STT backend + model defaults per platform.
 #   macOS (Apple Silicon only as of v0.4.0): Qwen3-ASR-0.6B via mlx-qwen3-asr.
@@ -266,51 +270,17 @@ TRIGGER_KEYS: set | None = None
 # the existing default_trigger_keys pattern). Set explicitly to an
 # empty set `set()` to DISABLE voice-edit entirely.
 #
-# Caveat: F13 only exists on full-size Win keyboards (TKL / laptop users
-# override). Right Command exists on all Mac keyboards including MacBook.
+# Caveat: F13 only exists on full-size Win keyboards — TKL / laptop users
+# override via config.toml or `home-stt config --set-trigger`.
+# Right Command exists on all Mac keyboards including MacBook.
 EDIT_TRIGGER_KEYS: set | None = None
 SELECTION_CAPTURE_WAIT_S  = 0.1   # post-Cmd+C wait before checking seqno
 
-# ---------------------------------------------------------------------------
-# Press-time encoder pipelining framework (built for v0.8.0, shipped
-# DISABLED in v0.7.3 after a bench-first save).
-#
-# Goal was 50% release-to-text latency reduction by running the ASR
-# encoder in a background thread while the user holds the trigger, so
-# only the decoder + tail encoder runs on the post-release critical path.
-# Spike (`tmp/spike_torch_encoder.py`) verified chunked encoding produces
-# text within Lev≤4 of batch on real speech; Day 13-14 latency bench
-# (`tmp/bench_v080_latency.py`) measured the actual saving:
-#
-#     sample              audio   batch   stream   saved   pct  Lev
-#     sample.wav          20.0s   2.83s   2.88s   -0.06s   -2%    2
-#     sample_english      20.0s   2.82s   2.85s   -0.03s   -1%    0
-#     sample_long         40.0s   6.99s   6.81s   +0.18s   +3%   21
-#     sample_silence-mid  30.0s   4.54s   4.47s   +0.07s   +2%   21
-#
-# Root cause: original plan estimated encoder forward at 3-5s for 40s
-# audio on RTX 5080 + Qwen3-ASR-0.6B; reality is ~0.2s. Decoder dominates
-# ~95% of post-release time. Pipelining the encoder saves ≤0.2s — not
-# worth the Lev=21 long-form text drift it introduces (chunk-boundary
-# noise: punctuation + homophone choice + occasional word substitution;
-# semantic content preserved but char-level differs by ~10%).
-#
-# Shipped DISABLED so the daemon's runtime behaviour matches v0.7.2.
-# Framework code (StreamingQwen3ASRModel, _encoder_worker, all state +
-# tests) preserved for future re-evaluation when the decoder side gets
-# faster (Qwen3-ASR-FP8 if Alibaba ships it, smaller decoder variant,
-# speculative decoding with a viable draft model, or llama.cpp+GGUF Q8_0
-# swap — the original v0.8.0 plan candidate B that's the real path to
-# 2-3x decoder speedup).
-#
-# To re-enable for testing / future work:
-#   ENCODER_PIPELINING = True
-ENCODER_PIPELINING            = False  # see comment above — null-result ship
-ENCODER_CHUNK_SEC             = 5.0    # encoder forward every N s of buffered audio
-ENCODER_QUEUE_MAX             = 200    # ~10s of 50ms ticks; lag safety cap
-ENCODER_FINALIZE_TIMEOUT      = 8.0    # max join wait before fallback to batch
-ENCODER_FAILURE_BUDGET        = 3      # consecutive failures before disabling next utterance
-ENCODER_SILENCE_FALLBACK_SEC  = 2.0    # mid-utterance silence ≥ N s → batch fallback
+# Press-time encoder pipelining (v0.8.0, shipped DISABLED). All logic
+# lives in stt_streaming.py / EncoderPipeline. Config constants
+# (ENCODER_PIPELINING etc.) are in that module; apply_to_module writes
+# to it. See stt_streaming.py for the full bench history and rationale.
+ENCODER_PIPELINING = False  # re-exported for stt_config.apply_to_module
 
 # Audio feedback — short sine-wave tones at trigger-press / paste-done
 # so the user knows when recording starts and when transcription has
@@ -328,218 +298,63 @@ BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 
 
 # ---------------------------------------------------------------------------
-# Audio capture state
+# Audio capture state — grouped into DaemonState for type safety and
+# snapshotability. Single instance `_st` created at module level.
 # ---------------------------------------------------------------------------
-_state_lock = threading.Lock()
-_buffer: list[np.ndarray] = []
-_recording = False
-_active_trigger = None   # which TRIGGER_KEYS member is currently held, or None
-_processing = False
-# v0.7.2: running sample count for the current _buffer. Tracked to enforce
-# MAX_AUDIO_SEC without re-summing every callback (which would be O(N) per
-# 50 ms tick on long recordings). Reset whenever _buffer is cleared / swapped.
-_recording_samples = 0
+class DaemonState:
+    __slots__ = ("lock", "buffer", "recording", "active_trigger",
+                 "processing", "recording_samples", "edit_mode",
+                 "edit_selection", "edit_original_clipboard")
 
-# v0.8.0: press-time encoder pipelining state. All access guarded by
-# _state_lock (the bool flags + counters), except _encoder_queue +
-# _encoder_stop_event which are already thread-safe primitives. See plan
-# in ~/.claude/plans/v0-8-0-architectural-polymorphic-ullman.md for the
-# end-to-end lifecycle. Reset together in _on_press; never set outside
-# _on_press / _audio_callback / _encoder_worker / _transcribe_and_emit.
-_encoder_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=ENCODER_QUEUE_MAX)
-_encoder_thread: threading.Thread | None = None
-_encoder_handle: Any = None
-_encoder_stop_event = threading.Event()
-_encoder_active = False            # True iff worker is alive and handle valid
-_encoder_failed = False            # set by worker on exception, or by finalize-timeout
-_encoder_consecutive_failures = 0  # ENCODER_FAILURE_BUDGET → suppress next utterance
-_encoder_use_batch_fallback = False  # Option C: mid-silence detected → use batch path
-_encoder_silence_run_samples = 0   # rolling silence sample count for Option C
-_encoder_residual_samples: np.ndarray | None = None  # tail audio worker left for finalize
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.buffer: list = []
+        self.recording: bool = False
+        self.active_trigger = None
+        self.processing: bool = False
+        self.recording_samples: int = 0
+        self.edit_mode: bool = False
+        self.edit_selection: str | None = None
+        self.edit_original_clipboard: str | None = None
 
-# v0.7.5 voice-edit per-recording state. Snapshotted at press time —
-# `_on_release` reads these under _state_lock then routes to
-# `_transcribe_and_emit_edit` instead of `_transcribe_and_emit`. All three
-# are cleared at the top of `_on_press` and re-populated if the press is
-# an edit-trigger.
-_edit_mode = False                  # True iff this recording is voice-edit
-_edit_selection: str | None = None  # the captured selection text
-_edit_original_clipboard: str | None = None  # to restore in finally
+
+_st = DaemonState()
+
+# Encoder pipeline instance — created in main() after SAMPLE_RATE is finalised.
+_encoder: EncoderPipeline | None = None
 
 # Silence threshold for the mid-utterance fallback detector. Matches the
-# -50 dBFS that _trim_silence uses, so user-visible behaviour is consistent
-# ("daemon thought you stopped speaking" → fallback).
+# -50 dBFS that _trim_silence uses.
 _ENCODER_SILENCE_THRESHOLD = 10.0 ** (-50.0 / 20.0)
 
 
-
-
-def _encoder_worker(handle: Any) -> None:
-    """v0.8.0: drain `_encoder_queue` into ENCODER_CHUNK_SEC slabs and feed
-    them through `_backend.push_chunk(handle, slab)` while the user is
-    still holding the trigger. Sets `_encoder_residual_samples` to the
-    remaining tail (< ENCODER_CHUNK_SEC) for finalize to encode.
-
-    Failure modes:
-      - Any exception in `push_chunk` → log + set `_encoder_failed = True`
-        + increment `_encoder_consecutive_failures`. `_transcribe_and_emit`
-        detects the flag and transparently falls back to the batch path.
-      - `_encoder_queue.Empty` after stop_event is the normal exit path.
-
-    Aborts cleanly (never via interrupt — PyTorch/MLX forwards are
-    uninterruptible). Worst case: a 5 s slab is in flight when the user
-    releases, the worker finishes that forward (≤ ~1 s on RTX 5080), THEN
-    checks `_encoder_stop_event` and exits. `_transcribe_and_emit`'s
-    8 s join timeout bounds the wait either way.
-    """
-    global _encoder_failed, _encoder_consecutive_failures, _encoder_residual_samples
-    chunk_size = int(SAMPLE_RATE * ENCODER_CHUNK_SEC)
-    accumulator: list[np.ndarray] = []
-    accumulated_n = 0
-    try:
-        while not _encoder_stop_event.is_set():
-            try:
-                # Short timeout so we re-check stop_event regularly even
-                # during long silence (when no new chunks arrive).
-                chunk = _encoder_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            accumulator.append(chunk)
-            accumulated_n += chunk.shape[0]
-            if accumulated_n >= chunk_size:
-                concat = np.concatenate(accumulator, axis=0).flatten().astype(np.float32)
-                slab = concat[:chunk_size]
-                _backend.push_chunk(handle, slab)
-                # Keep remainder for next slab.
-                if concat.shape[0] > chunk_size:
-                    accumulator = [concat[chunk_size:]]
-                    accumulated_n = concat.shape[0] - chunk_size
-                else:
-                    accumulator = []
-                    accumulated_n = 0
-        # Stop event set — drain any remaining queue items into accumulator
-        # so finalize sees the full tail. Don't push_chunk: finalize is the
-        # designated point for the final (possibly partial) slab.
-        while True:
-            try:
-                chunk = _encoder_queue.get_nowait()
-            except queue.Empty:
-                break
-            accumulator.append(chunk)
-            accumulated_n += chunk.shape[0]
-        if accumulator:
-            residual = np.concatenate(accumulator, axis=0).flatten().astype(np.float32)
-        else:
-            residual = np.zeros(0, dtype=np.float32)
-        with _state_lock:
-            _encoder_residual_samples = residual
-    except Exception as e:
-        # Don't print full traceback — log a one-liner and let the
-        # batch-fallback path produce the user-visible transcript.
-        logger.warning(f"encoder worker crashed: {type(e).__name__}: {e}")
-        with _state_lock:
-            _encoder_failed = True
-            _encoder_consecutive_failures += 1
-
-
 def _audio_callback(indata, frames, time_info, status) -> None:
-    """PortAudio callback fired every ~50 ms with a fresh chunk of float32
-    samples. Three responsibilities (in order, all under lock or
-    thread-safe primitives):
+    """PortAudio callback: append to buffer, enforce MAX_AUDIO_SEC cap,
+    and delegate encoder pipelining to _encoder.on_chunk()."""
 
-      1. Append to `_buffer` (v0.7.2 — full-audio fallback path).
-      2. Enforce MAX_AUDIO_SEC stuck-key cap (v0.7.2).
-      3. v0.8.0: dual-write the chunk to `_encoder_queue` for the
-         press-time encoder worker; lazy-spawn the worker on the first
-         chunk if the backend supports streaming AND we haven't burned
-         the failure budget; track silence runs for Option C fallback.
-
-    Spawning a Python thread from PortAudio's audio thread is safe (it's
-    not realtime-blocking).
-    """
-    global _recording, _recording_samples
-    global _encoder_thread, _encoder_handle, _encoder_active
-    global _encoder_silence_run_samples, _encoder_use_batch_fallback
-    global _encoder_failed, _encoder_consecutive_failures
     if status:
         logger.info("audio status: %s", status)
 
-    # Per-callback chunk stats. RMS uses float64 to avoid bf16/fp32 round
-    # cancellation on very-low-amplitude room tone.
     chunk = indata.copy()
     chunk_rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
     is_silent = chunk_rms < _ENCODER_SILENCE_THRESHOLD
 
     auto_stop = False
-    spawn_encoder = False
-    push_to_encoder = False
-    with _state_lock:
-        if not _recording:
+    do_encoder = False
+    with _st.lock:
+        if not _st.recording:
             return
-        _buffer.append(chunk)
-        _recording_samples += chunk.shape[0]
-        if _recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
-            _recording = False
+        _st.buffer.append(chunk)
+        _st.recording_samples += chunk.shape[0]
+        if _st.recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
+            _st.recording = False
             auto_stop = True
+        if _encoder is not None:
+            _encoder.track_silence(chunk, is_silent)
+            do_encoder = True
 
-        # Option C: silence-run tracking. Set fallback flag once we cross
-        # the threshold; once set, stays set for this recording (one
-        # detection is enough — chunked encoder will degrade gracefully).
-        if is_silent:
-            _encoder_silence_run_samples += chunk.shape[0]
-            if (_encoder_silence_run_samples >=
-                    SAMPLE_RATE * ENCODER_SILENCE_FALLBACK_SEC
-                    and not _encoder_use_batch_fallback):
-                _encoder_use_batch_fallback = True
-                # No need to actively stop the encoder worker — let it
-                # keep encoding; finalize will route to batch instead.
-        else:
-            _encoder_silence_run_samples = 0
-
-        # v0.8.0: encoder lazy-spawn decision. Only on the FIRST chunk of
-        # a recording, only if (a) pipelining enabled, (b) backend opts in,
-        # (c) we haven't burned the failure budget for this session,
-        # (d) silence-fallback hasn't already been triggered for this
-        # recording (e.g. user held key 3 s before speaking).
-        if (not _encoder_active
-                and ENCODER_PIPELINING
-                and _backend is not None
-                and _backend.supports_streaming()
-                and _encoder_consecutive_failures < ENCODER_FAILURE_BUDGET
-                and not _encoder_use_batch_fallback):
-            spawn_encoder = True
-        elif _encoder_active:
-            push_to_encoder = True
-
-    if spawn_encoder:
-        try:
-            _encoder_handle = _backend.start_encoder()
-            _encoder_stop_event.clear()
-            _encoder_thread = threading.Thread(
-                target=_encoder_worker, args=(_encoder_handle,), daemon=True,
-            )
-            _encoder_thread.start()
-            with _state_lock:
-                _encoder_active = True
-            # Push the first chunk to the queue too — worker is now ready.
-            push_to_encoder = True
-        except Exception as e:
-            logger.warning(f"encoder spawn failed: {type(e).__name__}: {e}; "
-                           f"will use batch path")
-            with _state_lock:
-                _encoder_failed = True
-                _encoder_consecutive_failures += 1
-
-    if push_to_encoder:
-        try:
-            _encoder_queue.put_nowait(chunk)
-        except queue.Full:
-            # Lag: worker can't keep up. _buffer still has the full audio,
-            # so finalize / batch fallback will still produce a transcript.
-            # Set the fallback flag so finalize doesn't trust accumulated
-            # partial encoder state.
-            with _state_lock:
-                _encoder_use_batch_fallback = True
+    if do_encoder:
+        _encoder.on_chunk(chunk, is_silent, _backend)
 
     if auto_stop:
         logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
@@ -554,138 +369,49 @@ _pasteboard: Pasteboard | None = None      # set in main()
 _polisher: TextPostProcessor | None = None  # set in main()
 
 
-def _abort_encoder_quiet() -> None:
-    """Helper: signal stop, briefly join the worker, abort the backend
-    handle. Idempotent and exception-safe — used by every early-return /
-    fallback path in _transcribe_and_emit to release GPU buffers cleanly.
-    Caller must hold the _processing semaphore or know the encoder is
-    not concurrently being read elsewhere."""
-    global _encoder_active
-    if not _encoder_active:
-        return
-    _encoder_stop_event.set()
-    if _encoder_thread is not None and _encoder_thread.is_alive():
-        _encoder_thread.join(timeout=2.0)
-    if _encoder_handle is not None and _backend is not None:
-        try:
-            _backend.abort(_encoder_handle)
-        except Exception as e:
-            logger.warning(f"encoder abort raised (ignored): "
-                           f"{type(e).__name__}: {e}")
-    with _state_lock:
-        _encoder_active = False
-
-
 def _transcribe_and_emit() -> None:
-    global _processing, _buffer, _recording_samples
-    global _encoder_active, _encoder_failed, _encoder_consecutive_failures
-    with _state_lock:
-        if _processing:
-            # v0.7.2: previously this was a silent early-return that left
-            # the captured audio in _buffer — where the NEXT successful
-            # transcribe would scoop it up and merge it with the next
-            # utterance ("I said A, then B during processing; my next
-            # transcript looks like B+C concatenated"). The user got no
-            # diagnostic. Now: explicitly drop, log, and clear.
-            dropped_chunks = len(_buffer)
-            dropped_sec = _recording_samples / SAMPLE_RATE
-            _buffer = []
-            _recording_samples = 0
+
+    with _st.lock:
+        if _st.processing:
+            dropped_chunks = len(_st.buffer)
+            dropped_sec = _st.recording_samples / SAMPLE_RATE
+            _st.buffer = []
+            _st.recording_samples = 0
             if dropped_chunks > 0:
                 logger.info(f"busy — dropped {dropped_sec:.2f}s of captured "
                             f"audio ({dropped_chunks} blocks; previous transcribe "
                             f"still running)")
             return
-        _processing = True
-        chunks = _buffer
-        _buffer = []
-        _recording_samples = 0
-        # v0.8.0: snapshot encoder state under the same lock acquisition
-        # for a coherent routing decision. After this point, the audio
-        # callback's writes to these flags only affect the NEXT recording.
-        snap_encoder_active = _encoder_active
-        snap_encoder_failed = _encoder_failed
-        snap_encoder_use_batch = _encoder_use_batch_fallback
+        _st.processing = True
+        chunks = _st.buffer
+        _st.buffer = []
+        _st.recording_samples = 0
+    text = None
+    language = None
     try:
         if not chunks:
-            _abort_encoder_quiet()
+            if _encoder is not None:
+                _encoder.abort(_backend)
             return
         samples = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
         raw_sec = len(samples) / SAMPLE_RATE
 
-        # Decide path: streaming if encoder spawned cleanly, didn't crash,
-        # and no silence-fallback was triggered for this recording.
-        use_streaming = (
-            snap_encoder_active
-            and not snap_encoder_failed
-            and not snap_encoder_use_batch
-        )
-
         raw: str = ""
         language: str = ""
         elapsed: float = 0.0
-        path_label = "batch"  # for the log line
+        path_label = "batch"
 
-        if use_streaming:
-            # Join the worker; if it doesn't exit within
-            # ENCODER_FINALIZE_TIMEOUT, abort and fall back.
-            t0 = time.time()
-            if _encoder_thread is not None:
-                _encoder_thread.join(timeout=ENCODER_FINALIZE_TIMEOUT)
-            join_elapsed = time.time() - t0
-            if _encoder_thread is not None and _encoder_thread.is_alive():
-                logger.warning(f"encoder join timed out after "
-                               f"{join_elapsed:.1f}s — falling back to batch path")
-                _abort_encoder_quiet()
-                with _state_lock:
-                    _encoder_failed = True
-                    _encoder_consecutive_failures += 1
-                use_streaming = False
-            else:
-                # Worker exited; re-read the failure flag in case it
-                # crashed mid-flight (worker sets _encoder_failed under
-                # lock; callback may also have set it for queue overflow).
-                with _state_lock:
-                    if _encoder_failed or _encoder_use_batch_fallback:
-                        # Worker reported a failure OR callback flagged a
-                        # late silence/lag event — abort and use batch.
-                        use_streaming = False
-
-        if use_streaming:
-            tail = _encoder_residual_samples
-            if tail is None:
-                tail = np.zeros(0, dtype=np.float32)
-            t0 = time.time()
-            try:
-                raw, language = _backend.finalize(_encoder_handle, tail)
-                elapsed = time.time() - t0
-                path_label = "stream"
-                with _state_lock:
-                    _encoder_consecutive_failures = 0  # success → reset
-                    _encoder_active = False
-            except Exception as e:
-                logger.warning(f"encoder finalize raised "
-                               f"{type(e).__name__}: {e}; falling back to batch")
-                try:
-                    _backend.abort(_encoder_handle)
-                except Exception:
-                    pass
-                with _state_lock:
-                    _encoder_failed = True
-                    _encoder_consecutive_failures += 1
-                    _encoder_active = False
-                use_streaming = False
-
-        if not use_streaming:
-            # Batch fallback — v0.7.2 path. First make sure any encoder
-            # worker that might still be alive is released cleanly so we
-            # don't leak GPU buffers.
-            _abort_encoder_quiet()
-            # v0.7.2: RMS silence trim before ASR. Qwen3-ASR is LLM-backbone
-            # and hallucinates on long silence (model card known issue).
+        # Try streaming path (encoder pipelining) if available
+        stream_result = None
+        if _encoder is not None:
+            stream_result = _encoder.try_streaming(_backend)
+        if stream_result is not None:
+            raw, language, elapsed, path_label = stream_result
+        else:
+            if _encoder is not None:
+                _encoder.abort(_backend)
             trimmed = _trim_silence(samples, SAMPLE_RATE)
             if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
-                # Could be (a) too-short tap or (b) all-silence after trim.
                 trim_sec = len(trimmed) / SAMPLE_RATE
                 if trim_sec < raw_sec * 0.5 and raw_sec >= MIN_AUDIO_SEC:
                     logger.info(f"silent — trimmed {raw_sec:.2f}s → "
@@ -696,7 +422,6 @@ def _transcribe_and_emit() -> None:
             t0 = time.time()
             raw, language = _backend.transcribe(trimmed)
             elapsed = time.time() - t0
-            # path_label already "batch"
 
         if not raw:
             logger.info(f"empty ({language}, {elapsed:.2f}s, {path_label})")
@@ -784,8 +509,10 @@ def _transcribe_and_emit() -> None:
     except Exception as e:
         logger.error(f"{e}")
     finally:
-        with _state_lock:
-            _processing = False
+        with _st.lock:
+            _st.processing = False
+        _write_state(IDLE, last_text=text if text else None,
+                     last_lang=language if language else None)
 
 
 # ---------------------------------------------------------------------------
@@ -846,24 +573,26 @@ def _transcribe_and_emit_edit(selection: str,
     instructions — pipelining win is negligible). Skips POLISH_LANGUAGES
     gating (the LLM is given an EXPLICIT language-handling rule via
     EDIT_PROMPT, so all language combinations route here)."""
-    global _processing, _buffer, _recording_samples
-    with _state_lock:
-        if _processing:
-            dropped_chunks = len(_buffer)
-            dropped_sec = _recording_samples / SAMPLE_RATE
-            _buffer = []
-            _recording_samples = 0
+
+    busy_drop = False
+    with _st.lock:
+        if _st.processing:
+            dropped_chunks = len(_st.buffer)
+            dropped_sec = _st.recording_samples / SAMPLE_RATE
+            _st.buffer = []
+            _st.recording_samples = 0
             if dropped_chunks > 0:
                 logger.info(f"busy — dropped {dropped_sec:.2f}s of voice-edit "
                             f"audio ({dropped_chunks} blocks)")
-            # Still need to restore the original clipboard even on busy-
-            # drop, because _on_press already overwrote it via simulate_copy.
-            _try_restore_clipboard(original_clipboard, context="busy-drop")
-            return
-        _processing = True
-        chunks = _buffer
-        _buffer = []
-        _recording_samples = 0
+            busy_drop = True
+        else:
+            _st.processing = True
+            chunks = _st.buffer
+            _st.buffer = []
+            _st.recording_samples = 0
+    if busy_drop:
+        _try_restore_clipboard(original_clipboard, context="busy-drop")
+        return
     try:
         if not chunks:
             logger.info("voice-edit: empty audio (no instruction)")
@@ -925,8 +654,9 @@ def _transcribe_and_emit_edit(selection: str,
         # beyond the paste of the edit result (which is then immediately
         # replaced — so user keeps their pre-edit clipboard intact).
         _try_restore_clipboard(original_clipboard, context="post-edit")
-        with _state_lock:
-            _processing = False
+        with _st.lock:
+            _st.processing = False
+        _write_state(IDLE, edit_mode=True)
 
 
 def _try_restore_clipboard(original: str | None, *, context: str) -> None:
@@ -947,11 +677,6 @@ def _try_restore_clipboard(original: str | None, *, context: str) -> None:
 # Keyboard hooks
 # ---------------------------------------------------------------------------
 def _on_press(key) -> None:
-    global _recording, _active_trigger, _recording_samples
-    global _encoder_thread, _encoder_handle, _encoder_active, _encoder_failed
-    global _encoder_use_batch_fallback, _encoder_silence_run_samples
-    global _encoder_residual_samples
-    global _edit_mode, _edit_selection, _edit_original_clipboard
 
     # v0.7.5: route both trigger key sets. EDIT_TRIGGER_KEYS may be None
     # (= disabled) or a set; same for TRIGGER_KEYS. The two sets are
@@ -971,8 +696,8 @@ def _on_press(key) -> None:
     # injected into the focused app. Dictate path already had this early
     # return below (inside the lock); we needed to hoist it above the
     # selection-capture step.
-    with _state_lock:
-        if _active_trigger is not None:
+    with _st.lock:
+        if _st.active_trigger is not None:
             return  # OS key-repeat — first press already started recording
 
     # For edit, capture selection BEFORE acquiring state lock (again).
@@ -1000,63 +725,45 @@ def _on_press(key) -> None:
             _try_restore_clipboard(captured[1], context="noop-polisher")
             return
 
-    with _state_lock:
-        if _active_trigger is not None:
+    with _st.lock:
+        if _st.active_trigger is not None:
             # Race: another trigger pressed during the ~100 ms selection
             # capture window. For edit, restore the captured clipboard
             # we modified via simulate_copy.
             if captured is not None:
                 _try_restore_clipboard(captured[1], context="active-trigger")
             return
-        _active_trigger = key
-        _recording = True
-        _buffer.clear()
+        _st.active_trigger = key
+        _st.recording = True
+        _st.buffer.clear()
         # v0.7.2: reset sample counter for MAX_AUDIO_SEC tracking. Without
         # this, a previous transcribe that left a stale count + a new press
         # could falsely trip the cap and auto-stop the new recording early.
-        _recording_samples = 0
-        # v0.7.5: edit state — cleared every press, populated only if this
-        # press is an edit trigger. Snapshot read in _on_release.
-        _edit_mode = False
-        _edit_selection = None
-        _edit_original_clipboard = None
+        _st.recording_samples = 0
+        _st.edit_mode = False
+        _st.edit_selection = None
+        _st.edit_original_clipboard = None
         if captured is not None:
-            _edit_mode = True
-            _edit_selection, _edit_original_clipboard = captured
-        # v0.8.0: reset all per-recording encoder state. _encoder_consecutive_failures
-        # is INTENTIONALLY NOT reset — it persists across utterances so 3
-        # back-to-back failures suppress streaming for the 4th. A successful
-        # finalize in _transcribe_and_emit resets it to 0.
-        _encoder_active = False
-        _encoder_failed = False
-        _encoder_use_batch_fallback = False
-        _encoder_silence_run_samples = 0
-        _encoder_residual_samples = None
-        _encoder_handle = None
-        _encoder_thread = None
-        _encoder_stop_event.clear()
-        # Drain any leftover items from a prior (crashed?) recording's queue.
-        while True:
-            try:
-                _encoder_queue.get_nowait()
-            except queue.Empty:
-                break
+            _st.edit_mode = True
+            _st.edit_selection, _st.edit_original_clipboard = captured
+        if _encoder is not None:
+            _encoder.reset()
+    _write_state(RECORDING, edit_mode=bool(captured))
     edit_tag = " [edit]" if is_edit else ""
     logger.info(f"REC ({key}){edit_tag}")
     _play_beep(BEEP_START_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
 
 
 def _on_release(key) -> None:
-    global _recording, _active_trigger
     # v0.7.5: accept release of either trigger key set.
     is_edit_key = bool(EDIT_TRIGGER_KEYS) and key in EDIT_TRIGGER_KEYS
     is_dictate_key = bool(TRIGGER_KEYS) and key in TRIGGER_KEYS
     if not (is_edit_key or is_dictate_key):
         return
-    with _state_lock:
-        if _active_trigger != key:
+    with _st.lock:
+        if _st.active_trigger != key:
             return  # releasing a non-active trigger (e.g. tap of the other one)
-        _active_trigger = None
+        _st.active_trigger = None
         # v0.7.2: do NOT flip _recording=False here yet. PortAudio fires
         # the callback every 50 ms; if we stop capture immediately, the
         # in-flight 0-50 ms audio block that arrives between user release
@@ -1078,28 +785,29 @@ def _on_release(key) -> None:
     edit_mode_snap = False
     edit_selection_snap: str | None = None
     edit_original_snap: str | None = None
-    with _state_lock:
+    with _st.lock:
         # If user pressed a trigger again during the drain, _active_trigger
         # is non-None. Leave _recording=True (the new press wants to
         # continue capturing) and SKIP this release's transcribe spawn —
         # the new press will spawn its own when it eventually releases.
-        if _active_trigger is not None:
+        if _st.active_trigger is not None:
             abort = True
         else:
-            _recording = False
-            edit_mode_snap = _edit_mode
-            edit_selection_snap = _edit_selection
-            edit_original_snap = _edit_original_clipboard
+            _st.recording = False
+            edit_mode_snap = _st.edit_mode
+            edit_selection_snap = _st.edit_selection
+            edit_original_snap = _st.edit_original_clipboard
     if abort:
         logger.info("release aborted by new press during drain")
         return
+    _write_state(PROCESSING, edit_mode=edit_mode_snap)
     # v0.8.0: signal the encoder worker (if any) to drain remaining queue
     # and exit. _transcribe_and_emit will join the worker before calling
     # finalize. Setting the event BEFORE the spawn ensures the worker
     # sees it on its next iteration even if _transcribe_and_emit is still
     # being scheduled.
-    if _encoder_active:
-        _encoder_stop_event.set()
+    if _encoder is not None:
+        _encoder.signal_stop()
     if edit_mode_snap:
         logger.info("voice-edit processing...")
         threading.Thread(
@@ -1141,8 +849,29 @@ def _setup_logging() -> None:
     root.addHandler(stderr_handler)
 
 
+def _resolve_mic_device(spec: str | int | None) -> int | None:
+    """Resolve a mic device spec to a sounddevice device index.
+
+    None → system default (returns None).
+    int  → passed through as device index.
+    str  → substring match against input device names.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, int):
+        return spec
+    name = str(spec).lower()
+    devices = sd.query_devices()
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0 and name in dev["name"].lower():
+            logger.info(f"mic: matched '{dev['name']}' (index {idx})")
+            return idx
+    logger.warning(f"mic: no input device matching '{spec}', using system default")
+    return None
+
+
 def main() -> None:
-    global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
+    global _backend, _pasteboard, _encoder, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
 
     _setup_logging()
 
@@ -1171,6 +900,7 @@ def main() -> None:
     logger.info(f"polish: {_polisher.device_label}")
 
     _backend = build_backend_with_fallback(STT_BACKEND, STT_MODEL, SAMPLE_RATE)
+    _encoder = EncoderPipeline(SAMPLE_RATE)
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
@@ -1199,7 +929,9 @@ def main() -> None:
         logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
                     f"to record.")
 
+    _mic_id = _resolve_mic_device(MIC_DEVICE)
     stream = sd.InputStream(
+        device=_mic_id,
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",
@@ -1207,6 +939,7 @@ def main() -> None:
         blocksize=int(SAMPLE_RATE * 0.05),  # 50 ms chunks
     )
     stream.start()
+    _write_state(IDLE)
     listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
     listener.start()
     try:
@@ -1216,6 +949,7 @@ def main() -> None:
     finally:
         stream.stop()
         stream.close()
+        _cleanup_state()
 
 
 if __name__ == "__main__":

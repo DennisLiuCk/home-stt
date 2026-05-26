@@ -10,7 +10,7 @@ called from any directory. Standalone fallback:
     python3 scripts/home_stt.py start
     python3 scripts/home_stt.py status
 
-Subcommands: start, stop, restart, status, log, config, version.
+Subcommands: start, stop, restart, status, log, config, tray, devices, version.
 """
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ def _read_lines(path: Path) -> list[str]:
 
 # ---- subcommand handlers ----------------------------------------------------
 
-def cmd_start(_args) -> int:
+def cmd_start(args) -> int:
     if sys.platform == "win32":
         script = SCRIPTS_DIR / "stt-start.ps1"
         cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
@@ -199,7 +199,25 @@ def cmd_start(_args) -> int:
     if not script.exists():
         print(f"home-stt: missing start script {script}", file=sys.stderr)
         return 1
-    return subprocess.call(cmd)
+    rc = subprocess.call(cmd)
+    if rc == 0 and getattr(args, "tray", False):
+        _launch_tray_background()
+    return rc
+
+
+def _launch_tray_background() -> None:
+    """Spawn the tray icon as a detached background process."""
+    tray_script = SCRIPTS_DIR / "stt_tray.py"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(tray_script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        print("Tray icon launched.")
+    except Exception as e:
+        print(f"home-stt: tray launch failed: {e}", file=sys.stderr)
 
 
 def cmd_stop(_args) -> int:
@@ -328,8 +346,97 @@ def _follow_log(path: Path) -> int:
         return 1
 
 
+def _capture_key(prompt_msg: str, *, timeout: float = 15.0):
+    """Listen for a single key press and return it (pynput Key or char).
+
+    Returns None if the user presses Escape or the timeout expires.
+    """
+    from pynput.keyboard import Key, Listener
+    import threading
+
+    result = None
+    done = threading.Event()
+
+    def on_press(key):
+        nonlocal result
+        if key == Key.esc:
+            done.set()
+            return False
+        result = key
+        done.set()
+        return False
+
+    print(prompt_msg, flush=True)
+    listener = Listener(on_press=on_press)
+    listener.start()
+    done.wait(timeout=timeout)
+    listener.stop()
+
+    if result is None:
+        return None
+
+    # Normalise: KeyCode with no char → use vk lookup, plain char → return it
+    if hasattr(result, "char") and result.char:
+        return result.char
+    return result
+
+
+def _key_display(key) -> str:
+    from pynput.keyboard import Key
+    if isinstance(key, Key):
+        return key.name
+    return repr(key)
+
+
+def cmd_set_trigger(_args) -> int:
+    """Interactive trigger-key detection and config update."""
+    from stt_config import _key_to_str, update_trigger_keys
+
+    print("home-stt trigger key setup")
+    print("=" * 40)
+    print()
+
+    # Dictate trigger
+    print("Step 1: Dictate trigger (hold-to-record key)")
+    print("  Default: Right Alt + Right Ctrl (Win), Right Option (Mac)")
+    key = _capture_key("  >> Press the key you want to use (Esc to keep default)...")
+    trigger = None
+    if key is not None:
+        name = _key_to_str(key)
+        trigger = [name]
+        print(f"  Captured: {_key_display(key)}  →  trigger_keys = [\"{name}\"]")
+    else:
+        print("  Skipped — keeping platform default.")
+    print()
+
+    # Edit trigger
+    print("Step 2: Voice-edit trigger (hold to edit selection)")
+    print("  Default: F13 (Win), Right Cmd (Mac)")
+    key = _capture_key("  >> Press the key you want to use (Esc to skip)...")
+    edit_trigger = None
+    if key is not None:
+        name = _key_to_str(key)
+        edit_trigger = [name]
+        print(f"  Captured: {_key_display(key)}  →  edit_trigger_keys = [\"{name}\"]")
+    else:
+        print("  Skipped — keeping platform default.")
+    print()
+
+    if trigger is None and edit_trigger is None:
+        print("No changes made.")
+        return 0
+
+    path = update_trigger_keys(trigger=trigger, edit_trigger=edit_trigger)
+    print(f"Config updated: {path}")
+    print("Run `home-stt restart` to apply.")
+    return 0
+
+
 def cmd_config(args) -> int:
     from stt_config import config_path, init_config, load_config, generate_default_config
+
+    if args.set_trigger:
+        return cmd_set_trigger(args)
 
     if args.init:
         path = config_path()
@@ -517,6 +624,47 @@ def cmd_doctor(_args) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_tray(_args) -> int:
+    """Launch the system tray icon."""
+    import stt_tray
+    stt_tray.main()
+    return 0
+
+
+def cmd_devices(_args) -> int:
+    """List available audio input devices."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        print("home-stt: sounddevice not installed", file=sys.stderr)
+        return 1
+
+    devices = sd.query_devices()
+    default_input = sd.default.device[0]
+    print("Available input devices:\n")
+    found = False
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] <= 0:
+            continue
+        found = True
+        marker = " *" if idx == default_input else "  "
+        sr = int(dev["default_samplerate"])
+        ch = dev["max_input_channels"]
+        print(f"{marker} [{idx}] {dev['name']}  ({sr} Hz, {ch}ch)")
+    if not found:
+        print("  (no input devices found)")
+    print()
+    print("  * = system default")
+    print()
+    print("To use a specific device, add to config.toml:")
+    from stt_config import config_path
+    print(f"  ({config_path()})")
+    print()
+    print('  mic_device = "Device Name"   # substring match')
+    print("  mic_device = 1               # or device index")
+    return 0
+
+
 def cmd_version(_args) -> int:
     print(f"home-stt v{_daemon_version()}")
     return 0
@@ -533,9 +681,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Print daemon version and exit.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sub.add_parser("start",   help="Start the daemon, or report it is already running.")
+    p_start = sub.add_parser("start",   help="Start the daemon, or report it is already running.")
+    p_start.add_argument("--tray", action="store_true",
+                         help="Also launch the system tray icon.")
     sub.add_parser("stop",    help="Stop the daemon.")
-    sub.add_parser("restart", help="Stop, settle, then start. Use after config edits.")
+    p_restart = sub.add_parser("restart", help="Stop, settle, then start. Use after config edits.")
+    p_restart.add_argument("--tray", action="store_true",
+                           help="Also launch the system tray icon after restart.")
     sub.add_parser("status",  help="Print PID / uptime / RSS / backend / polish / paste / recent transcribes.")
 
     p_log = sub.add_parser("log", help="Show the daemon log.")
@@ -554,8 +706,12 @@ def main(argv: list[str] | None = None) -> int:
                        help="Open config.toml in $VISUAL / $EDITOR / notepad.")
     p_cfg.add_argument("--path", action="store_true",
                        help="Print the config file path and exit.")
+    p_cfg.add_argument("--set-trigger", action="store_true",
+                       help="Interactive key detection — press a key to set triggers.")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
+    sub.add_parser("tray", help="Launch system tray icon (Windows: pystray, macOS: rumps).")
+    sub.add_parser("devices", help="List available audio input (microphone) devices.")
 
     sub.add_parser("version", help="Print home-stt version (same as --version).")
 
@@ -574,6 +730,8 @@ def main(argv: list[str] | None = None) -> int:
         "log":     cmd_log,
         "config":  cmd_config,
         "doctor":  cmd_doctor,
+        "tray":    cmd_tray,
+        "devices": cmd_devices,
         "version": cmd_version,
     }
     return handlers[args.command](args)

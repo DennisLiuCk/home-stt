@@ -27,6 +27,8 @@ import numpy as np
 import pytest
 from pynput.keyboard import Key
 
+import stt_streaming
+
 
 # ---------------------------------------------------------------------------
 # Config / regression markers
@@ -70,13 +72,13 @@ def test_encoder_pipelining_config_defaults(fresh_daemon):
 
     Tunables stay at their plan-spec values so re-enable is trivial."""
     assert fresh_daemon.ENCODER_PIPELINING is False
-    assert fresh_daemon.ENCODER_CHUNK_SEC == 5.0
-    assert fresh_daemon.ENCODER_QUEUE_MAX == 200
-    assert fresh_daemon.ENCODER_FINALIZE_TIMEOUT == 8.0
-    assert fresh_daemon.ENCODER_FAILURE_BUDGET == 3
+    assert stt_streaming.ENCODER_CHUNK_SEC == 5.0
+    assert stt_streaming.ENCODER_QUEUE_MAX == 200
+    assert stt_streaming.ENCODER_FINALIZE_TIMEOUT == 8.0
+    assert stt_streaming.ENCODER_FAILURE_BUDGET == 3
     # Option C silence-detect fallback threshold (still relevant when
     # streaming is re-enabled).
-    assert fresh_daemon.ENCODER_SILENCE_FALLBACK_SEC == 2.0
+    assert stt_streaming.ENCODER_SILENCE_FALLBACK_SEC == 2.0
 
 
 def test_sttbackend_default_supports_streaming_false(fresh_daemon):
@@ -176,20 +178,20 @@ def test_trim_silence_short_clip_no_op(fresh_daemon):
 def test_on_press_starts_recording(fresh_daemon):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     # Pre-poison _recording_samples to confirm the press resets it
-    fresh_daemon._recording_samples = 999
-    fresh_daemon._buffer = [np.zeros(100, dtype=np.float32)]
+    fresh_daemon._st.recording_samples = 999
+    fresh_daemon._st.buffer = [np.zeros(100, dtype=np.float32)]
     fresh_daemon._on_press(Key.alt_r)
-    assert fresh_daemon._recording is True
-    assert fresh_daemon._active_trigger == Key.alt_r
-    assert fresh_daemon._recording_samples == 0
-    assert fresh_daemon._buffer == []
+    assert fresh_daemon._st.recording is True
+    assert fresh_daemon._st.active_trigger == Key.alt_r
+    assert fresh_daemon._st.recording_samples == 0
+    assert fresh_daemon._st.buffer == []
 
 
 def test_on_press_ignores_non_trigger(fresh_daemon):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     fresh_daemon._on_press(Key.shift)
-    assert fresh_daemon._recording is False
-    assert fresh_daemon._active_trigger is None
+    assert fresh_daemon._st.recording is False
+    assert fresh_daemon._st.active_trigger is None
 
 
 def test_on_press_ignores_when_already_holding(fresh_daemon):
@@ -197,8 +199,8 @@ def test_on_press_ignores_when_already_holding(fresh_daemon):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r, Key.ctrl_r}
     fresh_daemon._on_press(Key.alt_r)
     fresh_daemon._on_press(Key.ctrl_r)
-    assert fresh_daemon._active_trigger == Key.alt_r
-    assert fresh_daemon._recording is True
+    assert fresh_daemon._st.active_trigger == Key.alt_r
+    assert fresh_daemon._st.recording is True
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +237,7 @@ def _install_inert_mocks(daemon_mod, streaming: bool = False,
     # Enable the streaming framework irrespective of the module's shipped
     # default — tests that DON'T want it can override after this call.
     daemon_mod.ENCODER_PIPELINING = True
+    stt_streaming.ENCODER_PIPELINING = True
 
 
 def test_on_release_has_drain_delay(fresh_daemon):
@@ -254,7 +257,7 @@ def test_on_release_has_drain_delay(fresh_daemon):
     # this test guards. Whether the actual drain is 50 or 80 ms is a
     # tuning decision; either is correct as long as ≥50.
     assert elapsed >= 0.05, f"expected ≥50ms drain, got {elapsed*1000:.0f}ms"
-    assert fresh_daemon._recording is False
+    assert fresh_daemon._st.recording is False
 
 
 def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
@@ -271,12 +274,12 @@ def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
             target=fresh_daemon._on_release, args=(Key.alt_r,),
         )
         release_thread.start()
-        time.sleep(0.02)  # 20ms into the 60ms drain
+        time.sleep(0.04)  # 40ms into the 80ms drain — enough for thread to start
         fresh_daemon._on_press(Key.alt_r)  # new press while still draining
-        release_thread.join(timeout=1.0)
+        release_thread.join(timeout=2.0)
 
-    assert fresh_daemon._recording is True, "new press should keep capturing"
-    assert fresh_daemon._active_trigger == Key.alt_r
+    assert fresh_daemon._st.recording is True, "new press should keep capturing"
+    assert fresh_daemon._st.active_trigger == Key.alt_r
     assert "aborted" in caplog.text.lower()
 
 
@@ -291,8 +294,8 @@ def test_on_release_ignores_non_active_key(fresh_daemon):
     fresh_daemon._on_release(Key.ctrl_r)
     elapsed = time.monotonic() - start
     assert elapsed < 0.01, "non-active release should return immediately"
-    assert fresh_daemon._recording is True  # still capturing alt_r
-    assert fresh_daemon._active_trigger == Key.alt_r
+    assert fresh_daemon._st.recording is True  # still capturing alt_r
+    assert fresh_daemon._st.active_trigger == Key.alt_r
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +307,15 @@ def test_audio_callback_appends_only_when_recording(fresh_daemon):
     chunk = np.zeros((100, 1), dtype=np.float32)
 
     # Not recording → no append
-    fresh_daemon._recording = False
+    fresh_daemon._st.recording = False
     fresh_daemon._audio_callback(chunk, 100, None, None)
-    assert fresh_daemon._buffer == []
+    assert fresh_daemon._st.buffer == []
 
     # Recording → append
-    fresh_daemon._recording = True
+    fresh_daemon._st.recording = True
     fresh_daemon._audio_callback(chunk, 100, None, None)
-    assert len(fresh_daemon._buffer) == 1
-    assert fresh_daemon._recording_samples == 100
+    assert len(fresh_daemon._st.buffer) == 1
+    assert fresh_daemon._st.recording_samples == 100
 
 
 def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, caplog):
@@ -322,14 +325,14 @@ def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, caplog):
     fresh_daemon._on_press(Key.alt_r)
     # Set _processing=True so the spawned transcribe thread early-returns
     # (we don't care about the transcribe; just the auto-stop behaviour).
-    fresh_daemon._processing = True
+    fresh_daemon._st.processing = True
     sr = fresh_daemon.SAMPLE_RATE
     # One big chunk = full MAX_AUDIO_SEC worth of samples. Real PortAudio
     # callbacks are 50ms but the threshold check is purely sample-count.
     big = np.zeros((sr * fresh_daemon.MAX_AUDIO_SEC, 1), dtype=np.float32)
     with caplog.at_level(logging.DEBUG, logger="stt"):
         fresh_daemon._audio_callback(big, big.shape[0], None, None)
-    assert fresh_daemon._recording is False
+    assert fresh_daemon._st.recording is False
     assert "auto-stop" in caplog.text.lower()
 
 
@@ -341,20 +344,20 @@ def test_transcribe_busy_clears_buffer_and_logs(fresh_daemon, caplog):
     """C2: pre-v0.7.2 the busy early-return silently left captured audio
     in _buffer where the NEXT transcribe call would merge it with the
     next utterance. Now: explicitly drop, log, and clear."""
-    fresh_daemon._processing = True  # simulate previous transcribe in flight
+    fresh_daemon._st.processing = True  # simulate previous transcribe in flight
     sr = fresh_daemon.SAMPLE_RATE
     # Pre-load buffer with 100 × 50ms chunks = 5s
     chunk_size = int(sr * 0.05)
-    fresh_daemon._buffer = [
+    fresh_daemon._st.buffer = [
         np.zeros((chunk_size, 1), dtype=np.float32) for _ in range(100)
     ]
-    fresh_daemon._recording_samples = chunk_size * 100
+    fresh_daemon._st.recording_samples = chunk_size * 100
 
     with caplog.at_level(logging.DEBUG, logger="stt"):
         fresh_daemon._transcribe_and_emit()
 
-    assert fresh_daemon._buffer == [], "busy path must clear buffer"
-    assert fresh_daemon._recording_samples == 0
+    assert fresh_daemon._st.buffer == [], "busy path must clear buffer"
+    assert fresh_daemon._st.recording_samples == 0
     combined = caplog.text.lower()
     assert "busy" in combined
     assert "drop" in combined  # "dropped 5.00s..."
@@ -363,9 +366,9 @@ def test_transcribe_busy_clears_buffer_and_logs(fresh_daemon, caplog):
 def test_transcribe_busy_with_empty_buffer_is_silent(fresh_daemon, caplog):
     """The busy log should only fire if there was actually audio to drop —
     a no-op busy bail (e.g. release with empty buffer) shouldn't spam."""
-    fresh_daemon._processing = True
-    fresh_daemon._buffer = []
-    fresh_daemon._recording_samples = 0
+    fresh_daemon._st.processing = True
+    fresh_daemon._st.buffer = []
+    fresh_daemon._st.recording_samples = 0
 
     with caplog.at_level(logging.DEBUG, logger="stt"):
         fresh_daemon._transcribe_and_emit()
@@ -403,13 +406,13 @@ def test_encoder_lazy_spawn_on_first_chunk(fresh_daemon):
     _install_inert_mocks(fresh_daemon, streaming=True)
     fresh_daemon._on_press(Key.alt_r)
     # Right after press, no encoder spawned yet
-    assert fresh_daemon._encoder_thread is None
-    assert fresh_daemon._encoder_active is False
+    assert fresh_daemon._encoder._thread is None
+    assert fresh_daemon._encoder.active is False
 
     # First callback should trigger lazy spawn
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
-    assert fresh_daemon._encoder_active is True
-    assert fresh_daemon._encoder_thread is not None
+    assert fresh_daemon._encoder.active is True
+    assert fresh_daemon._encoder._thread is not None
     assert fresh_daemon._backend.start_encoder.call_count == 1
 
     # Second callback should NOT re-spawn
@@ -425,8 +428,8 @@ def test_encoder_no_spawn_when_supports_streaming_false(fresh_daemon):
     _install_inert_mocks(fresh_daemon, streaming=False)
     fresh_daemon._on_press(Key.alt_r)
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
-    assert fresh_daemon._encoder_active is False
-    assert fresh_daemon._encoder_thread is None
+    assert fresh_daemon._encoder.active is False
+    assert fresh_daemon._encoder._thread is None
     assert fresh_daemon._backend.start_encoder.call_count == 0
 
 
@@ -442,19 +445,19 @@ def test_encoder_dual_write_to_buffer_and_queue(fresh_daemon):
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
     # buffer: at least 2 chunks
-    assert len(fresh_daemon._buffer) == 2
+    assert len(fresh_daemon._st.buffer) == 2
     # queue: at least 2 chunks (worker may have already pulled some;
     # this is racy. assert queue+worker_pulled >= 2 indirectly via
     # backend.push_chunk total calls. Since chunks are < ENCODER_CHUNK_SEC,
     # worker shouldn't have pushed yet — both should still be in queue.
     # But threads race. Just verify the queue API received them: count by
     # popping until empty.)
-    fresh_daemon._encoder_stop_event.set()
-    fresh_daemon._encoder_thread.join(timeout=2.0)
+    fresh_daemon._encoder._stop_event.set()
+    fresh_daemon._encoder._thread.join(timeout=2.0)
     # After worker exits, the residual catches anything left in queue
     # plus accumulator. Residual should be ≈ 1600 samples (2 × 800).
-    assert fresh_daemon._encoder_residual_samples is not None
-    assert fresh_daemon._encoder_residual_samples.shape[0] == 1600
+    assert fresh_daemon._encoder.residual_samples is not None
+    assert fresh_daemon._encoder.residual_samples.shape[0] == 1600
 
 
 def test_release_signals_stop_event_before_transcribe_spawn(fresh_daemon):
@@ -466,11 +469,11 @@ def test_release_signals_stop_event_before_transcribe_spawn(fresh_daemon):
     _install_inert_mocks(fresh_daemon, streaming=True)
     fresh_daemon._on_press(Key.alt_r)
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
-    assert fresh_daemon._encoder_active is True
-    assert not fresh_daemon._encoder_stop_event.is_set()
+    assert fresh_daemon._encoder.active is True
+    assert not fresh_daemon._encoder._stop_event.is_set()
     fresh_daemon._on_release(Key.alt_r)
     # After release returns, stop_event MUST be set
-    assert fresh_daemon._encoder_stop_event.is_set()
+    assert fresh_daemon._encoder._stop_event.is_set()
 
 
 def test_encoder_crash_sets_failure_flag(fresh_daemon, caplog):
@@ -485,10 +488,10 @@ def test_encoder_crash_sets_failure_flag(fresh_daemon, caplog):
         sr = fresh_daemon.SAMPLE_RATE
         big = _voiced_chunk(int(sr * 5.1))
         fresh_daemon._audio_callback(big, big.shape[0], None, None)
-        fresh_daemon._encoder_stop_event.set()
-        fresh_daemon._encoder_thread.join(timeout=2.0)
-    assert fresh_daemon._encoder_failed is True
-    assert fresh_daemon._encoder_consecutive_failures >= 1
+        fresh_daemon._encoder._stop_event.set()
+        fresh_daemon._encoder._thread.join(timeout=2.0)
+    assert fresh_daemon._encoder.failed is True
+    assert fresh_daemon._encoder.consecutive_failures >= 1
     assert "encoder worker crashed" in caplog.text.lower()
 
 
@@ -497,7 +500,7 @@ def test_finalize_timeout_falls_back_to_batch(fresh_daemon, caplog, monkeypatch)
     when _transcribe_and_emit tries to join it, the join must time out
     within ENCODER_FINALIZE_TIMEOUT seconds and the batch path takes
     over. We shorten the timeout for test speed."""
-    monkeypatch.setattr(fresh_daemon, "ENCODER_FINALIZE_TIMEOUT", 0.2)
+    monkeypatch.setattr(stt_streaming, "ENCODER_FINALIZE_TIMEOUT", 0.2)
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_inert_mocks(fresh_daemon, streaming=True)
 
@@ -524,8 +527,8 @@ def test_finalize_timeout_falls_back_to_batch(fresh_daemon, caplog, monkeypatch)
         # Always release the hung worker so it can exit cleanly and not
         # leak into subsequent tests' leaked-worker check.
         release_hang.set()
-        if fresh_daemon._encoder_thread is not None:
-            fresh_daemon._encoder_thread.join(timeout=2.0)
+        if fresh_daemon._encoder._thread is not None:
+            fresh_daemon._encoder._thread.join(timeout=2.0)
 
 
 def test_consecutive_failure_suppresses_spawn(fresh_daemon):
@@ -535,10 +538,10 @@ def test_consecutive_failure_suppresses_spawn(fresh_daemon):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_inert_mocks(fresh_daemon, streaming=True)
     # Pre-poison counter to the budget
-    fresh_daemon._encoder_consecutive_failures = fresh_daemon.ENCODER_FAILURE_BUDGET
+    fresh_daemon._encoder.consecutive_failures = stt_streaming.ENCODER_FAILURE_BUDGET
     fresh_daemon._on_press(Key.alt_r)
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
-    assert fresh_daemon._encoder_active is False
+    assert fresh_daemon._encoder.active is False
     assert fresh_daemon._backend.start_encoder.call_count == 0
 
 
@@ -557,10 +560,10 @@ def test_short_tap_encoder_finalize_with_tail(fresh_daemon):
     # Skip the 80 ms drain by setting stop_event directly + manually
     # invoking _transcribe_and_emit. (Calling _on_release would also work
     # but pads test runtime with the drain sleep.)
-    fresh_daemon._encoder_stop_event.set()
-    fresh_daemon._encoder_thread.join(timeout=2.0)
-    with fresh_daemon._state_lock:
-        fresh_daemon._recording = False
+    fresh_daemon._encoder._stop_event.set()
+    fresh_daemon._encoder._thread.join(timeout=2.0)
+    with fresh_daemon._st.lock:
+        fresh_daemon._st.recording = False
     fresh_daemon._transcribe_and_emit()
     # push_chunk should NOT have been called (200 ms < 5 s chunk size).
     # finalize SHOULD have been called with the 200 ms tail (~3200 samples).
@@ -581,18 +584,18 @@ def test_processing_flag_independent_of_encoder_active(fresh_daemon):
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_inert_mocks(fresh_daemon, streaming=True)
     # Simulate state: encoder active from a previous utterance
-    fresh_daemon._encoder_active = True
-    fresh_daemon._encoder_thread = MagicMock()  # pretend worker alive
+    fresh_daemon._encoder.active = True
+    fresh_daemon._encoder._thread = MagicMock()  # pretend worker alive
     # New press should still succeed (sets _active_trigger, _recording=True)
     fresh_daemon._on_press(Key.alt_r)
-    assert fresh_daemon._recording is True
-    assert fresh_daemon._active_trigger == Key.alt_r
+    assert fresh_daemon._st.recording is True
+    assert fresh_daemon._st.active_trigger == Key.alt_r
     # _on_press DOES reset _encoder_active to False (new recording starts
     # its own encoder). The old worker thread reference is overwritten
     # too — but we'd never get into this race in real usage because
     # _processing gates the previous recording's decoder.
-    assert fresh_daemon._encoder_active is False
-    assert fresh_daemon._encoder_thread is None
+    assert fresh_daemon._encoder.active is False
+    assert fresh_daemon._encoder._thread is None
 
 
 def test_silence_detection_triggers_batch_fallback(fresh_daemon):
@@ -607,13 +610,13 @@ def test_silence_detection_triggers_batch_fallback(fresh_daemon):
     sr = fresh_daemon.SAMPLE_RATE
     # Feed silence until the threshold is crossed. Use one big silent
     # chunk = ENCODER_SILENCE_FALLBACK_SEC + safety margin.
-    silent = _silent_chunk(int(sr * (fresh_daemon.ENCODER_SILENCE_FALLBACK_SEC + 0.5)))
+    silent = _silent_chunk(int(sr * (stt_streaming.ENCODER_SILENCE_FALLBACK_SEC + 0.5)))
     fresh_daemon._audio_callback(silent, silent.shape[0], None, None)
-    assert fresh_daemon._encoder_use_batch_fallback is True
+    assert fresh_daemon._encoder.use_batch_fallback is True
     # Now feed voiced audio — should NOT spawn encoder (fallback already
     # decided for this recording).
     fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
-    assert fresh_daemon._encoder_active is False
+    assert fresh_daemon._encoder.active is False
     assert fresh_daemon._backend.start_encoder.call_count == 0
 
 
@@ -635,16 +638,16 @@ def test_100_press_release_cycles_no_deadlock(fresh_daemon):
         # Feed one chunk so encoder lazy-spawns
         fresh_daemon._audio_callback(_voiced_chunk(800), 800, None, None)
         # Skip the 80 ms drain — flip state directly + join worker
-        with fresh_daemon._state_lock:
-            fresh_daemon._active_trigger = None
-            fresh_daemon._recording = False
-        if fresh_daemon._encoder_active:
-            fresh_daemon._encoder_stop_event.set()
-            if fresh_daemon._encoder_thread is not None:
-                fresh_daemon._encoder_thread.join(timeout=0.5)
-            with fresh_daemon._state_lock:
-                fresh_daemon._encoder_active = False
-        fresh_daemon._encoder_stop_event.clear()
+        with fresh_daemon._st.lock:
+            fresh_daemon._st.active_trigger = None
+            fresh_daemon._st.recording = False
+        if fresh_daemon._encoder.active:
+            fresh_daemon._encoder._stop_event.set()
+            if fresh_daemon._encoder._thread is not None:
+                fresh_daemon._encoder._thread.join(timeout=0.5)
+            with fresh_daemon._st.lock:
+                fresh_daemon._encoder.active = False
+        fresh_daemon._encoder._stop_event.clear()
 
     # After 100 cycles, no leftover thread should be alive (the fresh
     # fixture would also catch this on teardown, but we want explicit
@@ -658,7 +661,7 @@ def test_100_press_release_cycles_no_deadlock(fresh_daemon):
     # them all. So 0 expected from this test.
     leaked = [t for t in alive
               if getattr(t, "_target", None) is not None
-              and getattr(t._target, "__name__", "") == "_encoder_worker"]
+              and getattr(t._target, "__name__", "") == "_worker"]
     assert leaked == [], f"leaked encoder workers: {leaked}"
 
 
@@ -726,11 +729,11 @@ def test_edit_press_captures_selection(fresh_daemon):
 
     fresh_daemon._on_press(Key.f13)
 
-    assert fresh_daemon._edit_mode is True
-    assert fresh_daemon._edit_selection == "hello world"
-    assert fresh_daemon._edit_original_clipboard == "prev clipboard"
-    assert fresh_daemon._recording is True
-    assert fresh_daemon._active_trigger == Key.f13
+    assert fresh_daemon._st.edit_mode is True
+    assert fresh_daemon._st.edit_selection == "hello world"
+    assert fresh_daemon._st.edit_original_clipboard == "prev clipboard"
+    assert fresh_daemon._st.recording is True
+    assert fresh_daemon._st.active_trigger == Key.f13
     # simulate_copy was actually called
     fresh_daemon._pasteboard.simulate_copy.assert_called_once()
 
@@ -745,10 +748,10 @@ def test_edit_press_aborts_when_no_selection(fresh_daemon, caplog):
     with caplog.at_level(logging.DEBUG, logger="stt"):
         fresh_daemon._on_press(Key.f13)
 
-    assert fresh_daemon._recording is False
-    assert fresh_daemon._edit_mode is False
-    assert fresh_daemon._edit_selection is None
-    assert fresh_daemon._active_trigger is None
+    assert fresh_daemon._st.recording is False
+    assert fresh_daemon._st.edit_mode is False
+    assert fresh_daemon._st.edit_selection is None
+    assert fresh_daemon._st.active_trigger is None
     assert "no selection" in caplog.text.lower()
 
 
@@ -800,7 +803,7 @@ def test_dictate_press_unaffected_by_edit_keys(fresh_daemon, monkeypatch):
     time.sleep(0.3)
 
     assert invocations == ["polish"]
-    assert fresh_daemon._edit_mode is False
+    assert fresh_daemon._st.edit_mode is False
     # Dictate path must NOT have touched the clipboard or simulated Cmd+C
     fresh_daemon._pasteboard.simulate_copy.assert_not_called()
     fresh_daemon._pasteboard.get_text.assert_not_called()
@@ -818,10 +821,10 @@ def test_edit_clipboard_restored_on_success(fresh_daemon):
     fresh_daemon._on_press(Key.f13)
     # Pre-load buffer with non-silent audio so _trim_silence doesn't
     # strip everything. 16000 samples of low-amplitude noise = 1s.
-    fresh_daemon._buffer.append(
+    fresh_daemon._st.buffer.append(
         np.full(16000, 0.05, dtype=np.float32)
     )
-    fresh_daemon._recording_samples = 16000
+    fresh_daemon._st.recording_samples = 16000
     fresh_daemon._on_release(Key.f13)
     time.sleep(0.5)  # let edit thread run
 
@@ -847,10 +850,10 @@ def test_edit_clipboard_restored_on_polish_failure(fresh_daemon):
                         original_clipboard="orig", edit_result=None)
 
     fresh_daemon._on_press(Key.f13)
-    fresh_daemon._buffer.append(
+    fresh_daemon._st.buffer.append(
         np.full(16000, 0.05, dtype=np.float32)
     )
-    fresh_daemon._recording_samples = 16000
+    fresh_daemon._st.recording_samples = 16000
     fresh_daemon._on_release(Key.f13)
     time.sleep(0.5)
 
@@ -874,10 +877,10 @@ def test_edit_polisher_called_with_selection_and_instruction(fresh_daemon):
     )
 
     fresh_daemon._on_press(Key.f13)
-    fresh_daemon._buffer.append(
+    fresh_daemon._st.buffer.append(
         np.full(16000, 0.05, dtype=np.float32)
     )
-    fresh_daemon._recording_samples = 16000
+    fresh_daemon._st.recording_samples = 16000
     fresh_daemon._on_release(Key.f13)
     time.sleep(0.5)
 
@@ -893,7 +896,7 @@ def test_edit_busy_path_drops_and_restores(fresh_daemon):
     so the user's pre-edit clipboard is never silently lost on busy)."""
     fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
     _install_edit_mocks(fresh_daemon)
-    fresh_daemon._processing = True  # simulate busy
+    fresh_daemon._st.processing = True  # simulate busy
 
     # Call _transcribe_and_emit_edit directly — bypass the thread spawn
     # to avoid the daemon thread timing variance.
@@ -924,7 +927,7 @@ def test_edit_press_skips_capture_on_key_repeat(fresh_daemon):
 
     # First press — real start of voice-edit
     fresh_daemon._on_press(Key.f13)
-    assert fresh_daemon._active_trigger == Key.f13
+    assert fresh_daemon._st.active_trigger == Key.f13
     capture_calls_after_first = fresh_daemon._pasteboard.simulate_copy.call_count
     assert capture_calls_after_first == 1, (
         f"first press should simulate_copy once, got "
