@@ -87,6 +87,7 @@ def _on_status(icon, item):
 
 
 def _on_quit(icon, item):
+    _home_stt_cmd("stop")
     icon.stop()
 
 
