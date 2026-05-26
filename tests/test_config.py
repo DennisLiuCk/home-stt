@@ -152,6 +152,75 @@ class TestInitConfig:
         assert cfg_file.read_text() == "existing"
 
 
+class TestUpdateTriggerKeys:
+    def test_creates_file_if_missing(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"])
+        assert cfg_file.exists()
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["alt_r"]' in content
+
+    def test_updates_commented_line(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '# trigger_keys = ["alt_r"]\n'
+            '# edit_trigger_keys = ["f13"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["f14"], edit_trigger=["f15"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["f14"]' in content
+        assert 'edit_trigger_keys = ["f15"]' in content
+        assert "# trigger_keys" not in content
+        assert "# edit_trigger_keys" not in content
+
+    def test_updates_existing_value(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            'trigger_keys = ["ctrl_r"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["alt_r"]' in content
+        assert "ctrl_r" not in content
+
+    def test_none_skips_key(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            'trigger_keys = ["ctrl_r"]\n'
+            '# edit_trigger_keys = ["f13"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=None, edit_trigger=["f15"])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert 'trigger_keys = ["ctrl_r"]' in content
+        assert 'edit_trigger_keys = ["f15"]' in content
+
+    def test_roundtrip_produces_valid_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(trigger=["alt_r"], edit_trigger=["f13"])
+        if stt_config.tomllib is not None:
+            with open(cfg_file, "rb") as f:
+                parsed = stt_config.tomllib.load(f)
+            assert parsed["trigger_keys"] == ["alt_r"]
+            assert parsed["edit_trigger_keys"] == ["f13"]
+
+
+class TestKeyToStr:
+    def test_pynput_key(self):
+        from pynput.keyboard import Key
+        assert stt_config._key_to_str(Key.alt_r) == "alt_r"
+
+    def test_char(self):
+        assert stt_config._key_to_str("a") == "a"
+
+
 class TestGenerateDefaultConfig:
     def test_template_is_valid_toml(self, tmp_path):
         content = stt_config.generate_default_config()

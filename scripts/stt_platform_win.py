@@ -298,7 +298,7 @@ class WindowsPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_gr, Key.ctrl_r}
     # v0.7.5 voice-edit default — F13 is almost universally present on
     # full-size Win keyboards and unbound from OS shortcuts. TKL / laptop
-    # users without F13 override via EDIT_TRIGGER_KEYS in stt-daemon.py.
+    # users override via config.toml or `home-stt config --set-trigger`.
     default_edit_trigger_keys = {Key.f13}
 
     def register_native_libs(self) -> int:

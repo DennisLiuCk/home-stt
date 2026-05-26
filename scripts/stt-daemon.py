@@ -266,8 +266,9 @@ TRIGGER_KEYS: set | None = None
 # the existing default_trigger_keys pattern). Set explicitly to an
 # empty set `set()` to DISABLE voice-edit entirely.
 #
-# Caveat: F13 only exists on full-size Win keyboards (TKL / laptop users
-# override). Right Command exists on all Mac keyboards including MacBook.
+# Caveat: F13 only exists on full-size Win keyboards — TKL / laptop users
+# override via config.toml or `home-stt config --set-trigger`.
+# Right Command exists on all Mac keyboards including MacBook.
 EDIT_TRIGGER_KEYS: set | None = None
 SELECTION_CAPTURE_WAIT_S  = 0.1   # post-Cmd+C wait before checking seqno
 

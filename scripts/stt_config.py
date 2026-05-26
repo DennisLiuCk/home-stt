@@ -205,6 +205,60 @@ def init_config() -> Path:
     return path
 
 
+def _key_to_str(key) -> str:
+    """Convert a pynput Key or character back to a config-file string."""
+    from pynput.keyboard import Key
+    if isinstance(key, Key):
+        return key.name
+    return str(key)
+
+
+def update_trigger_keys(
+    trigger: list[str] | None = None,
+    edit_trigger: list[str] | None = None,
+) -> Path:
+    """Write trigger key settings into the user's config.toml.
+
+    Creates the file from the default template if it doesn't exist.
+    If it exists, patches the trigger_keys / edit_trigger_keys lines
+    in place; if the keys aren't present yet, appends them to the
+    trigger-keys section.
+    """
+    import re as _re
+
+    path = init_config()
+    content = path.read_text(encoding="utf-8")
+
+    def _format_toml_list(keys: list[str]) -> str:
+        return "[" + ", ".join(f'"{k}"' for k in keys) + "]"
+
+    for key_name, value in [("trigger_keys", trigger),
+                            ("edit_trigger_keys", edit_trigger)]:
+        if value is None:
+            continue
+        toml_val = _format_toml_list(value)
+        line = f"{key_name} = {toml_val}"
+        # Replace existing (commented or not)
+        pattern = _re.compile(
+            r"^#?\s*" + _re.escape(key_name) + r"\s*=.*$", _re.MULTILINE
+        )
+        if pattern.search(content):
+            content = pattern.sub(line, content, count=1)
+        else:
+            # Append after the trigger-keys section header
+            marker = "# ── Trigger keys"
+            idx = content.find(marker)
+            if idx != -1:
+                next_section = content.find("\n# ── ", idx + len(marker))
+                insert_at = next_section if next_section != -1 else len(content)
+                content = content[:insert_at] + line + "\n" + content[insert_at:]
+            else:
+                content = content.rstrip("\n") + "\n\n" + line + "\n"
+
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
 def apply_to_module(cfg: dict[str, Any], module) -> None:
     """Apply loaded config values to a daemon module's globals.
 

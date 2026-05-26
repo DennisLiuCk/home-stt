@@ -328,8 +328,97 @@ def _follow_log(path: Path) -> int:
         return 1
 
 
+def _capture_key(prompt_msg: str, *, timeout: float = 15.0):
+    """Listen for a single key press and return it (pynput Key or char).
+
+    Returns None if the user presses Escape or the timeout expires.
+    """
+    from pynput.keyboard import Key, Listener
+    import threading
+
+    result = None
+    done = threading.Event()
+
+    def on_press(key):
+        nonlocal result
+        if key == Key.esc:
+            done.set()
+            return False
+        result = key
+        done.set()
+        return False
+
+    print(prompt_msg, flush=True)
+    listener = Listener(on_press=on_press)
+    listener.start()
+    done.wait(timeout=timeout)
+    listener.stop()
+
+    if result is None:
+        return None
+
+    # Normalise: KeyCode with no char → use vk lookup, plain char → return it
+    if hasattr(result, "char") and result.char:
+        return result.char
+    return result
+
+
+def _key_display(key) -> str:
+    from pynput.keyboard import Key
+    if isinstance(key, Key):
+        return key.name
+    return repr(key)
+
+
+def cmd_set_trigger(_args) -> int:
+    """Interactive trigger-key detection and config update."""
+    from stt_config import _key_to_str, update_trigger_keys
+
+    print("home-stt trigger key setup")
+    print("=" * 40)
+    print()
+
+    # Dictate trigger
+    print("Step 1: Dictate trigger (hold-to-record key)")
+    print("  Default: Right Alt + Right Ctrl (Win), Right Option (Mac)")
+    key = _capture_key("  >> Press the key you want to use (Esc to keep default)...")
+    trigger = None
+    if key is not None:
+        name = _key_to_str(key)
+        trigger = [name]
+        print(f"  Captured: {_key_display(key)}  →  trigger_keys = [\"{name}\"]")
+    else:
+        print("  Skipped — keeping platform default.")
+    print()
+
+    # Edit trigger
+    print("Step 2: Voice-edit trigger (hold to edit selection)")
+    print("  Default: F13 (Win), Right Cmd (Mac)")
+    key = _capture_key("  >> Press the key you want to use (Esc to skip)...")
+    edit_trigger = None
+    if key is not None:
+        name = _key_to_str(key)
+        edit_trigger = [name]
+        print(f"  Captured: {_key_display(key)}  →  edit_trigger_keys = [\"{name}\"]")
+    else:
+        print("  Skipped — keeping platform default.")
+    print()
+
+    if trigger is None and edit_trigger is None:
+        print("No changes made.")
+        return 0
+
+    path = update_trigger_keys(trigger=trigger, edit_trigger=edit_trigger)
+    print(f"Config updated: {path}")
+    print("Run `home-stt restart` to apply.")
+    return 0
+
+
 def cmd_config(args) -> int:
     from stt_config import config_path, init_config, load_config, generate_default_config
+
+    if args.set_trigger:
+        return cmd_set_trigger(args)
 
     if args.init:
         path = config_path()
@@ -554,6 +643,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="Open config.toml in $VISUAL / $EDITOR / notepad.")
     p_cfg.add_argument("--path", action="store_true",
                        help="Print the config file path and exit.")
+    p_cfg.add_argument("--set-trigger", action="store_true",
+                       help="Interactive key detection — press a key to set triggers.")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
 
