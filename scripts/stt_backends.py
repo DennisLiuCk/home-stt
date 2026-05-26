@@ -16,8 +16,7 @@ import numpy as np
 
 logger = logging.getLogger("stt.backends")
 
-# Sampling rate for all backends (16 kHz mono float32).
-SAMPLE_RATE = 16000
+_DEFAULT_SAMPLE_RATE = 16000
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +32,7 @@ class STTBackend(ABC):
     audio at 16 kHz mono and expects a (text, language) tuple back."""
 
     name: str = "abstract"
+    sample_rate: int = _DEFAULT_SAMPLE_RATE
 
     @abstractmethod
     def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
@@ -130,10 +130,9 @@ class FasterWhisperBackend(STTBackend):
 
     name = "faster-whisper"
 
-    def __init__(self, model_name: str):
-        # Lazy import — keeps `faster_whisper` out of the import graph when
-        # a different backend is selected.
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
         from faster_whisper import WhisperModel
+        self.sample_rate = sample_rate
 
         try:
             self._model = WhisperModel(model_name, device="cuda",
@@ -161,10 +160,7 @@ class FasterWhisperBackend(STTBackend):
         return text, info.language
 
     def warmup(self) -> None:
-        # Cold-start CUDA JIT compile on Blackwell can take ~10s; once
-        # cached it's sub-second. Pay it now so the user's first
-        # hold-to-talk doesn't eat it.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        warm_audio = np.zeros(self.sample_rate, dtype=np.float32)
         list(self._model.transcribe(warm_audio, beam_size=1,
                                     vad_filter=False)[0])
 
@@ -180,9 +176,10 @@ class MlxWhisperBackend(STTBackend):
 
     name = "mlx-whisper"
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
         import mlx_whisper  # lazy import (Apple Silicon only)
 
+        self.sample_rate = sample_rate
         self._mlx_whisper = mlx_whisper
         if "/" not in model_name:
             model_name = f"mlx-community/whisper-{model_name}"
@@ -211,9 +208,7 @@ class MlxWhisperBackend(STTBackend):
         return text, language
 
     def warmup(self) -> None:
-        # First call materialises model weights + Metal kernels. Once warm,
-        # subsequent transcribes are sub-second on Apple Silicon turbo.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        warm_audio = np.zeros(self.sample_rate, dtype=np.float32)
         self._mlx_whisper.transcribe(
             warm_audio,
             path_or_hf_repo=self._model_name,
@@ -266,12 +261,13 @@ class Qwen3AsrBackend(STTBackend):
         "arabic":     "ar",
     }
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
+        self.sample_rate = sample_rate
         self._model_name = self._resolve_model_name(model_name)
         if sys.platform == "darwin" and _host_platform.machine() == "arm64":
-            self._impl = _Qwen3MlxImpl(self._model_name)
+            self._impl = _Qwen3MlxImpl(self._model_name, sample_rate)
         else:
-            self._impl = _Qwen3TorchImpl(self._model_name)
+            self._impl = _Qwen3TorchImpl(self._model_name, sample_rate)
 
     @staticmethod
     def _resolve_model_name(model_name: str) -> str:
@@ -333,11 +329,12 @@ class Qwen3AsrBackend(STTBackend):
 class _Qwen3MlxImpl:
     """Apple Silicon path — mlx-qwen3-asr (Metal native)."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
         import mlx_qwen3_asr  # lazy import (Apple Silicon only)
 
         self._mqa = mlx_qwen3_asr
         self._model_name = model_name
+        self._sample_rate = sample_rate
         self.device_label = "Apple Silicon (Metal, MLX) — Qwen3-ASR"
 
     def supports_streaming(self) -> bool:
@@ -358,11 +355,7 @@ class _Qwen3MlxImpl:
         }
 
     def warmup(self) -> None:
-        # First call downloads weights (~1.2 GB for 0.6B) on first run and
-        # materialises Metal kernels. Once warm, the next transcribe is
-        # near the ~92ms time-to-first-token claimed by the upstream MLX
-        # port.
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        warm_audio = np.zeros(self._sample_rate, dtype=np.float32)
         self._mqa.transcribe(
             warm_audio,
             model=self._model_name,
@@ -382,9 +375,9 @@ class _Qwen3TorchImpl:
     delivering 30-60 s transcribes.
     """
 
-    def __init__(self, model_name: str):
-        # Heavy lazy imports — only paid on Win/Linux + qwen3-asr backend.
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
         import torch
+        self._sample_rate = sample_rate
         # v0.8.0: use the streaming-capable subclass. transcribe()
         # behaviour is inherited unchanged from Qwen3ASRModel; the
         # streaming methods are additive. If the wrapper import fails
@@ -452,7 +445,7 @@ class _Qwen3TorchImpl:
 
     def transcribe(self, samples: np.ndarray) -> dict:
         results = self._model.transcribe(
-            audio=(samples, SAMPLE_RATE),
+            audio=(samples, self._sample_rate),
             language=None,
         )
         if not results:
@@ -464,22 +457,22 @@ class _Qwen3TorchImpl:
         }
 
     def warmup(self) -> None:
-        warm_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        warm_audio = np.zeros(self._sample_rate, dtype=np.float32)
         self._model.transcribe(
-            audio=(warm_audio, SAMPLE_RATE),
+            audio=(warm_audio, self._sample_rate),
             language=None,
         )
 
 
-def build_backend(name: str, model: str) -> STTBackend:
+def build_backend(name: str, model: str, sample_rate: int = _DEFAULT_SAMPLE_RATE) -> STTBackend:
     """Factory. To add a new backend: implement STTBackend in a new class,
     add a branch here, and update STT_BACKEND in the Config section."""
     if name == "faster-whisper":
-        return FasterWhisperBackend(model)
+        return FasterWhisperBackend(model, sample_rate)
     if name == "mlx-whisper":
-        return MlxWhisperBackend(model)
+        return MlxWhisperBackend(model, sample_rate)
     if name == "qwen3-asr":
-        return Qwen3AsrBackend(model)
+        return Qwen3AsrBackend(model, sample_rate)
     # ── Future backends ────────────────────────────────────────────────
     # elif name == "sense-voice":
     #     return SenseVoiceBackend(model)
@@ -488,14 +481,15 @@ def build_backend(name: str, model: str) -> STTBackend:
     raise ValueError(f"Unknown STT backend: {name!r}")
 
 
-def build_backend_with_fallback(backend_name: str, model_name: str) -> STTBackend:
+def build_backend_with_fallback(backend_name: str, model_name: str,
+                                sample_rate: int = _DEFAULT_SAMPLE_RATE) -> STTBackend:
     """Try the configured STT backend; on ImportError (missing package) or
     CUDA OOM, fall back to faster-whisper with a loud actionable stderr
     message. If that also fails, exit cleanly — the daemon can't run
     without an STT backend, and a half-initialised state is worse than a
     clear-cut exit. Mirrors build_polisher's degrade-gracefully pattern."""
     try:
-        return build_backend(backend_name, model_name)
+        return build_backend(backend_name, model_name, sample_rate)
     except (ImportError, ModuleNotFoundError) as e:
         logger.warning(
             f"backend '{backend_name}' missing required package: "
@@ -541,7 +535,7 @@ def build_backend_with_fallback(backend_name: str, model_name: str) -> STTBacken
         )
 
     try:
-        return build_backend("faster-whisper", "large-v3-turbo")
+        return build_backend("faster-whisper", "large-v3-turbo", sample_rate)
     except Exception as e:
         logger.critical(
             f"faster-whisper fallback also failed: {e}. "

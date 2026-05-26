@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 
 import numpy as np
 import sounddevice as sd
@@ -96,7 +95,7 @@ def _play_beep(freq_hz: float,
         sd.play(wave, samplerate=sr)
     except Exception as e:
         # Beep is purely cosmetic — never let it break transcription.
-        logger.debug(f"beep failed: {e}")
+        logger.warning("beep failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

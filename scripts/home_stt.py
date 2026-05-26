@@ -430,12 +430,13 @@ def cmd_doctor(_args) -> int:
             import mlx  # noqa: F401
             all_ok &= _check("mlx", True, getattr(mlx, "__version__", "ok"))
         except ImportError:
-            _check("mlx", False, "not installed (needed for mlx-whisper / qwen3-asr on Mac)")
+            all_ok &= _check("mlx", False, "not installed (needed for mlx-whisper / qwen3-asr on Mac)")
         try:
             import mlx_lm  # noqa: F401
             all_ok &= _check("mlx-lm (polish)", True,
                              getattr(mlx_lm, "__version__", "ok"))
         except ImportError:
+            # Optional — polish degrades to NoopPolisher without mlx-lm.
             _check("mlx-lm (polish)", False, "not installed — polish will be disabled")
     else:
         # CUDA backend
@@ -466,10 +467,10 @@ def cmd_doctor(_args) -> int:
             all_ok &= _check("qwen-asr", True,
                              getattr(qwen_asr, "__version__", "ok"))
         except ImportError:
-            _check("qwen-asr", False,
-                   "not installed (default STT backend — see README)")
+            all_ok &= _check("qwen-asr", False,
+                             "not installed (default STT backend — see README)")
 
-        # faster-whisper (fallback backend)
+        # faster-whisper (fallback backend) — optional if qwen-asr is present.
         try:
             import faster_whisper
             _check("faster-whisper (fallback)", True,

@@ -7,10 +7,13 @@ Priority (highest wins):  environment variable > config file > code default
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("stt.config")
 
 try:
     import tomllib  # Python 3.11+
@@ -127,21 +130,19 @@ def load_config() -> dict[str, Any]:
                 if norm in cfg and not isinstance(v, dict):
                     cfg[norm] = v
         except Exception as e:
-            print(f"[stt] WARN: failed to load {path}: {e}", file=sys.stderr, flush=True)
+            logger.warning("failed to load %s: %s", path, e)
     elif path.exists() and tomllib is None:
-        print(f"[stt] WARN: config file exists at {path} but neither tomllib "
-              f"(Python 3.11+) nor tomli is available. Config file ignored.",
-              file=sys.stderr, flush=True)
+        logger.warning("config file exists at %s but neither tomllib "
+                       "(Python 3.11+) nor tomli is available. Config file ignored.", path)
 
     for key in _DEFAULTS:
         env_name = _ENV_PREFIX + key.upper()
         env_val = os.environ.get(env_name)
-        if env_val is not None:
+        if env_val is not None and env_val.strip() != "":
             try:
                 cfg[key] = _coerce_env(key, env_val)
             except (ValueError, TypeError) as e:
-                print(f"[stt] WARN: bad env {env_name}={env_val!r}: {e}",
-                      file=sys.stderr, flush=True)
+                logger.warning("bad env %s=%r: %s", env_name, env_val, e)
 
     return cfg
 

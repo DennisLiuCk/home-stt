@@ -43,7 +43,6 @@ import logging
 import os
 import platform as _host_platform
 import queue
-import re
 import sys
 import threading
 import time
@@ -72,7 +71,6 @@ except Exception:
 
 import numpy as np
 import sounddevice as sd
-from opencc import OpenCC
 from pynput import keyboard
 from pynput.keyboard import Key
 
@@ -464,7 +462,7 @@ def _audio_callback(indata, frames, time_info, status) -> None:
     global _encoder_silence_run_samples, _encoder_use_batch_fallback
     global _encoder_failed, _encoder_consecutive_failures
     if status:
-        logger.debug(f"audio status: {status}")
+        logger.info("audio status: %s", status)
 
     # Per-callback chunk stats. RMS uses float64 to avoid bf16/fp32 round
     # cancellation on very-low-amplitude room tone.
@@ -1126,13 +1124,21 @@ def _setup_logging() -> None:
     level_name = os.environ.get("HOME_STT_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(level)
-    handler.setFormatter(logging.Formatter("[stt] %(message)s"))
+    fmt = logging.Formatter("[stt] %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(level)
+    stdout_handler.setFormatter(fmt)
+    stdout_handler.addFilter(lambda r: r.levelno < logging.WARNING)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
 
     root = logging.getLogger("stt")
     root.setLevel(level)
-    root.addHandler(handler)
+    root.addHandler(stdout_handler)
+    root.addHandler(stderr_handler)
 
 
 def main() -> None:
@@ -1164,7 +1170,7 @@ def main() -> None:
     _polisher = build_polisher(POLISH_ENABLED, POLISH_MODEL, POLISH_PROMPT)
     logger.info(f"polish: {_polisher.device_label}")
 
-    _backend = build_backend_with_fallback(STT_BACKEND, STT_MODEL)
+    _backend = build_backend_with_fallback(STT_BACKEND, STT_MODEL, SAMPLE_RATE)
 
     if TRIGGER_KEYS is None:
         TRIGGER_KEYS = _pasteboard.default_trigger_keys
