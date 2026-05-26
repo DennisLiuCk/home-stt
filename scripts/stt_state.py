@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -46,16 +47,46 @@ def write_state(
         pass
 
 
+def _daemon_alive() -> bool:
+    """Check if the daemon process is alive via PID file."""
+    pid_file = Path(__file__).resolve().parent / "stt-daemon.pid"
+    if not pid_file.exists():
+        return False
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        return False
+    if sys.platform == "win32":
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return str(pid) in r.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
 def read_state() -> dict | None:
-    """Read current daemon state. Returns None if file doesn't exist or is stale."""
+    """Read current daemon state. Uses PID file to detect stopped daemon."""
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        age = time.time() - data.get("ts", 0)
-        if age > 30:
-            data["state"] = "stopped"
-        return data
     except (OSError, json.JSONDecodeError, KeyError):
-        return None
+        data = None
+
+    if not _daemon_alive():
+        if data is not None:
+            data["state"] = "stopped"
+        else:
+            return {"state": "stopped", "ts": 0}
+
+    return data
 
 
 def cleanup() -> None:
