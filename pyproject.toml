@@ -42,4 +42,4 @@ home-stt = "home_stt:main"
 
 [tool.setuptools]
 package-dir = {"" = "scripts"}
-py-modules = ["home_stt", "stt_config", "stt_audio"]
+py-modules = ["home_stt", "stt_config", "stt_audio", "stt_backends"]

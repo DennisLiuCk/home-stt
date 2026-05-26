@@ -119,11 +119,12 @@ def test_existing_backends_inherit_no_streaming(fresh_daemon):
     backends will override to True (separate test once impl lands)."""
     # FasterWhisperBackend / MlxWhisperBackend don't load models on
     # supports_streaming() — it's just a method check on the class.
-    assert fresh_daemon.FasterWhisperBackend.supports_streaming(
-        fresh_daemon.FasterWhisperBackend.__new__(fresh_daemon.FasterWhisperBackend)
+    from stt_backends import FasterWhisperBackend, MlxWhisperBackend
+    assert FasterWhisperBackend.supports_streaming(
+        FasterWhisperBackend.__new__(FasterWhisperBackend)
     ) is False
-    assert fresh_daemon.MlxWhisperBackend.supports_streaming(
-        fresh_daemon.MlxWhisperBackend.__new__(fresh_daemon.MlxWhisperBackend)
+    assert MlxWhisperBackend.supports_streaming(
+        MlxWhisperBackend.__new__(MlxWhisperBackend)
     ) is False
 
 
