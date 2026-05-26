@@ -77,6 +77,7 @@ from opencc import OpenCC
 from pynput import keyboard
 from pynput.keyboard import Key
 
+from stt_audio import post_process, _play_beep, _trim_silence
 from stt_platform import Pasteboard, build_pasteboard
 from text_polisher import TextPostProcessor, build_polisher
 
@@ -326,117 +327,6 @@ BEEP_FAIL_HZ     = 220                 # A3, "dull" — v0.7.5 voice-edit
                                        #   things went wrong.
 BEEP_DURATION_MS = 80
 BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
-
-
-# ---------------------------------------------------------------------------
-# Text post-processing (backend-agnostic)
-#
-# `s2twp` (not plain `s2tw`) does character-level Simplified→Traditional
-# conversion PLUS phrase-level mapping to Taiwan vocabulary:
-#   软件→軟體 (not 軟件), 视频→影片 (not 視頻), 异步→非同步 (not 異步),
-#   函数→函式 (not 函數), 代码→程式碼 (not 代碼). For a TW-target daemon
-# this is strictly better than s2tw. Cost difference is ~0.1ms (microsecond
-# range either way).
-#
-# post_process() is called TWICE per transcribe:
-#   1. on raw ASR output (Qwen3-ASR-0.6B outputs simplified natively — so
-#      polish always sees clean traditional + TW-vocab input, less risk of
-#      the small polish model being primed into a simplified output register)
-#   2. on polish output (deterministic backstop — polish models occasionally
-#      leak simplified glyphs back in despite the prompt rule; OpenCC is
-#      cheaper and more reliable than fighting that with prompt engineering)
-# Both calls are idempotent: re-running on already-traditional+spaced text
-# is a no-op.
-# ---------------------------------------------------------------------------
-_s2twp = OpenCC("s2twp")
-_CJK   = r"[㐀-鿿]"
-_AW    = r"[A-Za-z0-9]"
-
-
-def post_process(text: str) -> str:
-    """Simplified → Taiwan-traditional (with TW phrase mapping via s2twp),
-    then add spaces at CJK ↔ ASCII edges. Idempotent."""
-    text = _s2twp.convert(text)
-    text = re.sub(f"({_CJK})({_AW})", r"\1 \2", text)
-    text = re.sub(f"({_AW})({_CJK})", r"\1 \2", text)
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Audio feedback (cross-platform — uses sounddevice which we already need
-# for capture). Generates a short sine wave and plays it non-blocking via
-# sd.play().
-#
-# A few subtleties that bit us on macOS:
-#   - The mic stream is open at SAMPLE_RATE (16 kHz), but the default OS
-#     output device is usually 44.1/48 kHz. If we hand sd.play() a 16 kHz
-#     buffer, CoreAudio resamples it, and the resampling artifacts on a
-#     short (~80 ms) tone are audible as a "broken" / "double-ding" sound.
-#     Fix: generate the wave at the OUTPUT device's native rate.
-#   - sd.play() opens a fresh OutputStream every call, and on macOS the
-#     stream-open transient is a brief audible click. Fix: prepend a tiny
-#     (~5 ms) silence pad so the click happens during silence, not on top
-#     of the sine attack.
-#   - Linear fades produce harsher edges than half-cosine ramps; using a
-#     raised-cosine envelope makes the tone sound "tighter".
-# ---------------------------------------------------------------------------
-def _detect_output_samplerate() -> int:
-    """Return the default output device's preferred sample rate, falling
-    back to 44.1 kHz if querying fails. Cached at module load."""
-    try:
-        return int(sd.query_devices(kind="output")["default_samplerate"])
-    except Exception:
-        return 44100
-
-
-# Populated lazily by _get_beep_sr() on first beep — keeps PortAudio /
-# CoreAudio out of the import path so the daemon can start on macOS
-# LaunchAgent (pre-login session, audio HAL not yet ready) or other
-# headless contexts without emitting noisy errors before any [stt] log
-# line. By the time the first beep fires (on first key press) the
-# listener / audio stream are already up, so HAL is in a known state.
-_BEEP_SR: int | None = None
-
-
-def _get_beep_sr() -> int:
-    global _BEEP_SR
-    if _BEEP_SR is None:
-        _BEEP_SR = _detect_output_samplerate()
-    return _BEEP_SR
-
-
-def _play_beep(freq_hz: float,
-               duration_ms: int = BEEP_DURATION_MS,
-               volume: float = BEEP_VOLUME) -> None:
-    if not BEEPS_ENABLED:
-        return
-    try:
-        sr = _get_beep_sr()
-        n = int(sr * duration_ms / 1000)
-        if n <= 0:
-            return
-        t = np.arange(n) / sr
-        wave = (volume * np.sin(2 * np.pi * freq_hz * t)).astype(np.float32)
-
-        # Raised-cosine fade in/out (~15 ms each) — smoother than linear,
-        # eliminates click pops at start/end of the tone.
-        fade = min(int(sr * 0.015), n // 2)
-        if fade > 0:
-            ramp = (0.5 * (1 - np.cos(np.pi * np.arange(fade) / fade))).astype(np.float32)
-            wave[:fade]  *= ramp
-            wave[-fade:] *= ramp[::-1]
-
-        # Silence pad at the start: CoreAudio's first-buffer transient
-        # (when sd.play() opens a new OutputStream) lands in this silence
-        # rather than on top of the sine attack, so the user hears one
-        # clean "ding" instead of "click-ding".
-        pad = np.zeros(int(sr * 0.005), dtype=np.float32)
-        wave = np.concatenate([pad, wave])
-
-        sd.play(wave, samplerate=sr)
-    except Exception as e:
-        # Beep is purely cosmetic — never let it break transcription.
-        logger.debug(f"beep failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1015,45 +905,6 @@ _edit_original_clipboard: str | None = None  # to restore in finally
 _ENCODER_SILENCE_THRESHOLD = 10.0 ** (-50.0 / 20.0)
 
 
-# v0.7.2: RMS-based silence trimmer. Cheap (numpy-only, microseconds for
-# typical hold-to-talk clips) substitute for proper VAD. Two motivations:
-#
-#   1. Qwen3-ASR is LLM-backbone — the HF model card explicitly lists
-#      "silence hallucination, mispronunciations, long-form drift" as known
-#      edge cases. When the encoder sees significant silence the decoder
-#      can emit a learned phrase that "fits" silence in training data —
-#      Chinese voice-blog signoffs ("好好好好") or English "Thanks for
-#      watching"-type artefacts. Trimming leading/trailing silence kills
-#      this trigger before it reaches the model.
-#
-#   2. Trimmed audio is shorter → encoder forward is faster.
-#
-# Threshold -50 dBFS catches typical room tone (well below speech amplitude
-# ~-20 to -10 dBFS) while not flagging quiet speech onsets. 100 ms margin
-# preserves syllable attacks at the boundary.
-def _trim_silence(samples: np.ndarray,
-                  threshold_dbfs: float = -50.0,
-                  frame_ms: int = 30,
-                  margin_ms: int = 100) -> np.ndarray:
-    if len(samples) < SAMPLE_RATE * 0.1:
-        return samples  # too short to meaningfully trim
-    frame_size = max(1, int(SAMPLE_RATE * frame_ms / 1000))
-    n_frames = len(samples) // frame_size
-    if n_frames == 0:
-        return samples
-    frames = samples[:n_frames * frame_size].reshape(n_frames, frame_size)
-    # RMS per frame, vectorised.
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
-    threshold = 10.0 ** (threshold_dbfs / 20.0)
-    above = rms > threshold
-    if not above.any():
-        return samples[:0]  # all silence — return empty array (correct dtype)
-    first = int(above.argmax())
-    last = n_frames - int(above[::-1].argmax()) - 1
-    margin = int(SAMPLE_RATE * margin_ms / 1000)
-    start = max(0, first * frame_size - margin)
-    end = min(len(samples), (last + 1) * frame_size + margin)
-    return samples[start:end]
 
 
 def _encoder_worker(handle: Any) -> None:
@@ -1365,7 +1216,7 @@ def _transcribe_and_emit() -> None:
             _abort_encoder_quiet()
             # v0.7.2: RMS silence trim before ASR. Qwen3-ASR is LLM-backbone
             # and hallucinates on long silence (model card known issue).
-            trimmed = _trim_silence(samples)
+            trimmed = _trim_silence(samples, SAMPLE_RATE)
             if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
                 # Could be (a) too-short tap or (b) all-silence after trim.
                 trim_sec = len(trimmed) / SAMPLE_RATE
@@ -1431,7 +1282,7 @@ def _transcribe_and_emit() -> None:
         time.sleep(0.02)
         paste_ok = _pasteboard.paste()
         if paste_ok:
-            _play_beep(BEEP_END_HZ)
+            _play_beep(BEEP_END_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
 
         try:
             timing = f"{elapsed:.2f}s"
@@ -1552,7 +1403,7 @@ def _transcribe_and_emit_edit(selection: str,
             return
         samples_arr = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
         raw_sec = len(samples_arr) / SAMPLE_RATE
-        trimmed = _trim_silence(samples_arr)
+        trimmed = _trim_silence(samples_arr, SAMPLE_RATE)
         if len(trimmed) < SAMPLE_RATE * MIN_AUDIO_SEC:
             logger.info(f"voice-edit: too short ({raw_sec:.2f}s) — "
                         f"no instruction captured")
@@ -1574,7 +1425,7 @@ def _transcribe_and_emit_edit(selection: str,
         edited = _polisher.edit(selection, instruction)
         edit_elapsed = time.time() - t1
         if edited is None:
-            _play_beep(BEEP_FAIL_HZ)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
             logger.warning(f"voice-edit: polish.edit returned None "
                            f"(instruction: {instruction!r})")
             return
@@ -1588,7 +1439,7 @@ def _transcribe_and_emit_edit(selection: str,
         time.sleep(0.02)
         paste_ok = _pasteboard.paste()
         if paste_ok:
-            _play_beep(BEEP_END_HZ)
+            _play_beep(BEEP_END_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
             # Compact log: instruction + before/after lets user diff in
             # the daemon log without re-deriving from clipboard history.
             logger.info(f"voice-edit ({language}, {asr_elapsed:.2f}s+"
@@ -1668,14 +1519,14 @@ def _on_press(key) -> None:
     if is_edit:
         captured = _capture_selection(_pasteboard)
         if captured is None:
-            _play_beep(BEEP_FAIL_HZ)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
             logger.info("voice-edit: no selection captured")
             return  # DO NOT start recording
         # Verify polisher actually has edit capability — NoopPolisher's
         # edit() returns None unconditionally, so starting a recording
         # we know can't succeed would just waste 1-5s of user effort.
         if _polisher.__class__.__name__ == "NoopPolisher":
-            _play_beep(BEEP_FAIL_HZ)
+            _play_beep(BEEP_FAIL_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
             logger.warning("voice-edit: POLISH_ENABLED is False — voice-edit "
                            "requires polish (LLM does the editing). Enable polish "
                            "or unset EDIT_TRIGGER_KEYS.")
@@ -1725,7 +1576,7 @@ def _on_press(key) -> None:
                 break
     edit_tag = " [edit]" if is_edit else ""
     logger.info(f"REC ({key}){edit_tag}")
-    _play_beep(BEEP_START_HZ)
+    _play_beep(BEEP_START_HZ, BEEP_DURATION_MS, BEEP_VOLUME, BEEPS_ENABLED)
 
 
 def _on_release(key) -> None:

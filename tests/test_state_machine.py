@@ -136,7 +136,7 @@ def test_trim_silence_tight_clip_passes_through(fresh_daemon):
     sr = fresh_daemon.SAMPLE_RATE
     # 0.5s of noise at ~-15 dBFS (well above -50 dBFS threshold).
     speech = (np.random.randn(int(sr * 0.5)) * 0.2).astype(np.float32)
-    trimmed = fresh_daemon._trim_silence(speech)
+    trimmed = fresh_daemon._trim_silence(speech, sr)
     # Should preserve roughly the full clip — within 100ms margin either side.
     assert len(trimmed) >= len(speech) * 0.9
 
@@ -147,7 +147,7 @@ def test_trim_silence_pads_removed(fresh_daemon):
     silence = np.zeros(sr, dtype=np.float32)
     speech = (np.random.randn(sr) * 0.2).astype(np.float32)
     clip = np.concatenate([silence, speech, silence])
-    trimmed = fresh_daemon._trim_silence(clip)
+    trimmed = fresh_daemon._trim_silence(clip, sr)
     # 1s speech + 2 × 100ms margins ≈ 1.2s; trimming should be tight.
     assert 0.8 < len(trimmed) / sr < 1.5
 
@@ -156,7 +156,7 @@ def test_trim_silence_all_silence_returns_empty(fresh_daemon):
     """Pure silence → empty array (caller treats as 'too short' and skips)."""
     sr = fresh_daemon.SAMPLE_RATE
     silence = np.zeros(sr * 2, dtype=np.float32)
-    trimmed = fresh_daemon._trim_silence(silence)
+    trimmed = fresh_daemon._trim_silence(silence, sr)
     assert len(trimmed) == 0
 
 
@@ -164,7 +164,7 @@ def test_trim_silence_short_clip_no_op(fresh_daemon):
     """Clips below 100ms are too short to meaningfully trim — pass through."""
     sr = fresh_daemon.SAMPLE_RATE
     tiny = np.zeros(int(sr * 0.05), dtype=np.float32)  # 50ms
-    trimmed = fresh_daemon._trim_silence(tiny)
+    trimmed = fresh_daemon._trim_silence(tiny, sr)
     assert len(trimmed) == len(tiny)
 
 
