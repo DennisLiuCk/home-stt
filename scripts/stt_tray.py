@@ -15,6 +15,8 @@ import time
 import threading
 from pathlib import Path
 
+_quit_requested = threading.Event()
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -88,7 +90,7 @@ def _on_status(icon, item):
 
 def _on_quit(icon, item):
     _home_stt_cmd("stop")
-    icon.stop()
+    _quit_requested.set()
 
 
 def _make_recording_frame(phase: int):
@@ -136,9 +138,15 @@ def _poll_state(icon, interval: float = 0.3) -> None:
                     except Exception:
                         pass
 
-        # Auto-quit when daemon stops (so `home-stt stop` closes both)
+        # Quit: either user clicked "Quit Tray" or daemon stopped
+        if _quit_requested.is_set():
+            icon.stop()
+            return
         if state == "stopped" and prev_state is not None and prev_state != "stopped":
-            icon.notify("Daemon stopped", "home-stt")
+            try:
+                icon.notify("Daemon stopped", "home-stt")
+            except Exception:
+                pass
             time.sleep(2)
             icon.stop()
             return
