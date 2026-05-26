@@ -90,60 +90,22 @@ daemon.BEEPS_ENABLED = False
 
 def _reset_daemon_state():
     """Single source of truth for the clean-state baseline used by
-    fresh_daemon (pre and post test). Extracted so additions to the
-    v0.8.0 encoder state etc. don't drift between pre/post halves."""
-    import queue as _queue
-    # v0.8.0: kill any encoder worker thread that may have been spawned
-    # by the previous test BEFORE resetting state, so its goroutine-like
-    # loop sees the stop signal and exits cleanly. Without this, a
-    # background worker can still write to module globals after we've
-    # "reset" them, corrupting the next test.
-    daemon._encoder_stop_event.set()
-    prior_thread = daemon._encoder_thread
-    if prior_thread is not None and prior_thread.is_alive():
-        prior_thread.join(timeout=2.0)
-    daemon._encoder_stop_event.clear()
+    fresh_daemon (pre and post test)."""
+    from stt_streaming import EncoderPipeline
 
     daemon._buffer = []
     daemon._recording = False
     daemon._active_trigger = None
     daemon._processing = False
     daemon._recording_samples = 0
-    # v0.7.5: voice-edit per-recording state. Reset between tests so a
-    # test that sets _edit_mode=True (via mocked _on_press flow) doesn't
-    # leak into the next test's release dispatch.
     daemon._edit_mode = False
     daemon._edit_selection = None
     daemon._edit_original_clipboard = None
-    # v0.7.3: restore module-default ENCODER_PIPELINING after any test
-    # mutation (streaming tests flip it True for their body).
     daemon.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
-    # v0.7.5: restore EDIT_TRIGGER_KEYS module-default (voice-edit tests
-    # set it to a sentinel like {Key.f13}).
+    import stt_streaming as _stt_streaming
+    _stt_streaming.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
     daemon.EDIT_TRIGGER_KEYS = _ORIGINAL_EDIT_TRIGGER_KEYS
-    # v0.8.0 encoder-pipelining state. Mirrors what _on_press does on a
-    # real recording start, so tests that exercise the audio callback
-    # without going through _on_press first don't hit stale flags.
-    daemon._encoder_thread = None
-    daemon._encoder_handle = None
-    daemon._encoder_active = False
-    daemon._encoder_failed = False
-    daemon._encoder_consecutive_failures = 0
-    daemon._encoder_use_batch_fallback = False
-    daemon._encoder_silence_run_samples = 0
-    daemon._encoder_residual_samples = None
-    # Drain the queue (fresh Queue() would also work but reusing the
-    # existing one avoids re-binding the module attribute that the
-    # daemon's own functions captured at import time).
-    while True:
-        try:
-            daemon._encoder_queue.get_nowait()
-        except _queue.Empty:
-            break
-    # _backend default stays None (was lazily set by main() in v0.7.2;
-    # v0.8.0 made it nullable so the audio callback can early-out when
-    # no backend is wired). Tests that need a backend set their own
-    # mock via _install_inert_mocks or equivalent.
+    daemon._encoder = EncoderPipeline(daemon.SAMPLE_RATE)
 
 
 @pytest.fixture

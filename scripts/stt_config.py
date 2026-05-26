@@ -312,7 +312,13 @@ def apply_to_module(cfg: dict[str, Any], module) -> None:
             setattr(module, mod_attr, val)
 
     if cfg.get("encoder_pipelining") is not None:
-        module.ENCODER_PIPELINING = bool(cfg["encoder_pipelining"])
+        val = bool(cfg["encoder_pipelining"])
+        module.ENCODER_PIPELINING = val
+        try:
+            import stt_streaming
+            stt_streaming.ENCODER_PIPELINING = val
+        except ImportError:
+            pass
 
     if cfg.get("beeps_enabled") is not None:
         module.BEEPS_ENABLED = bool(cfg["beeps_enabled"])
