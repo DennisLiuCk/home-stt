@@ -1,6 +1,6 @@
 # Hold-to-Talk STT
 
-![version](https://img.shields.io/badge/version-0.7.5-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
+![version](https://img.shields.io/badge/version-0.8.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey) ![python](https://img.shields.io/badge/python-3.10%2B-green)
 
 **按住熱鍵講話、放開自動貼到當下焦點視窗,完全離線。** 兩個模式:語音輸入(Dictate)+ 語音編輯(Voice-Edit),詳見 [核心功能](#核心功能)。
 
@@ -22,7 +22,8 @@
 **⚙️ 進階配置**
 
 - [依硬體選擇 Preset](#依硬體選擇-preset) — 低 VRAM / 低 RAM 機降階
-- [自訂](#自訂) — Config 變數說明
+- [自訂](#自訂) — Config 檔 + CLI 設定工具
+- [System Tray 系統列圖示](#system-tray-系統列圖示) — 狀態指示 + 通知 (v0.8.0+)
 - [Polish 後處理](#polish-後處理-v050windows-macos-v060) — LLM 修飾文字機制
 - [開機自動啟動（選用）](#開機自動啟動選用)
 
@@ -219,24 +220,23 @@ v0.6.0+ 起預設跑 **Qwen3-ASR + LLM polish** 雙模型在 GPU/Metal 上(macOS
 
 ### 怎麼切換
 
-編輯 `scripts/stt-daemon.py`,找到 Config 區的 `STT_BACKEND` / `STT_MODEL` / `POLISH_ENABLED` / `POLISH_MODEL` 四行(line ~108–138),按照上表挑你硬體對應的 tier 改:
+編輯 config.toml（`home-stt config --edit`）,設定以下四個值:
 
-```python
-# 例如:Balanced tier(中階卡 RTX 3060 / 4060)
-STT_BACKEND      = "qwen3-asr"
-STT_MODEL        = "Qwen/Qwen3-ASR-0.6B"
-POLISH_ENABLED   = True
-POLISH_MODEL     = "Qwen/Qwen2.5-1.5B-Instruct"
+```toml
+# Balanced tier(中階卡 RTX 3060 / 4060)
+stt_backend = "qwen3-asr"
+stt_model = "Qwen/Qwen3-ASR-0.6B"
+polish_enabled = true
+polish_model = "Qwen/Qwen2.5-1.5B-Instruct"
 
-# 例如:Light tier(入門卡 RTX 3050 / 2060)
-STT_BACKEND      = "qwen3-asr"
-STT_MODEL        = "Qwen/Qwen3-ASR-0.6B"
-POLISH_ENABLED   = False
+# Light tier(入門卡 RTX 3050 / 2060)
+stt_backend = "qwen3-asr"
+polish_enabled = false
 
-# 例如:Mini tier(沒裝 PyTorch CUDA / 想極省資源)
-STT_BACKEND      = "faster-whisper"
-STT_MODEL        = "large-v3-turbo"   # 或 medium / small / base
-POLISH_ENABLED   = False
+# Mini tier(沒裝 PyTorch CUDA / 想極省資源)
+stt_backend = "faster-whisper"
+stt_model = "large-v3-turbo"   # 或 medium / small / base
+polish_enabled = false
 ```
 
 然後 restart(雙平台同指令):
@@ -286,7 +286,7 @@ scripts/
 
 v0.7.0+ 預設 **Maximum tier** — `Qwen3-ASR-0.6B` + `Qwen3-4B-Instruct-2507` polish,雙模型常駐 ~10 GB VRAM。**RTX 4070 / 4080 / 4090 跳過這步直接 (3)**。
 
-如果你的卡 < 10 GB VRAM(RTX 3060 / 4060 / 筆電 GPU)、或不想裝 PyTorch CUDA,先去 [依硬體選擇 Preset](#依硬體選擇-preset) 挑 Balanced / Light / Mini tier,編輯 `scripts/stt-daemon.py` 把 `STT_BACKEND` / `STT_MODEL` / `POLISH_ENABLED` / `POLISH_MODEL` 改掉再啟動。
+如果你的卡 < 10 GB VRAM(RTX 3060 / 4060 / 筆電 GPU)、或不想裝 PyTorch CUDA,先去 [依硬體選擇 Preset](#依硬體選擇-preset) 挑 Balanced / Light / Mini tier,用 `home-stt config --edit` 開啟 config.toml，改 `stt_backend` / `stt_model` / `polish_enabled` / `polish_model` 再 `home-stt restart`。
 
 ### 3. 啟動 daemon
 
@@ -423,7 +423,7 @@ python3 -c "import sys; print(sys.executable)"
 | **M-Air / 任何 8GB 機** | `POLISH_ENABLED = False`(Light tier:只 ASR、無 polish) | ~1.5-2 GB |
 | **M-Pro / M-Max / 32GB+** | 預設不動,可選升 `STT_MODEL = "1.7B"` 換更高 ASR 精度 | ~4.5-7 GB |
 
-要改的話編輯 `scripts/stt-daemon.py` 頂部 Config 區。完整 4-tier 比較表(含 Windows / Linux 路徑)見 [依硬體選擇 Preset](#依硬體選擇-preset)。
+要改的話用 `home-stt config --edit` 編輯 config.toml。完整 4-tier 比較表見 [依硬體選擇 Preset](#依硬體選擇-preset)。
 
 ### 5. 啟動 daemon
 
@@ -557,32 +557,111 @@ bash scripts/stt-stop.sh
 
 ## 自訂
 
-直接編輯 `stt-daemon.py` 頂部的 `Config` 區塊：
+v0.8.0 起所有設定都透過 **config.toml** 管理，不需要改 source code：
 
-```python
-SAMPLE_RATE      = 16000                   # 麥克風取樣率
-MIN_AUDIO_SEC    = 0.3                     # 太短的按鍵自動忽略
-STT_BACKEND      = _DEFAULT_BACKEND        # 自動:Apple Silicon → qwen3-asr (v0.3.0+);Win/Linux → qwen3-asr (v0.6.0+)
-STT_MODEL        = _DEFAULT_MODEL          # 自動:皆為 "Qwen/Qwen3-ASR-0.6B"
-TRIGGER_KEYS     = None                    # None = 平台預設(Win: alt_gr+ctrl_r,Mac: alt_r);改 set 可覆蓋
+```bash
+# 產生預設 config 檔（已有則不覆蓋）
+home-stt config --init
 
-# Polish 後處理(v0.5.0+;Windows v0.6.0+;用小 LLM 修飾 ASR 輸出,去口語贅字)
-POLISH_ENABLED   = True                    # False = 跳過 polish,直接貼原始 ASR(行為等同 v0.4.x)
-POLISH_MODEL     = _DEFAULT_POLISH_MODEL   # 自動:Mac → MLX 4-bit 變體 / Win/Linux → "Qwen/Qwen3-4B-Instruct-2507"
-POLISH_LANGUAGES = {"zh", "ja", "ko"}      # 只 polish CJK;純英文 bypass(小 LLM 容易誤翻英文)
-POLISH_PROMPT    = "..."                   # 移除「呃、嗯、就是、那個、然後」+ 修口誤的 system prompt
+# 用編輯器開啟
+home-stt config --edit
 
-# 提示音
-BEEPS_ENABLED    = True                    # 想完全靜音設 False
-BEEP_START_HZ    = 880                     # 按下觸發鍵時的「叮」
-BEEP_END_HZ      = 660                     # 處理完貼上後的「咚」
-BEEP_DURATION_MS = 80
-BEEP_VOLUME      = 0.15                    # 0.0–1.0;太大聲會干擾 mic
+# 查看目前設定
+home-stt config
+
+# 查看 config 檔路徑
+home-stt config --path
 ```
 
-改完用 stop + start 腳本重啟（Windows: `.ps1`,macOS: `.sh`）。
+Config 檔位置：
+- Windows：`%APPDATA%\home-stt\config.toml`
+- macOS：`~/.config/home-stt/config.toml`
+
+**優先序**：環境變數 (`HOME_STT_*`) > config.toml > 程式碼預設值
+
+### 觸發鍵自訂（v0.8.0+）
+
+TKL / 筆電鍵盤沒有 F13？用互動式偵測：
+
+```bash
+home-stt config --set-trigger
+```
+
+按照提示按鍵即可，結果自動寫入 config.toml。也可以手動編輯：
+
+```toml
+trigger_keys = ["alt_r"]
+edit_trigger_keys = ["f13"]
+```
+
+### 麥克風裝置選擇（v0.8.0+）
+
+```bash
+# 列出所有輸入裝置
+home-stt devices
+```
+
+在 config.toml 指定裝置（名稱子字串匹配或 index）：
+
+```toml
+mic_device = "Yeti Nano"
+# mic_device = 1
+```
+
+### 常用設定
+
+```toml
+# STT backend
+stt_backend = "qwen3-asr"
+stt_model = "Qwen/Qwen3-ASR-0.6B"
+
+# Polish 後處理
+polish_enabled = true
+polish_model = "Qwen/Qwen3-4B-Instruct-2507"
+
+# 提示音
+beeps_enabled = true
+beep_volume = 0.15
+
+# 進階
+sample_rate = 16000
+min_audio_sec = 0.15
+max_audio_sec = 120
+```
+
+改完 restart 生效：`home-stt restart`
 
 > 切換模型大小（依硬體）見 [依硬體選擇 Preset](#依硬體選擇-preset)；切換到不同 STT 引擎見 [STT 模型抽象](#stt-模型抽象)。
+
+### System Tray 系統列圖示
+
+v0.8.0 起支援系統列圖示，即時顯示 daemon 狀態：
+
+```bash
+# 啟動 daemon + tray 一起
+home-stt start --tray
+
+# 或分開啟動
+home-stt start
+home-stt tray
+```
+
+| 狀態 | 圖示 | 說明 |
+|------|------|------|
+| idle | 灰色圓點 | 等待觸發鍵 |
+| recording | 紅色脈動 | 正在錄音 |
+| processing | 黃色圓點 | STT + polish 處理中 |
+| stopped | 深灰圓點 | daemon 未執行 |
+
+**功能**：
+- 狀態即時切換（灰→紅→黃→灰）
+- 完成時彈出 Windows 通知，顯示轉錄文字
+- 右鍵選單：Start / Stop / Restart / Status / Quit Tray
+- `home-stt stop` 時 tray 自動退出；Quit Tray 也會一併停止 daemon
+
+**安裝**：`pip install pystray Pillow`（或 `pip install home-stt[tray]`）
+
+---
 
 ### Polish 後處理 (v0.5.0+;Windows + macOS v0.6.0+)
 
@@ -779,21 +858,33 @@ v0.7.x 系列做了大量加速 / 品質研究,以下路徑都 **bench-validated
 ```
 home-stt/
 ├── README.md
-├── .gitignore
+├── pyproject.toml           # 版本 + 依賴 + entry points
+├── tests/
+│   ├── conftest.py          # 共用 fixture + daemon module loader
+│   ├── test_config.py       # config 載入 / env / TOML / key parsing
+│   ├── test_state.py        # daemon↔tray 狀態檔 IPC
+│   ├── test_state_machine.py # state machine + encoder + voice-edit
+│   └── test_polish_bench.py # polish 品質回歸(需 GPU,CI skip)
 └── scripts/
-    ├── stt-daemon.py        # 主程式:keyboard hook + audio + STT backends + state machine
-    ├── stt_platform.py      # Pasteboard ABC + build_pasteboard() factory dispatch
-    ├── stt_platform_win.py  # WindowsPasteboard:ctypes SendInput + PowerShell clipboard + NVIDIA DLL
-    ├── stt_platform_mac.py  # MacOSPasteboard:pbcopy + pynput Cmd+V
-    ├── stt-start.ps1        # Windows 啟動:背景 spawn python,寫 PID file
-    ├── stt-stop.ps1         # Windows 停止:讀 PID file 或掃 process tree 殺
-    ├── stt-start.sh         # macOS 啟動:nohup 背景跑,寫 PID file
-    ├── stt-stop.sh          # macOS 停止:讀 PID file + pgrep fallback
-    └── stt-daemon.pid       # daemon PID(runtime 產生,已 gitignore)
+    ├── stt-daemon.py        # 主程式:DaemonState + keyboard hook + transcribe
+    ├── stt_config.py        # TOML config 載入 + apply_to_module (v0.8.0+)
+    ├── stt_backends.py      # STTBackend ABC + 3 backend impl
+    ├── stt_audio.py         # beep + post_process + trim_silence
+    ├── stt_streaming.py     # EncoderPipeline(disabled,保留框架)
+    ├── stt_state.py         # daemon↔tray 共享狀態檔 (v0.8.0+)
+    ├── stt_tray.py          # System Tray icon — pystray (v0.8.0+)
+    ├── text_polisher.py     # TextPostProcessor ABC + LLM polish
+    ├── home_stt.py          # 統一 CLI (v0.8.0+: tray/devices/--set-trigger)
+    ├── stt_platform.py      # Pasteboard ABC + factory dispatch
+    ├── stt_platform_win.py  # WindowsPasteboard
+    ├── stt_platform_mac.py  # MacOSPasteboard
+    ├── stt-start.ps1 / .sh  # 平台啟動腳本
+    └── stt-stop.ps1 / .sh   # 平台停止腳本
 
-Windows %TEMP%\ 或 macOS $TMPDIR (/var/folders/.../T/)
-├── stt-daemon.log       # 主 log(包含 transcription)
-└── stt-daemon.err.log   # 錯誤 log
+Runtime files (temp dir):
+├── stt-daemon.log           # 主 log
+├── stt-daemon.err.log       # 錯誤 log
+└── stt-daemon-state.json    # daemon↔tray 狀態(v0.8.0+)
 ```
 
 ---

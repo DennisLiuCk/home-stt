@@ -35,7 +35,7 @@ import stt_streaming
 # ---------------------------------------------------------------------------
 
 def test_version_bumped(fresh_daemon):
-    assert fresh_daemon.__version__ == "0.7.5"
+    assert fresh_daemon.__version__ == "0.8.0"
 
 
 def test_polish_languages_is_zh_only(fresh_daemon):
@@ -260,7 +260,8 @@ def test_on_release_has_drain_delay(fresh_daemon):
     assert fresh_daemon._st.recording is False
 
 
-def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
+def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog,
+                                                     monkeypatch):
     """C1 corner case: user re-presses during the drain window.
     _on_release should leave _recording=True (so the new press
     continues capturing) and skip its transcribe spawn — the new
@@ -269,13 +270,25 @@ def test_on_release_aborts_if_new_press_during_drain(fresh_daemon, caplog):
     _install_inert_mocks(fresh_daemon)
     fresh_daemon._on_press(Key.alt_r)
 
+    # Synchronise: detect when _on_release enters the drain sleep,
+    # then fire the re-press. Avoids flaky timing on fast CI runners.
+    drain_entered = threading.Event()
+    _real_sleep = time.sleep
+
+    def _patched_sleep(secs):
+        if 0.07 <= secs <= 0.09:
+            drain_entered.set()
+        _real_sleep(secs)
+
+    monkeypatch.setattr(time, "sleep", _patched_sleep)
+
     with caplog.at_level(logging.DEBUG, logger="stt"):
         release_thread = threading.Thread(
             target=fresh_daemon._on_release, args=(Key.alt_r,),
         )
         release_thread.start()
-        time.sleep(0.04)  # 40ms into the 80ms drain — enough for thread to start
-        fresh_daemon._on_press(Key.alt_r)  # new press while still draining
+        drain_entered.wait(timeout=2.0)
+        fresh_daemon._on_press(Key.alt_r)
         release_thread.join(timeout=2.0)
 
     assert fresh_daemon._st.recording is True, "new press should keep capturing"
