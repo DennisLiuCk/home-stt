@@ -11,6 +11,7 @@
 **🚀 新用戶從這開始**
 
 - [核心功能](#核心功能) — Dictate + Voice-Edit 兩個模式
+- [跟其他方案比較](#跟其他方案比較) — 為什麼選 home-stt
 - [平台支援](#平台支援)
 - [系統需求](#系統需求)
 - [macOS 第一次啟用](#macos-第一次啟用) ⭐ Mac 新用戶這條
@@ -70,6 +71,22 @@
 ```
 
 完全離線,LLM 在本地跑(macOS:MLX 4-bit;Windows:PyTorch CUDA bfloat16)。
+
+---
+
+## 跟其他方案比較
+
+| 功能 | home-stt | macOS Dictation | Windows 語音辨識 | Talon Voice | Whisper.cpp |
+|------|----------|-----------------|-----------------|-------------|-------------|
+| 完全離線 | ✅ | ❌ (cloud) | ❌ (cloud) | ✅ | ✅ |
+| LLM 修飾（去贅字 / 修口誤） | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Voice-Edit（語音改寫選取） | ✅ | ❌ | ❌ | ✅ (進階) | ❌ |
+| 中英混合辨識 | ✅ 最佳化 | 一般 | 一般 | 英文為主 | 一般 |
+| Hold-to-talk（按住即錄） | ✅ | ❌ (toggle) | ❌ (toggle) | ✅ | ❌ (CLI) |
+| 跨平台 | Win + Mac | Mac only | Win only | Win + Mac + Linux | 全平台 |
+| IME 共存（注音 / 拼音） | ✅ 免疫設計 | 部分 | 部分 | 部分 | N/A |
+
+> **home-stt 的定位**：100% 離線、hold-to-talk、中英混合最佳化的語音輸入 daemon。不是通用語音助手、也不是 voice control — 專注做好「按住講話、放開貼字」這一件事。
 
 ---
 
