@@ -93,14 +93,14 @@ def _reset_daemon_state():
     fresh_daemon (pre and post test)."""
     from stt_streaming import EncoderPipeline
 
-    daemon._buffer = []
-    daemon._recording = False
-    daemon._active_trigger = None
-    daemon._processing = False
-    daemon._recording_samples = 0
-    daemon._edit_mode = False
-    daemon._edit_selection = None
-    daemon._edit_original_clipboard = None
+    daemon._st.buffer = []
+    daemon._st.recording = False
+    daemon._st.active_trigger = None
+    daemon._st.processing = False
+    daemon._st.recording_samples = 0
+    daemon._st.edit_mode = False
+    daemon._st.edit_selection = None
+    daemon._st.edit_original_clipboard = None
     daemon.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
     import stt_streaming as _stt_streaming
     _stt_streaming.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING

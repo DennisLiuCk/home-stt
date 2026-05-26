@@ -298,29 +298,30 @@ BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 
 
 # ---------------------------------------------------------------------------
-# Audio capture state
+# Audio capture state — grouped into DaemonState for type safety and
+# snapshotability. Single instance `_st` created at module level.
 # ---------------------------------------------------------------------------
-_state_lock = threading.Lock()
-_buffer: list[np.ndarray] = []
-_recording = False
-_active_trigger = None   # which TRIGGER_KEYS member is currently held, or None
-_processing = False
-# v0.7.2: running sample count for the current _buffer. Tracked to enforce
-# MAX_AUDIO_SEC without re-summing every callback (which would be O(N) per
-# 50 ms tick on long recordings). Reset whenever _buffer is cleared / swapped.
-_recording_samples = 0
+class DaemonState:
+    __slots__ = ("lock", "buffer", "recording", "active_trigger",
+                 "processing", "recording_samples", "edit_mode",
+                 "edit_selection", "edit_original_clipboard")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.buffer: list = []
+        self.recording: bool = False
+        self.active_trigger = None
+        self.processing: bool = False
+        self.recording_samples: int = 0
+        self.edit_mode: bool = False
+        self.edit_selection: str | None = None
+        self.edit_original_clipboard: str | None = None
+
+
+_st = DaemonState()
 
 # Encoder pipeline instance — created in main() after SAMPLE_RATE is finalised.
 _encoder: EncoderPipeline | None = None
-
-# v0.7.5 voice-edit per-recording state. Snapshotted at press time —
-# `_on_release` reads these under _state_lock then routes to
-# `_transcribe_and_emit_edit` instead of `_transcribe_and_emit`. All three
-# are cleared at the top of `_on_press` and re-populated if the press is
-# an edit-trigger.
-_edit_mode = False                  # True iff this recording is voice-edit
-_edit_selection: str | None = None  # the captured selection text
-_edit_original_clipboard: str | None = None  # to restore in finally
 
 # Silence threshold for the mid-utterance fallback detector. Matches the
 # -50 dBFS that _trim_silence uses.
@@ -330,7 +331,7 @@ _ENCODER_SILENCE_THRESHOLD = 10.0 ** (-50.0 / 20.0)
 def _audio_callback(indata, frames, time_info, status) -> None:
     """PortAudio callback: append to buffer, enforce MAX_AUDIO_SEC cap,
     and delegate encoder pipelining to _encoder.on_chunk()."""
-    global _recording, _recording_samples
+
     if status:
         logger.info("audio status: %s", status)
 
@@ -339,13 +340,13 @@ def _audio_callback(indata, frames, time_info, status) -> None:
     is_silent = chunk_rms < _ENCODER_SILENCE_THRESHOLD
 
     auto_stop = False
-    with _state_lock:
-        if not _recording:
+    with _st.lock:
+        if not _st.recording:
             return
-        _buffer.append(chunk)
-        _recording_samples += chunk.shape[0]
-        if _recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
-            _recording = False
+        _st.buffer.append(chunk)
+        _st.recording_samples += chunk.shape[0]
+        if _st.recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
+            _st.recording = False
             auto_stop = True
         if _encoder is not None:
             _encoder.on_chunk(chunk, is_silent, _backend)
@@ -364,22 +365,22 @@ _polisher: TextPostProcessor | None = None  # set in main()
 
 
 def _transcribe_and_emit() -> None:
-    global _processing, _buffer, _recording_samples
-    with _state_lock:
-        if _processing:
-            dropped_chunks = len(_buffer)
-            dropped_sec = _recording_samples / SAMPLE_RATE
-            _buffer = []
-            _recording_samples = 0
+
+    with _st.lock:
+        if _st.processing:
+            dropped_chunks = len(_st.buffer)
+            dropped_sec = _st.recording_samples / SAMPLE_RATE
+            _st.buffer = []
+            _st.recording_samples = 0
             if dropped_chunks > 0:
                 logger.info(f"busy — dropped {dropped_sec:.2f}s of captured "
                             f"audio ({dropped_chunks} blocks; previous transcribe "
                             f"still running)")
             return
-        _processing = True
-        chunks = _buffer
-        _buffer = []
-        _recording_samples = 0
+        _st.processing = True
+        chunks = _st.buffer
+        _st.buffer = []
+        _st.recording_samples = 0
     text = None
     language = None
     try:
@@ -503,8 +504,8 @@ def _transcribe_and_emit() -> None:
     except Exception as e:
         logger.error(f"{e}")
     finally:
-        with _state_lock:
-            _processing = False
+        with _st.lock:
+            _st.processing = False
         _write_state(IDLE, last_text=text if text else None,
                      last_lang=language if language else None)
 
@@ -567,13 +568,13 @@ def _transcribe_and_emit_edit(selection: str,
     instructions — pipelining win is negligible). Skips POLISH_LANGUAGES
     gating (the LLM is given an EXPLICIT language-handling rule via
     EDIT_PROMPT, so all language combinations route here)."""
-    global _processing, _buffer, _recording_samples
-    with _state_lock:
-        if _processing:
-            dropped_chunks = len(_buffer)
-            dropped_sec = _recording_samples / SAMPLE_RATE
-            _buffer = []
-            _recording_samples = 0
+
+    with _st.lock:
+        if _st.processing:
+            dropped_chunks = len(_st.buffer)
+            dropped_sec = _st.recording_samples / SAMPLE_RATE
+            _st.buffer = []
+            _st.recording_samples = 0
             if dropped_chunks > 0:
                 logger.info(f"busy — dropped {dropped_sec:.2f}s of voice-edit "
                             f"audio ({dropped_chunks} blocks)")
@@ -581,10 +582,10 @@ def _transcribe_and_emit_edit(selection: str,
             # drop, because _on_press already overwrote it via simulate_copy.
             _try_restore_clipboard(original_clipboard, context="busy-drop")
             return
-        _processing = True
-        chunks = _buffer
-        _buffer = []
-        _recording_samples = 0
+        _st.processing = True
+        chunks = _st.buffer
+        _st.buffer = []
+        _st.recording_samples = 0
     try:
         if not chunks:
             logger.info("voice-edit: empty audio (no instruction)")
@@ -646,8 +647,8 @@ def _transcribe_and_emit_edit(selection: str,
         # beyond the paste of the edit result (which is then immediately
         # replaced — so user keeps their pre-edit clipboard intact).
         _try_restore_clipboard(original_clipboard, context="post-edit")
-        with _state_lock:
-            _processing = False
+        with _st.lock:
+            _st.processing = False
         _write_state(IDLE, edit_mode=True)
 
 
@@ -669,8 +670,6 @@ def _try_restore_clipboard(original: str | None, *, context: str) -> None:
 # Keyboard hooks
 # ---------------------------------------------------------------------------
 def _on_press(key) -> None:
-    global _recording, _active_trigger, _recording_samples
-    global _edit_mode, _edit_selection, _edit_original_clipboard
 
     # v0.7.5: route both trigger key sets. EDIT_TRIGGER_KEYS may be None
     # (= disabled) or a set; same for TRIGGER_KEYS. The two sets are
@@ -690,8 +689,8 @@ def _on_press(key) -> None:
     # injected into the focused app. Dictate path already had this early
     # return below (inside the lock); we needed to hoist it above the
     # selection-capture step.
-    with _state_lock:
-        if _active_trigger is not None:
+    with _st.lock:
+        if _st.active_trigger is not None:
             return  # OS key-repeat — first press already started recording
 
     # For edit, capture selection BEFORE acquiring state lock (again).
@@ -719,30 +718,28 @@ def _on_press(key) -> None:
             _try_restore_clipboard(captured[1], context="noop-polisher")
             return
 
-    with _state_lock:
-        if _active_trigger is not None:
+    with _st.lock:
+        if _st.active_trigger is not None:
             # Race: another trigger pressed during the ~100 ms selection
             # capture window. For edit, restore the captured clipboard
             # we modified via simulate_copy.
             if captured is not None:
                 _try_restore_clipboard(captured[1], context="active-trigger")
             return
-        _active_trigger = key
-        _recording = True
+        _st.active_trigger = key
+        _st.recording = True
         _write_state(RECORDING, edit_mode=bool(captured))
-        _buffer.clear()
+        _st.buffer.clear()
         # v0.7.2: reset sample counter for MAX_AUDIO_SEC tracking. Without
         # this, a previous transcribe that left a stale count + a new press
         # could falsely trip the cap and auto-stop the new recording early.
-        _recording_samples = 0
-        # v0.7.5: edit state — cleared every press, populated only if this
-        # press is an edit trigger. Snapshot read in _on_release.
-        _edit_mode = False
-        _edit_selection = None
-        _edit_original_clipboard = None
+        _st.recording_samples = 0
+        _st.edit_mode = False
+        _st.edit_selection = None
+        _st.edit_original_clipboard = None
         if captured is not None:
-            _edit_mode = True
-            _edit_selection, _edit_original_clipboard = captured
+            _st.edit_mode = True
+            _st.edit_selection, _st.edit_original_clipboard = captured
         if _encoder is not None:
             _encoder.reset()
     edit_tag = " [edit]" if is_edit else ""
@@ -751,16 +748,15 @@ def _on_press(key) -> None:
 
 
 def _on_release(key) -> None:
-    global _recording, _active_trigger
     # v0.7.5: accept release of either trigger key set.
     is_edit_key = bool(EDIT_TRIGGER_KEYS) and key in EDIT_TRIGGER_KEYS
     is_dictate_key = bool(TRIGGER_KEYS) and key in TRIGGER_KEYS
     if not (is_edit_key or is_dictate_key):
         return
-    with _state_lock:
-        if _active_trigger != key:
+    with _st.lock:
+        if _st.active_trigger != key:
             return  # releasing a non-active trigger (e.g. tap of the other one)
-        _active_trigger = None
+        _st.active_trigger = None
         # v0.7.2: do NOT flip _recording=False here yet. PortAudio fires
         # the callback every 50 ms; if we stop capture immediately, the
         # in-flight 0-50 ms audio block that arrives between user release
@@ -782,19 +778,19 @@ def _on_release(key) -> None:
     edit_mode_snap = False
     edit_selection_snap: str | None = None
     edit_original_snap: str | None = None
-    with _state_lock:
+    with _st.lock:
         # If user pressed a trigger again during the drain, _active_trigger
         # is non-None. Leave _recording=True (the new press wants to
         # continue capturing) and SKIP this release's transcribe spawn —
         # the new press will spawn its own when it eventually releases.
-        if _active_trigger is not None:
+        if _st.active_trigger is not None:
             abort = True
         else:
-            _recording = False
-            _write_state(PROCESSING, edit_mode=_edit_mode)
-            edit_mode_snap = _edit_mode
-            edit_selection_snap = _edit_selection
-            edit_original_snap = _edit_original_clipboard
+            _st.recording = False
+            _write_state(PROCESSING, edit_mode=_st.edit_mode)
+            edit_mode_snap = _st.edit_mode
+            edit_selection_snap = _st.edit_selection
+            edit_original_snap = _st.edit_original_clipboard
     if abort:
         logger.info("release aborted by new press during drain")
         return
