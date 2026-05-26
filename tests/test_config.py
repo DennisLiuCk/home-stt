@@ -253,6 +253,57 @@ class TestKeyToStr:
     def test_char(self):
         assert stt_config._key_to_str("a") == "a"
 
+    def test_keycode_with_char(self):
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_char("z")
+        assert stt_config._key_to_str(kc) == "z"
+
+    def test_keycode_vk_only(self):
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_vk(65437)
+        result = stt_config._key_to_str(kc)
+        assert result.startswith("vk_") or result.isalpha()
+
+    def test_vk_roundtrip(self):
+        """_key_to_str → _parse_key must survive for vk-only keys."""
+        from pynput.keyboard import KeyCode
+        kc = KeyCode.from_vk(65437)
+        name = stt_config._key_to_str(kc)
+        parsed = stt_config._parse_key(name)
+        assert parsed is not None
+
+
+class TestParseKeyVk:
+    def test_vk_format(self):
+        from pynput.keyboard import KeyCode
+        result = stt_config._parse_key("vk_65437")
+        assert isinstance(result, KeyCode)
+        assert result.vk == 65437
+
+    def test_vk_invalid_number(self):
+        with pytest.raises(ValueError):
+            stt_config._parse_key("vk_notanumber")
+
+
+class TestApplyToModuleBadKeys:
+    def test_bad_key_name_logs_warning_not_crash(self, tmp_path, monkeypatch):
+        """A typo in config trigger_keys should warn, not crash the daemon."""
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        cfg = stt_config.load_config()
+        cfg["trigger_keys"] = ["not_a_real_key"]
+
+        class FakeModule:
+            TRIGGER_KEYS = None
+            EDIT_TRIGGER_KEYS = None
+            ENCODER_PIPELINING = False
+            POLISH_ENABLED = True
+            POLISH_LANGUAGES = {"zh"}
+            BEEPS_ENABLED = True
+
+        mod = FakeModule()
+        stt_config.apply_to_module(cfg, mod)
+        assert mod.TRIGGER_KEYS is None  # should stay default, not crash
+
 
 class TestGenerateDefaultConfig:
     def test_template_is_valid_toml(self, tmp_path):
