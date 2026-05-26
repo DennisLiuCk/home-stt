@@ -10,7 +10,7 @@ called from any directory. Standalone fallback:
     python3 scripts/home_stt.py start
     python3 scripts/home_stt.py status
 
-Subcommands: start, stop, restart, status, log, config, devices, version.
+Subcommands: start, stop, restart, status, log, config, tray, devices, version.
 """
 from __future__ import annotations
 
@@ -606,6 +606,13 @@ def cmd_doctor(_args) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_tray(_args) -> int:
+    """Launch the system tray icon."""
+    import stt_tray
+    stt_tray.main()
+    return 0
+
+
 def cmd_devices(_args) -> int:
     """List available audio input devices."""
     try:
@@ -681,6 +688,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="Interactive key detection — press a key to set triggers.")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
+    sub.add_parser("tray", help="Launch system tray icon (Windows: pystray, macOS: rumps).")
     sub.add_parser("devices", help="List available audio input (microphone) devices.")
 
     sub.add_parser("version", help="Print home-stt version (same as --version).")
@@ -700,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
         "log":     cmd_log,
         "config":  cmd_config,
         "doctor":  cmd_doctor,
+        "tray":    cmd_tray,
         "devices": cmd_devices,
         "version": cmd_version,
     }

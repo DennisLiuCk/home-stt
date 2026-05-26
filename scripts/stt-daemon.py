@@ -77,6 +77,7 @@ from pynput.keyboard import Key
 from stt_audio import post_process, _play_beep, _trim_silence
 from stt_backends import STTBackend, build_backend, build_backend_with_fallback
 from stt_platform import Pasteboard, build_pasteboard
+from stt_state import write_state as _write_state, cleanup as _cleanup_state, IDLE, RECORDING, PROCESSING
 from text_polisher import TextPostProcessor, build_polisher
 
 
@@ -611,6 +612,8 @@ def _transcribe_and_emit() -> None:
         snap_encoder_active = _encoder_active
         snap_encoder_failed = _encoder_failed
         snap_encoder_use_batch = _encoder_use_batch_fallback
+    text = None
+    language = None
     try:
         if not chunks:
             _abort_encoder_quiet()
@@ -791,6 +794,8 @@ def _transcribe_and_emit() -> None:
     finally:
         with _state_lock:
             _processing = False
+        _write_state(IDLE, last_text=text if text else None,
+                     last_lang=language if language else None)
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +937,7 @@ def _transcribe_and_emit_edit(selection: str,
         _try_restore_clipboard(original_clipboard, context="post-edit")
         with _state_lock:
             _processing = False
+        _write_state(IDLE, edit_mode=True)
 
 
 def _try_restore_clipboard(original: str | None, *, context: str) -> None:
@@ -1015,6 +1021,7 @@ def _on_press(key) -> None:
             return
         _active_trigger = key
         _recording = True
+        _write_state(RECORDING, edit_mode=bool(captured))
         _buffer.clear()
         # v0.7.2: reset sample counter for MAX_AUDIO_SEC tracking. Without
         # this, a previous transcribe that left a stale count + a new press
@@ -1092,6 +1099,7 @@ def _on_release(key) -> None:
             abort = True
         else:
             _recording = False
+            _write_state(PROCESSING, edit_mode=_edit_mode)
             edit_mode_snap = _edit_mode
             edit_selection_snap = _edit_selection
             edit_original_snap = _edit_original_clipboard
@@ -1235,6 +1243,7 @@ def main() -> None:
         blocksize=int(SAMPLE_RATE * 0.05),  # 50 ms chunks
     )
     stream.start()
+    _write_state(IDLE)
     listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
     listener.start()
     try:
@@ -1244,6 +1253,7 @@ def main() -> None:
     finally:
         stream.stop()
         stream.close()
+        _cleanup_state()
 
 
 if __name__ == "__main__":
