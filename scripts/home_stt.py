@@ -10,7 +10,7 @@ called from any directory. Standalone fallback:
     python3 scripts/home_stt.py start
     python3 scripts/home_stt.py status
 
-Subcommands: start, stop, restart, status, log, config, version.
+Subcommands: start, stop, restart, status, log, config, devices, version.
 """
 from __future__ import annotations
 
@@ -606,6 +606,40 @@ def cmd_doctor(_args) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_devices(_args) -> int:
+    """List available audio input devices."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        print("home-stt: sounddevice not installed", file=sys.stderr)
+        return 1
+
+    devices = sd.query_devices()
+    default_input = sd.default.device[0]
+    print("Available input devices:\n")
+    found = False
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] <= 0:
+            continue
+        found = True
+        marker = " *" if idx == default_input else "  "
+        sr = int(dev["default_samplerate"])
+        ch = dev["max_input_channels"]
+        print(f"{marker} [{idx}] {dev['name']}  ({sr} Hz, {ch}ch)")
+    if not found:
+        print("  (no input devices found)")
+    print()
+    print("  * = system default")
+    print()
+    print("To use a specific device, add to config.toml:")
+    from stt_config import config_path
+    print(f"  ({config_path()})")
+    print()
+    print('  mic_device = "Device Name"   # substring match')
+    print("  mic_device = 1               # or device index")
+    return 0
+
+
 def cmd_version(_args) -> int:
     print(f"home-stt v{_daemon_version()}")
     return 0
@@ -647,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="Interactive key detection — press a key to set triggers.")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
+    sub.add_parser("devices", help="List available audio input (microphone) devices.")
 
     sub.add_parser("version", help="Print home-stt version (same as --version).")
 
@@ -665,6 +700,7 @@ def main(argv: list[str] | None = None) -> int:
         "log":     cmd_log,
         "config":  cmd_config,
         "doctor":  cmd_doctor,
+        "devices": cmd_devices,
         "version": cmd_version,
     }
     return handlers[args.command](args)

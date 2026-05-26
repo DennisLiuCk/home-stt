@@ -212,6 +212,39 @@ class TestUpdateTriggerKeys:
             assert parsed["edit_trigger_keys"] == ["f13"]
 
 
+class TestMicDevice:
+    def test_default_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] is None
+
+    def test_string_from_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('mic_device = "Yeti Nano"\n', encoding="utf-8")
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == "Yeti Nano"
+
+    def test_int_from_toml(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("mic_device = 3\n", encoding="utf-8")
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == 3
+
+    def test_env_int_coercion(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        monkeypatch.setenv("HOME_STT_MIC_DEVICE", "5")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == 5
+
+    def test_env_string(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stt_config, "config_path", lambda: tmp_path / "nope.toml")
+        monkeypatch.setenv("HOME_STT_MIC_DEVICE", "Yeti Nano")
+        cfg = stt_config.load_config()
+        assert cfg["mic_device"] == "Yeti Nano"
+
+
 class TestKeyToStr:
     def test_pynput_key(self):
         from pynput.keyboard import Key

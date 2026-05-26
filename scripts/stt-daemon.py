@@ -102,6 +102,10 @@ MIN_AUDIO_SEC    = 0.15                # taps shorter than this are ignored
 # beyond this, _audio_callback force-releases and spawns transcribe.
 MAX_AUDIO_SEC    = 120                 # hard ceiling — auto-release on stuck key
 
+# Microphone device — None = system default. Set via config.toml or
+# HOME_STT_MIC_DEVICE env var. Accepts device name (str) or index (int).
+MIC_DEVICE: str | int | None = None
+
 # STT backend + model defaults per platform.
 #   macOS (Apple Silicon only as of v0.4.0): Qwen3-ASR-0.6B via mlx-qwen3-asr.
 #       Strong Chinese punctuation + native zh-en code-switching beat Whisper
@@ -1142,6 +1146,27 @@ def _setup_logging() -> None:
     root.addHandler(stderr_handler)
 
 
+def _resolve_mic_device(spec: str | int | None) -> int | None:
+    """Resolve a mic device spec to a sounddevice device index.
+
+    None → system default (returns None).
+    int  → passed through as device index.
+    str  → substring match against input device names.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, int):
+        return spec
+    name = str(spec).lower()
+    devices = sd.query_devices()
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0 and name in dev["name"].lower():
+            logger.info(f"mic: matched '{dev['name']}' (index {idx})")
+            return idx
+    logger.warning(f"mic: no input device matching '{spec}', using system default")
+    return None
+
+
 def main() -> None:
     global _backend, _pasteboard, TRIGGER_KEYS, EDIT_TRIGGER_KEYS
 
@@ -1200,7 +1225,9 @@ def main() -> None:
         logger.info(f"warmup {time.time()-t0:.1f}s — hold {trigger_labels} "
                     f"to record.")
 
+    _mic_id = _resolve_mic_device(MIC_DEVICE)
     stream = sd.InputStream(
+        device=_mic_id,
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",

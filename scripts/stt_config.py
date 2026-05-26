@@ -77,6 +77,7 @@ _DEFAULTS: dict[str, Any] = {
     "beep_fail_hz": 220,
     "beep_duration_ms": 80,
     "beep_volume": 0.15,
+    "mic_device": None,
 }
 
 _ENV_PREFIX = "HOME_STT_"
@@ -100,6 +101,12 @@ def _coerce_env(key: str, raw: str) -> Any:
         return parts if parts else None
     if key in _LIST_STR_KEYS:
         return [s.strip() for s in raw.split(",") if s.strip()]
+    if key == "mic_device":
+        stripped = raw.strip()
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
     return raw
 
 
@@ -176,6 +183,11 @@ _TEMPLATE = """\
 # sample_rate = 16000
 # min_audio_sec = 0.15
 # max_audio_sec = 120
+#
+# Microphone device — name (substring match) or index number.
+# Run `home-stt devices` to list available devices.
+# mic_device = "MacBook Pro Microphone"
+# mic_device = 1
 
 # ── Beep feedback ────────────────────────────────────────────────────
 # beeps_enabled = true
@@ -312,3 +324,10 @@ def apply_to_module(cfg: dict[str, Any], module) -> None:
             parsed = _parse_key_set(val)
             if parsed is not None:
                 setattr(module, mod_attr, parsed)
+
+    mic = cfg.get("mic_device")
+    if mic is not None:
+        if isinstance(mic, int):
+            setattr(module, "MIC_DEVICE", mic)
+        else:
+            setattr(module, "MIC_DEVICE", str(mic))
