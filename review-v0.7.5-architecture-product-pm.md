@@ -86,7 +86,7 @@ class DaemonState:
 
 ### 改進建議
 
-#### P1. System Tray / Menu Bar 狀態指示器
+#### P1. System Tray / Menu Bar 狀態指示器（獨立 PR）
 
 **現狀**：daemon 在背景跑，用戶只能透過 terminal 看 `home-stt status` 或聽 beep。
 **問題**：
@@ -255,7 +255,7 @@ README 改為 `pip install home-stt[cuda]` 或 `pip install home-stt[mlx]`。
 | # | 建議 | Impact | Effort | 理由 |
 |---|------|--------|--------|------|
 | A1 | 拆分 monolith | ★★★★ | 3-5 天 | 降低認知負擔、改善可測試性 |
-| P1 | System Tray icon | ★★★★★ | 3-5 天 | 用戶體驗質變 — 從「不知道有沒有在跑」到「看得見」 |
+| P1 | System Tray icon（獨立 PR） | ★★★★★ | 3-5 天 | 用戶體驗質變 — 從「不知道有沒有在跑」到「看得見」 |
 | S3 | 結構化 logging | ★★★ | 2 天 | 為 monitoring / debug / plugin 打基礎 |
 | P2 | Onboarding wizard | ★★★★ | 3-4 天 | 降低 #1 掉坑點（macOS 權限 + Windows pip 順序）|
 
@@ -284,7 +284,7 @@ README 改為 `pip install home-stt[cuda]` 或 `pip install home-stt[mlx]`。
 - S5 競品比較文件
 
 ### Phase 2: 可見性 + 體驗（2-3 週）
-- P1 System Tray / Menu Bar icon
+- P1 System Tray / Menu Bar icon（獨立 PR）
 - S3 結構化 logging
 - P2 Onboarding wizard（`home-stt setup` / `home-stt doctor`）
 - P5 麥克風裝置選擇
