@@ -270,10 +270,14 @@ def _rss_mb(pid: int) -> float | None:
         return None
 
 
-def _read_log_lines() -> list[str]:
+def _read_log_lines(max_bytes: int = 64 * 1024) -> list[str]:
     log_path = Path(tempfile.gettempdir()) / "stt-daemon.log"
     try:
+        size = log_path.stat().st_size
         with open(log_path, encoding="utf-8", errors="replace") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()
             return f.readlines()
     except OSError:
         return []
@@ -291,7 +295,7 @@ def _recent_transcribes(lines: list[str], n: int = 10) -> list[str]:
 
 def _parse_startup_info(lines: list[str]) -> dict[str, str]:
     info: dict[str, str] = {}
-    for line in lines[:120]:
+    for line in lines[:80]:
         m = _STARTUP_BACKEND_PAT.search(line)
         if m and "backend" not in info:
             info["backend"] = f"{m.group(1).strip()} ({m.group(2).strip()})"
@@ -382,27 +386,30 @@ def _poll_dashboard():
 
     log_lines = _read_log_lines()
     startup_info = _parse_startup_info(log_lines)
-    if startup_info.get("backend"):
-        sys_lines.append(f"**STT Backend**　`{startup_info['backend']}`")
-    else:
+    cfg = None
+    if not startup_info.get("backend") or not startup_info.get("polish"):
         try:
             cfg = load_config()
-            backend = cfg.get("stt_backend") or "qwen3-asr (預設)"
-            model = cfg.get("stt_model") or "預設"
-            sys_lines.append(f"**STT Backend**　`{backend}` / `{model}`")
         except Exception:
-            sys_lines.append("**STT Backend**　—")
+            pass
+
+    if startup_info.get("backend"):
+        sys_lines.append(f"**STT Backend**　`{startup_info['backend']}`")
+    elif cfg:
+        backend = cfg.get("stt_backend") or "qwen3-asr (預設)"
+        model = cfg.get("stt_model") or "預設"
+        sys_lines.append(f"**STT Backend**　`{backend}` / `{model}`")
+    else:
+        sys_lines.append("**STT Backend**　—")
 
     if startup_info.get("polish"):
         sys_lines.append(f"**Polish 模型**　`{startup_info['polish']}`")
+    elif cfg:
+        pm = cfg.get("polish_model") or "預設"
+        pe = cfg.get("polish_enabled", True)
+        sys_lines.append(f"**Polish**　{'啟用' if pe else '停用'} / `{pm}`")
     else:
-        try:
-            cfg = load_config()
-            pm = cfg.get("polish_model") or "預設"
-            pe = cfg.get("polish_enabled", True)
-            sys_lines.append(f"**Polish**　{'啟用' if pe else '停用'} / `{pm}`")
-        except Exception:
-            sys_lines.append("**Polish**　—")
+        sys_lines.append("**Polish**　—")
 
     cfg_p = config_path()
     sys_lines.append(f"**Config 路徑**　`{cfg_p}`")
@@ -572,8 +579,11 @@ def _effective_config() -> dict:
     }
 
 
+_LOAD_FAILED = "LOAD_FAILED"
+
+
 def _ensure_models(model_state: dict) -> tuple[dict, str]:
-    if model_state.get("backend") is not None:
+    if model_state.get("_loaded"):
         return model_state, ""
 
     from stt_backends import build_backend
@@ -581,6 +591,7 @@ def _ensure_models(model_state: dict) -> tuple[dict, str]:
 
     cfg = _effective_config()
     errors: list[str] = []
+    polish_prompt = cfg.get("polish_prompt") or _POLISH_PROMPT
 
     backend = None
     try:
@@ -597,29 +608,25 @@ def _ensure_models(model_state: dict) -> tuple[dict, str]:
             "可能原因：torch CUDA wheel 未正確安裝，或 CUDA toolkit 版本不符。\n"
             "請嘗試：pip install torch --index-url https://download.pytorch.org/whl/cu124"
         )
-        backend = None
     except Exception as exc:
         logger.warning("playground: STT backend load failed: %s", exc)
         errors.append(f"STT 後端載入失敗：{exc}")
-        backend = None
 
     polisher = None
     try:
         polisher = build_polisher(
             enabled=cfg["polish_enabled"],
             model_name=cfg["polish_model"],
-            system_prompt=_POLISH_PROMPT,
+            system_prompt=polish_prompt,
         )
     except OSError as exc:
         logger.warning("playground: polisher DLL load failed: %s", exc)
         errors.append(f"Polish 模型 DLL 載入失敗：{exc}")
-        polisher = None
     except Exception as exc:
         logger.warning("playground: polisher load failed: %s", exc)
         errors.append(f"Polish 模型載入失敗：{exc}")
-        polisher = None
 
-    new_state = {"backend": backend, "polisher": polisher}
+    new_state = {"backend": backend, "polisher": polisher, "_loaded": True}
     err_msg = "\n".join(errors) if errors else ""
     return new_state, err_msg
 
@@ -711,8 +718,11 @@ def _run_voice_edit(selection_text: str, instruction_audio, instruction_text: st
         return "", "請先輸入要編輯的選取文字。", model_state
 
     model_state, load_err = _ensure_models(model_state)
-    if load_err and model_state.get("backend") is None and model_state.get("polisher") is None:
-        return "", f"模型載入錯誤：{load_err}", model_state
+    if load_err:
+        if model_state.get("backend") is None and model_state.get("polisher") is None:
+            return "", f"模型載入錯誤：{load_err}", model_state
+        if model_state.get("polisher") is None:
+            return "", f"Polish 模型載入失敗（Voice-Edit 需要 LLM）：{load_err}", model_state
 
     instruction = ""
     if instruction_audio is not None:
@@ -1992,7 +2002,7 @@ def main(port: int = 7860, share: bool = False) -> None:
     """Launch the web UI server."""
     app = create_app()
     app.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=port,
         share=share,
         theme=gr.themes.Soft(),

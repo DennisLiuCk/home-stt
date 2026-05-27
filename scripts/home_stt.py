@@ -635,11 +635,22 @@ def cmd_web(args) -> int:
     """Launch the Gradio web UI."""
     try:
         import stt_web
-    except ImportError:
-        print("home-stt: gradio not installed. Install with:\n"
-              "  pip install home-stt[web]", file=sys.stderr)
+    except ImportError as e:
+        if "gradio" in str(e).lower():
+            print("home-stt: gradio not installed. Install with:\n"
+                  "  pip install home-stt[web]", file=sys.stderr)
+        else:
+            print(f"home-stt: web UI import failed: {e}", file=sys.stderr)
         return 1
-    stt_web.main(port=args.port, share=args.share)
+    except OSError as e:
+        print(f"home-stt: web UI failed to load (DLL/library error): {e}",
+              file=sys.stderr)
+        return 1
+    try:
+        stt_web.main(port=args.port, share=args.share)
+    except OSError as e:
+        print(f"home-stt: web server failed: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
