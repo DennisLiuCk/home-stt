@@ -464,6 +464,92 @@ class _Qwen3TorchImpl:
         )
 
 
+class BreezeAsrBackend(STTBackend):
+    """MediaTek Breeze-ASR-25 — Whisper-large-v2 fine-tuned for Taiwanese
+    Mandarin + Mandarin-English code-switching.
+
+    Uses HuggingFace transformers ``AutomaticSpeechRecognitionPipeline`` with
+    ``chunk_length_s=0`` (sequential modeling, official recommendation for
+    best accuracy). 1.5B params, ~3 GB fp16.
+
+    Accepts:
+      - Fully qualified HF repo id ("MediaTek-Research/Breeze-ASR-25")
+      - Short alias "breeze-25" (case-insensitive)
+    """
+
+    name = "breeze-asr"
+
+    _DEFAULT_MODEL = "MediaTek-Research/Breeze-ASR-25"
+
+    def __init__(self, model_name: str, sample_rate: int = _DEFAULT_SAMPLE_RATE):
+        import torch
+        from transformers import (
+            AutomaticSpeechRecognitionPipeline,
+            WhisperForConditionalGeneration,
+            WhisperProcessor,
+        )
+
+        self.sample_rate = sample_rate
+        self._model_name = self._resolve_model_name(model_name)
+
+        try:
+            device = "cuda:0"
+            self._torch_dtype = torch.float16
+            processor = WhisperProcessor.from_pretrained(self._model_name)
+            model = WhisperForConditionalGeneration.from_pretrained(
+                self._model_name,
+                torch_dtype=torch.float16,
+            ).to(device).eval()
+            gpu_name = torch.cuda.get_device_name(0)
+            self._device_label_str = f"{gpu_name} (float16) — Breeze-ASR-25"
+        except Exception as e:
+            logger.info(f"CUDA load failed ({e}); falling back to CPU float32.")
+            device = "cpu"
+            self._torch_dtype = torch.float32
+            processor = WhisperProcessor.from_pretrained(self._model_name)
+            model = WhisperForConditionalGeneration.from_pretrained(
+                self._model_name,
+                torch_dtype=torch.float32,
+            ).eval()
+            self._device_label_str = "CPU (float32) — Breeze-ASR-25"
+
+        self._pipe = AutomaticSpeechRecognitionPipeline(
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            device=model.device,
+            torch_dtype=self._torch_dtype,
+            chunk_length_s=0,
+        )
+
+    @staticmethod
+    def _resolve_model_name(model_name: str) -> str:
+        if "/" in model_name:
+            return model_name
+        if "breeze" in model_name.lower():
+            return BreezeAsrBackend._DEFAULT_MODEL
+        return BreezeAsrBackend._DEFAULT_MODEL
+
+    @property
+    def device_label(self) -> str:
+        return self._device_label_str
+
+    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
+        result = self._pipe(
+            {"raw": samples, "sampling_rate": self.sample_rate},
+            return_timestamps=False,
+        )
+        text = (result.get("text") or "").strip()
+        return text, "zh"
+
+    def warmup(self) -> None:
+        warm_audio = np.zeros(self.sample_rate, dtype=np.float32)
+        self._pipe(
+            {"raw": warm_audio, "sampling_rate": self.sample_rate},
+            return_timestamps=False,
+        )
+
+
 def build_backend(name: str, model: str, sample_rate: int = _DEFAULT_SAMPLE_RATE) -> STTBackend:
     """Factory. To add a new backend: implement STTBackend in a new class,
     add a branch here, and update STT_BACKEND in the Config section."""
@@ -473,6 +559,8 @@ def build_backend(name: str, model: str, sample_rate: int = _DEFAULT_SAMPLE_RATE
         return MlxWhisperBackend(model, sample_rate)
     if name == "qwen3-asr":
         return Qwen3AsrBackend(model, sample_rate)
+    if name == "breeze-asr":
+        return BreezeAsrBackend(model, sample_rate)
     # ── Future backends ────────────────────────────────────────────────
     # elif name == "sense-voice":
     #     return SenseVoiceBackend(model)

@@ -31,6 +31,11 @@ mlx = [
 whisper = [
     "faster-whisper>=1.0",
 ]
+breeze-asr = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "accelerate>=0.20",
+]
 tray = [
     "pystray>=0.19",
     "Pillow>=9.0",
