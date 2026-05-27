@@ -35,6 +35,9 @@ tray = [
     "pystray>=0.19",
     "Pillow>=9.0",
 ]
+web = [
+    "gradio>=5.0",
+]
 dev = [
     "pytest>=7.0",
 ]
@@ -44,4 +47,4 @@ home-stt = "home_stt:main"
 
 [tool.setuptools]
 package-dir = {"" = "scripts"}
-py-modules = ["home_stt", "stt_config", "stt_audio", "stt_backends", "stt_platform", "stt_platform_mac", "stt_platform_win", "text_polisher"]
+py-modules = ["home_stt", "stt_config", "stt_audio", "stt_backends", "stt_platform", "stt_platform_mac", "stt_platform_win", "text_polisher", "stt_web"]
