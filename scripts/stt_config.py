@@ -168,7 +168,7 @@ _TEMPLATE = """\
 # Lines starting with # are comments. Uncomment and edit to override.
 
 # ── STT backend ──────────────────────────────────────────────────────
-# Available backends: "qwen3-asr", "faster-whisper", "mlx-whisper"
+# Available backends: "qwen3-asr", "faster-whisper", "mlx-whisper", "breeze-asr"
 # stt_backend = "qwen3-asr"
 # stt_model = "Qwen/Qwen3-ASR-0.6B"
 

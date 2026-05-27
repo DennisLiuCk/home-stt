@@ -1,0 +1,161 @@
+{
+  "_meta": {
+    "purpose": "ASR quality benchmark fixture — Breeze-ASR-25 vs Qwen3-ASR-0.6B evaluation.",
+    "audio_source": "Edge TTS (zh-TW-HsiaoChenNeural), resampled to 16 kHz mono WAV. Generate via: python scripts/gen_asr_bench_audio.py",
+    "schema": {
+      "id": "stable case id",
+      "category": "short_utterance | code_switching | pure_chinese | technical | punctuation | long_form | semantic",
+      "audio_path": "relative path from repo root to WAV file",
+      "ground_truth": "expected transcription (reference text)",
+      "must_contain": "substrings the ASR output MUST contain",
+      "must_not_contain": "substrings that MUST NOT appear",
+      "note": "human-readable rationale"
+    }
+  },
+  "cases": [
+    {
+      "id": "short_single_syllable",
+      "category": "short_utterance",
+      "audio_path": "tests/fixtures/audio/short_single_syllable.wav",
+      "ground_truth": "好",
+      "must_contain": ["好"],
+      "must_not_contain": [],
+      "note": "最短單音節回應"
+    },
+    {
+      "id": "short_agreement",
+      "category": "short_utterance",
+      "audio_path": "tests/fixtures/audio/short_agreement.wav",
+      "ground_truth": "對啊就是這樣",
+      "must_contain": ["對"],
+      "must_not_contain": [],
+      "note": "短句口語回應"
+    },
+    {
+      "id": "short_request",
+      "category": "short_utterance",
+      "audio_path": "tests/fixtures/audio/short_request.wav",
+      "ground_truth": "幫我改一下",
+      "must_contain": ["幫我"],
+      "must_not_contain": [],
+      "note": "短句請求"
+    },
+    {
+      "id": "codesw_review_commit",
+      "category": "code_switching",
+      "audio_path": "tests/fixtures/audio/codesw_review_commit.wav",
+      "ground_truth": "幫我review這個commit然後push到main",
+      "must_contain": ["review", "commit", "push", "main"],
+      "must_not_contain": ["提交", "推送"],
+      "note": "中英混合技術動詞 — 英文關鍵字不應被翻譯"
+    },
+    {
+      "id": "codesw_python_function",
+      "category": "code_switching",
+      "audio_path": "tests/fixtures/audio/codesw_python_function.wav",
+      "ground_truth": "這個Python function的async部分需要改",
+      "must_contain": ["Python", "function", "async"],
+      "must_not_contain": ["函式", "函數", "非同步"],
+      "note": "英文技術關鍵字必須保留原文"
+    },
+    {
+      "id": "codesw_prebuilt_wheel",
+      "category": "code_switching",
+      "audio_path": "tests/fixtures/audio/codesw_prebuilt_wheel.wav",
+      "ground_truth": "找不到prebuilt wheel只好自己compile",
+      "must_contain": ["prebuilt", "wheel", "compile"],
+      "must_not_contain": ["預建", "輪子", "編譯"],
+      "note": "英文技術名詞不應音譯或翻譯"
+    },
+    {
+      "id": "pure_zh_problem",
+      "category": "pure_chinese",
+      "audio_path": "tests/fixtures/audio/pure_zh_problem.wav",
+      "ground_truth": "我剛剛在測試這個工具的過程中，發現了一個小問題。",
+      "must_contain": ["測試", "工具", "問題"],
+      "must_not_contain": [],
+      "note": "純中文多句含標點"
+    },
+    {
+      "id": "pure_zh_multi_sentence",
+      "category": "pure_chinese",
+      "audio_path": "tests/fixtures/audio/pure_zh_multi_sentence.wav",
+      "ground_truth": "目前我輸出的文字都是透過這個工具來輸出。你可以發現前面的句子是沒有標點符號，後面又突然出現標點符號，請幫我分析一下。",
+      "must_contain": ["輸出", "標點符號", "分析"],
+      "must_not_contain": [],
+      "note": "長段落多句含句號 — 標點保留是關鍵指標"
+    },
+    {
+      "id": "tech_identifier",
+      "category": "technical",
+      "audio_path": "tests/fixtures/audio/tech_identifier.wav",
+      "ground_truth": "把_USE_TORCH_COMPILE設成True試試",
+      "must_contain": ["TORCH", "COMPILE", "True"],
+      "must_not_contain": [],
+      "note": "技術識別符 — TTS 無法唸底線，ground truth 含底線用於 CER 參考"
+    },
+    {
+      "id": "tech_numbers",
+      "category": "technical",
+      "audio_path": "tests/fixtures/audio/tech_numbers.wav",
+      "ground_truth": "polish從4.26秒降到1.9秒",
+      "must_contain": ["4.26", "1.9"],
+      "must_not_contain": [],
+      "note": "數字精度保留 — ASR 不應改動數字"
+    },
+    {
+      "id": "tech_pytorch_transformers",
+      "category": "code_switching",
+      "audio_path": "tests/fixtures/audio/tech_pytorch_transformers.wav",
+      "ground_truth": "PyTorch跟transformers都要先裝好",
+      "must_contain": ["PyTorch", "transformers"],
+      "must_not_contain": [],
+      "note": "品牌/套件名必須保留原文"
+    },
+    {
+      "id": "punct_question",
+      "category": "punctuation",
+      "audio_path": "tests/fixtures/audio/punct_question.wav",
+      "ground_truth": "你可以透過GH CLI來確認pipeline的執行狀況嗎？",
+      "must_contain": ["pipeline"],
+      "must_not_contain": [],
+      "note": "問號保留 + 英文術語保留"
+    },
+    {
+      "id": "punct_mixed_comma_question",
+      "category": "punctuation",
+      "audio_path": "tests/fixtures/audio/punct_mixed_comma_question.wav",
+      "ground_truth": "是我需要有講話有停頓，然後才會有標點符號，還是其他原因？",
+      "must_contain": ["停頓", "標點符號"],
+      "must_not_contain": [],
+      "note": "逗號 + 問號混合標點"
+    },
+    {
+      "id": "long_technical_paragraph",
+      "category": "long_form",
+      "audio_path": "tests/fixtures/audio/long_technical_paragraph.wav",
+      "ground_truth": "我們目前的架構是用Qwen3 ASR做語音辨識，然後接一個Qwen3 4B的polish模型做後處理。整個pipeline的延遲大概在3到5秒左右，主要瓶頸在decoder。我想評估看看MediaTek的Breeze ASR模型是否能改善辨識品質，特別是在中英混合的場景。",
+      "must_contain": ["ASR", "pipeline", "decoder", "Breeze"],
+      "must_not_contain": [],
+      "note": "長段落技術描述 — 多個英文術語 + 多句結構"
+    },
+    {
+      "id": "fact_int4_slower",
+      "category": "semantic",
+      "audio_path": "tests/fixtures/audio/fact_int4_slower.wav",
+      "ground_truth": "INT4量化在這台機器上反而更慢",
+      "must_contain": ["更慢"],
+      "must_not_contain": ["更快"],
+      "note": "語義保真 — 「更慢」不可被反轉為「更快」"
+    },
+    {
+      "id": "subject_help_me",
+      "category": "semantic",
+      "audio_path": "tests/fixtures/audio/subject_help_me.wav",
+      "ground_truth": "幫我改一下這段程式碼",
+      "must_contain": ["幫我", "程式碼"],
+      "must_not_contain": ["幫你"],
+      "note": "主詞保留 — 「幫我」不可變成「幫你」"
+    }
+  ]
+}
