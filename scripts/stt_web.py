@@ -123,67 +123,417 @@ def _daemon_version() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 CUSTOM_CSS = """
+/* ═══════════════════════════════════════════════════════════════════════
+   home-stt · "Luminous Editorial"
+   A bright, airy interface — warm paper canvas, jade accent, amber highlights,
+   an elegant Fraunces wordmark over Manrope, floating cards, soft motion.
+   ═══════════════════════════════════════════════════════════════════════ */
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap');
+
+:root {
+    --stt-bg:         #FBFAF7;
+    --stt-surface:    #FFFFFF;
+    --stt-ink:        #22302C;
+    --stt-muted:      #6E7B75;
+    --stt-faint:      #9AA39C;
+    --stt-border:     #ECE7DD;
+    --stt-jade:       #12A48E;
+    --stt-jade-deep:  #0E8C7C;
+    --stt-jade-soft:  #E6F4F0;
+    --stt-amber:      #C8852A;
+    --stt-coral:      #E0533D;
+    --stt-serif: 'Fraunces','Noto Serif TC', Georgia, 'Songti TC', serif;
+    --stt-sans:  'Manrope','Noto Sans TC','PingFang TC','Microsoft JhengHei', ui-sans-serif, system-ui, sans-serif;
+    --stt-mono:  'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+/* ── Atmosphere: a fixed, full-viewport glow behind everything ─────────── */
+body { background: var(--stt-bg) !important; }
+gradio-app, .gradio-container, .main, .wrap { background: transparent !important; }
+
+body::before {
+    content: ''; position: fixed; inset: 0; z-index: -2; pointer-events: none;
+    background:
+        radial-gradient(900px 520px at 8% -10%,  rgba(18,164,142,.12), transparent 60%),
+        radial-gradient(820px 480px at 104% -6%, rgba(200,133,42,.10), transparent 55%),
+        radial-gradient(760px 760px at 50% 122%, rgba(18,164,142,.07), transparent 60%),
+        var(--stt-bg);
+}
+body::after {
+    content: ''; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .55;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+    background-size: 140px 140px;
+}
+
+.gradio-container {
+    max-width: 1160px !important;
+    margin: 0 auto !important;
+    padding: 0 1.4rem 3rem !important;
+    font-family: var(--stt-sans) !important;
+    color: var(--stt-ink);
+}
+
+/* Hide Gradio's default footer for a cleaner canvas */
+.gradio-container > footer,
+footer.svelte-1ax1toq, footer { display: none !important; }
+
 /* ── Header ────────────────────────────────────────────────────────────── */
 .app-header {
     text-align: center;
-    padding: 1.2rem 1rem 0.6rem;
+    padding: 2.6rem 1rem 1.4rem;
+    animation: sttRise .7s cubic-bezier(.22,1,.36,1) both;
 }
-.app-header h1 {
-    font-size: 1.75rem;
-    font-weight: 700;
-    margin-bottom: 0.15rem;
-    letter-spacing: 0.03em;
+.app-badge {
+    width: 66px; height: 66px; margin: 0 auto 1.1rem;
+    border-radius: 20px;
+    display: flex; align-items: center; justify-content: center; gap: 4px;
+    background: linear-gradient(145deg, #15B7A0 0%, #0E8C7C 100%);
+    box-shadow: 0 12px 30px -10px rgba(16,140,124,.55),
+                inset 0 1px 0 rgba(255,255,255,.35);
+}
+.app-badge .bar {
+    width: 4px; border-radius: 4px; background: rgba(255,255,255,.92);
+    animation: sttWave 1.1s ease-in-out infinite;
+}
+.app-badge .bar:nth-child(1) { height: 14px; animation-delay: 0s;    }
+.app-badge .bar:nth-child(2) { height: 26px; animation-delay: .15s;  }
+.app-badge .bar:nth-child(3) { height: 34px; animation-delay: .3s;   }
+.app-badge .bar:nth-child(4) { height: 22px; animation-delay: .45s;  }
+.app-badge .bar:nth-child(5) { height: 12px; animation-delay: .6s;   }
+
+.app-eyebrow {
+    font-family: var(--stt-sans);
+    font-size: .72rem; font-weight: 700;
+    letter-spacing: .42em; text-indent: .42em;
+    text-transform: uppercase;
+    color: var(--stt-jade-deep);
+    opacity: .85; margin-bottom: .55rem;
+}
+.app-header h1, .app-wordmark {
+    font-family: var(--stt-serif) !important;
+    font-optical-sizing: auto;
+    font-size: 3.05rem; line-height: 1; font-weight: 600;
+    letter-spacing: -.01em; margin: 0 0 .5rem;
+    background: linear-gradient(135deg, #1B3A33 0%, #0E8C7C 70%, #15B7A0 100%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: transparent;
 }
 .app-header .subtitle {
-    font-size: 0.92rem;
-    opacity: 0.65;
-    font-weight: 400;
+    font-size: .98rem; font-weight: 500;
+    color: var(--stt-muted); letter-spacing: .01em;
 }
+.app-header .rule {
+    width: 54px; height: 2px; margin: 1.1rem auto 0;
+    border-radius: 2px;
+    background: linear-gradient(90deg, transparent, var(--stt-jade), transparent);
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────────── */
+.tabs { animation: sttRise .7s cubic-bezier(.22,1,.36,1) .08s both; }
+.tab-nav {
+    border-bottom: 1px solid var(--stt-border) !important;
+    gap: .35rem !important; margin-bottom: 1.4rem !important;
+    justify-content: center;
+}
+.tab-nav button {
+    font-family: var(--stt-sans) !important;
+    font-weight: 600 !important; font-size: .96rem !important;
+    color: var(--stt-muted) !important;
+    background: transparent !important; border: none !important;
+    padding: .7rem 1.15rem !important; margin-bottom: -1px;
+    border-radius: 12px 12px 0 0 !important;
+    position: relative; transition: color .2s ease, background .2s ease;
+}
+.tab-nav button:hover { color: var(--stt-jade-deep) !important; background: rgba(18,164,142,.06) !important; }
+.tab-nav button.selected { color: var(--stt-jade-deep) !important; background: transparent !important; }
+.tab-nav button.selected::after {
+    content: ''; position: absolute; left: 1.05rem; right: 1.05rem; bottom: -1px; height: 3px;
+    border-radius: 3px 3px 0 0;
+    background: linear-gradient(90deg, var(--stt-jade), var(--stt-jade-deep));
+}
+.tabitem { min-height: 440px; padding-top: .4rem !important; }
+
+/* ── Cards / blocks ────────────────────────────────────────────────────── */
+.block, .gr-group, .form, .gr-box {
+    border-radius: 18px !important;
+}
+.gr-group, .gradio-group {
+    background: var(--stt-surface) !important;
+    border: 1px solid var(--stt-border) !important;
+    box-shadow: 0 1px 2px rgba(34,48,44,.04), 0 14px 34px -22px rgba(34,48,44,.22) !important;
+}
+
+/* ── Accordions ────────────────────────────────────────────────────────── */
+.gradio-accordion {
+    border: 1px solid var(--stt-border) !important;
+    border-radius: 16px !important;
+    background: var(--stt-surface) !important;
+    box-shadow: 0 1px 2px rgba(34,48,44,.03), 0 14px 30px -24px rgba(34,48,44,.20) !important;
+    overflow: hidden;
+}
+.label-wrap {
+    font-family: var(--stt-sans) !important;
+    font-weight: 700 !important; font-size: 1rem !important;
+    color: var(--stt-ink) !important;
+    padding: .35rem 0 !important;
+}
+.label-wrap > span:first-child { display: inline-flex; align-items: center; }
+.label-wrap > span:first-child::before {
+    content: ''; display: inline-block;
+    width: 4px; height: 1.05em; margin-right: .65rem;
+    border-radius: 3px;
+    background: linear-gradient(180deg, var(--stt-jade), var(--stt-jade-deep));
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.gradio-container button.primary,
+.gradio-container button.secondary,
+.gradio-container button.stop {
+    font-family: var(--stt-sans) !important;
+    font-weight: 700 !important; letter-spacing: .01em;
+    border-radius: 12px !important;
+    transition: transform .15s ease, box-shadow .22s ease, filter .2s ease !important;
+}
+.gradio-container button.primary {
+    background: linear-gradient(135deg, #15B7A0 0%, #0E8C7C 100%) !important;
+    border: none !important; color: #fff !important;
+    box-shadow: 0 8px 20px -8px rgba(16,140,124,.6) !important;
+}
+.gradio-container button.primary:hover { transform: translateY(-1px); filter: brightness(1.04); box-shadow: 0 12px 26px -8px rgba(16,140,124,.7) !important; }
+.gradio-container button.secondary {
+    background: var(--stt-surface) !important;
+    border: 1px solid var(--stt-border) !important;
+    color: var(--stt-ink) !important;
+}
+.gradio-container button.secondary:hover { transform: translateY(-1px); border-color: var(--stt-jade) !important; color: var(--stt-jade-deep) !important; background: var(--stt-jade-soft) !important; }
+.gradio-container button.stop {
+    background: linear-gradient(135deg, #F26B53 0%, #E0533D 100%) !important;
+    border: none !important; color: #fff !important;
+    box-shadow: 0 8px 20px -8px rgba(224,83,61,.55) !important;
+}
+.gradio-container button.stop:hover { transform: translateY(-1px); filter: brightness(1.04); }
+.gradio-container button:active { transform: translateY(0) !important; }
+
+/* ── Unified button icons (custom line set, inherits the button text colour) ─ */
+.gradio-container button.btn-ico { display: inline-flex !important; align-items: center; justify-content: center; }
+.gradio-container button.btn-ico::before {
+    content: ''; width: 1.12em; height: 1.12em; margin-right: .55em; flex: 0 0 auto;
+    background-color: currentColor;
+    -webkit-mask: var(--btn-ico) center / contain no-repeat;
+            mask: var(--btn-ico) center / contain no-repeat;
+}
+.gradio-container button.i-play     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M7 5l12 7-12 7z' fill='%23000'/></svg>"); }
+.gradio-container button.i-stop     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='6' y='6' width='12' height='12' rx='2.5' fill='%23000'/></svg>"); }
+.gradio-container button.i-restart  { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 12a9 9 0 1 1-2.6-6.4'/><path d='M21 4v5h-5'/></svg>"); }
+.gradio-container button.i-refresh  { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12a9 9 0 0 1 14.8-6.9L21 8'/><path d='M21 3v5h-5'/><path d='M21 12a9 9 0 0 1-14.8 6.9L3 16'/><path d='M3 21v-5h5'/></svg>"); }
+.gradio-container button.i-wave     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'><path d='M4 10v4'/><path d='M9 6v12'/><path d='M14 8v8'/><path d='M19 11v2'/></svg>"); }
+.gradio-container button.i-edit     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20h9'/><path d='M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z'/></svg>"); }
+.gradio-container button.i-polish   { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'><path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z'/></svg>"); }
+.gradio-container button.i-save     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z'/><path d='M17 21v-8H7v8'/><path d='M7 3v5h7'/></svg>"); }
+.gradio-container button.i-reset    { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9 14L4 9l5-5'/><path d='M4 9h11a5 5 0 0 1 0 10h-3'/></svg>"); }
+.gradio-container button.i-activity { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12h4l3 8 4-16 3 8h4'/></svg>"); }
+
+/* ── Fix: keep leading bold glyphs from clipping at the content edge ─────── */
+.gradio-container { overflow-x: visible !important; }
+.gradio-container .prose, .gradio-container .md { padding-left: 4px !important; overflow: visible !important; }
+.gradio-container .prose :is(p, li, strong, h1, h2, h3, h4),
+.gradio-container .md :is(p, li, strong, h1, h2, h3, h4) { overflow: visible; }
+
+/* ── Inputs ────────────────────────────────────────────────────────────── */
+textarea, input[type=text], input[type=number], .gr-input {
+    font-family: var(--stt-sans) !important;
+    border-radius: 12px !important;
+}
+textarea:focus, input[type=text]:focus, input[type=number]:focus {
+    border-color: var(--stt-jade) !important;
+    box-shadow: 0 0 0 3px rgba(18,164,142,.16) !important;
+}
+.gr-input-label, label span { font-family: var(--stt-sans) !important; }
+
+/* ── Markdown / prose ──────────────────────────────────────────────────── */
+.prose, .md { font-family: var(--stt-sans) !important; color: var(--stt-ink); }
+.prose h1, .prose h2, .prose h3, .md h1, .md h2, .md h3 {
+    font-family: var(--stt-serif) !important;
+    font-weight: 600 !important; letter-spacing: -.01em;
+    color: var(--stt-ink) !important;
+}
+.prose h2, .md h2 { font-size: 1.7rem !important; margin-top: .3rem; }
+.prose h3, .md h3 { font-size: 1.18rem !important; }
+.prose a, .md a { color: var(--stt-jade-deep) !important; text-decoration-color: rgba(18,164,142,.4); text-underline-offset: 3px; }
+.prose a:hover, .md a:hover { color: var(--stt-jade) !important; }
+.prose hr, .md hr {
+    border: none !important; height: 1px !important; margin: 1.6rem 0 !important;
+    background: linear-gradient(90deg, transparent, var(--stt-border) 18%, var(--stt-border) 82%, transparent) !important;
+}
+.prose code, .md code {
+    font-family: var(--stt-mono) !important; font-size: .86em;
+    background: #F1EDE4 !important; color: var(--stt-jade-deep) !important;
+    padding: .12em .42em !important; border-radius: 6px !important;
+}
+.prose pre, .md pre {
+    background: #1F2A28 !important; border-radius: 14px !important;
+    border: 1px solid rgba(0,0,0,.06);
+}
+.prose pre code, .md pre code { background: transparent !important; color: #E8EEE9 !important; }
+.prose blockquote, .md blockquote {
+    border-left: 3px solid var(--stt-jade) !important;
+    background: var(--stt-jade-soft) !important;
+    border-radius: 0 10px 10px 0; padding: .55rem .95rem !important;
+    color: var(--stt-ink) !important; font-style: normal;
+}
+.prose table, .md table { border-radius: 12px !important; overflow: hidden; border: 1px solid var(--stt-border); }
+.prose thead th, .md thead th { background: var(--stt-jade-soft) !important; color: var(--stt-jade-deep) !important; font-weight: 700 !important; }
+
+/* ── Status banner (Dashboard) ─────────────────────────────────────────── */
+.stt-banner {
+    display: flex; align-items: center; gap: .85rem;
+    padding: 1rem 1.35rem; border-radius: 16px;
+    font-family: var(--stt-sans);
+    border: 1px solid var(--stt-border);
+    background: var(--stt-surface);
+    box-shadow: 0 1px 2px rgba(34,48,44,.04), 0 16px 34px -24px rgba(34,48,44,.28);
+    animation: sttRise .5s cubic-bezier(.22,1,.36,1) both;
+}
+.stt-banner__dot {
+    width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--stt-faint);
+}
+.stt-banner__caption {
+    font-size: .74rem; font-weight: 700; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--stt-muted);
+}
+.stt-banner__value {
+    margin-left: auto;
+    font-size: 1.18rem; font-weight: 700; letter-spacing: .02em;
+    color: var(--stt-ink);
+}
+.stt-banner--idle       { background: linear-gradient(180deg,#F3F7F4,#FFFFFF); }
+.stt-banner--idle       .stt-banner__dot   { background: #5E8C80; }
+.stt-banner--idle       .stt-banner__value { color: #2C3E38; }
+.stt-banner--recording  { background: linear-gradient(180deg,#FDEEEB,#FFFFFF); border-color:#F4D2CB; }
+.stt-banner--recording  .stt-banner__dot   { background: var(--stt-coral); animation: sttPulse 1.4s ease-out infinite; }
+.stt-banner--recording  .stt-banner__value { color: #9A3422; }
+.stt-banner--processing { background: linear-gradient(180deg,#FBF3E3,#FFFFFF); border-color:#F0DEB6; }
+.stt-banner--processing .stt-banner__dot   { background: var(--stt-amber); animation: sttPulse 1.6s ease-out infinite; }
+.stt-banner--processing .stt-banner__value { color: #7A521A; }
+.stt-banner--stopped    { background: linear-gradient(180deg,#F2F0EA,#FFFFFF); }
+.stt-banner--stopped    .stt-banner__dot   { background: #9A958A; }
+.stt-banner--stopped    .stt-banner__value { color: #50574E; }
 
 /* ── Footer ────────────────────────────────────────────────────────────── */
 .app-footer {
     text-align: center;
-    padding: 0.8rem 1rem;
-    font-size: 0.82rem;
-    opacity: 0.55;
-    border-top: 1px solid var(--border-color-primary);
-    margin-top: 1.5rem;
+    margin-top: 2.4rem; padding: 1.4rem 1rem 0;
+    font-family: var(--stt-mono);
+    font-size: .76rem; letter-spacing: .04em;
+    color: var(--stt-faint);
+    border-top: 1px solid var(--stt-border);
+}
+.app-footer .sep { color: var(--stt-jade); opacity: .7; margin: 0 .6rem; }
+
+/* ── Scrollbar & selection ─────────────────────────────────────────────── */
+::selection { background: rgba(18,164,142,.20); color: var(--stt-ink); }
+*::-webkit-scrollbar { width: 11px; height: 11px; }
+*::-webkit-scrollbar-thumb {
+    background: #D8D2C6; border-radius: 9px;
+    border: 3px solid transparent; background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--stt-jade); background-clip: content-box; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Keyframes ─────────────────────────────────────────────────────────── */
+@keyframes sttRise  { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes sttWave  { 0%,100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
+@keyframes sttPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(224,83,61,.5); }
+    70%  { box-shadow: 0 0 0 10px rgba(224,83,61,0); }
+    100% { box-shadow: 0 0 0 0 rgba(224,83,61,0); }
 }
 
-/* ── Status banner colours ─────────────────────────────────────────────── */
-.status-idle       { background: #6b7280; color: #fff; }
-.status-recording  { background: #dc2626; color: #fff; }
-.status-processing { background: #d97706; color: #fff; }
-.status-stopped    { background: #374151; color: #fff; }
-
-/* ── General spacing tweaks ────────────────────────────────────────────── */
-.gradio-container {
-    max-width: 1200px !important;
-    margin: 0 auto;
-}
-
-/* Accordion headers */
-.gradio-accordion > .label-wrap {
-    font-weight: 600 !important;
-}
-
-/* Button row spacing */
-.button-row .gr-button {
-    min-width: 120px;
-}
-
-/* ── Dark-mode adjustments ─────────────────────────────────────────────── */
-@media (prefers-color-scheme: dark) {
-    .status-idle       { background: #4b5563; }
-    .status-stopped    { background: #1f2937; }
-    .app-footer        { border-top-color: #374151; }
-}
-
-/* ── Tab panel min height so short tabs don't collapse ─────────────────── */
-.tabitem {
-    min-height: 420px;
+@media (prefers-reduced-motion: reduce) {
+    .app-header, .tabs, .stt-banner { animation: none !important; }
+    .app-badge .bar, .stt-banner__dot { animation: none !important; }
+    .gradio-container button:hover { transform: none !important; }
 }
 """
+
+
+# ── Force a bright (light) palette regardless of the OS dark-mode setting ──
+# Gradio reads the `__theme` query param at render time; redirect once to pin
+# it to "light" so the "明亮優雅" look is guaranteed.
+_FORCE_LIGHT_HEAD = """
+<script>
+(function () {
+    try {
+        var u = new URL(window.location.href);
+        if (u.searchParams.get('__theme') !== 'light') {
+            u.searchParams.set('__theme', 'light');
+            window.location.replace(u.toString());
+        }
+    } catch (e) {}
+})();
+</script>
+"""
+
+
+def _build_theme() -> gr.themes.Base:
+    """A warm, luminous light theme: jade primary, amber accents, paper neutrals."""
+    return gr.themes.Soft(
+        primary_hue=gr.themes.colors.emerald,
+        secondary_hue=gr.themes.colors.amber,
+        neutral_hue=gr.themes.colors.stone,
+        spacing_size=gr.themes.sizes.spacing_lg,
+        radius_size=gr.themes.sizes.radius_lg,
+        text_size=gr.themes.sizes.text_md,
+        font=[
+            gr.themes.GoogleFont("Manrope"),
+            "Noto Sans TC", "PingFang TC", "Microsoft JhengHei",
+            "ui-sans-serif", "system-ui", "sans-serif",
+        ],
+        font_mono=[
+            gr.themes.GoogleFont("JetBrains Mono"),
+            "ui-monospace", "SFMono-Regular", "monospace",
+        ],
+    ).set(
+        # Canvas & surfaces
+        body_background_fill="#FBFAF7",
+        background_fill_primary="#FFFFFF",
+        background_fill_secondary="#F6F3EC",
+        block_background_fill="#FFFFFF",
+        panel_background_fill="#FFFFFF",
+        # Text
+        body_text_color="#22302C",
+        body_text_color_subdued="#6E7B75",
+        block_title_text_color="#22302C",
+        block_title_text_weight="700",
+        block_label_text_color="#6E7B75",
+        # Borders & radii
+        border_color_primary="#ECE7DD",
+        block_border_color="#ECE7DD",
+        block_border_width="1px",
+        input_border_color="#E4DED2",
+        block_radius="18px",
+        input_radius="12px",
+        # Shadows
+        block_shadow="0 1px 2px rgba(34,48,44,0.04), 0 14px 34px -22px rgba(34,48,44,0.22)",
+        # Primary buttons (jade gradient)
+        button_primary_background_fill="linear-gradient(135deg, #15B7A0 0%, #0E8C7C 100%)",
+        button_primary_background_fill_hover="linear-gradient(135deg, #18C6AD 0%, #109A88 100%)",
+        button_primary_text_color="#FFFFFF",
+        button_primary_border_color="rgba(0,0,0,0)",
+        # Secondary buttons (paper)
+        button_secondary_background_fill="#FFFFFF",
+        button_secondary_background_fill_hover="#F4F1EA",
+        button_secondary_text_color="#2B3A35",
+        button_secondary_border_color="#E2DCD0",
+        # Inputs
+        input_background_fill="#FCFBF8",
+        input_background_fill_focus="#FFFFFF",
+        # Accents & links
+        color_accent_soft="#E6F4F0",
+        link_text_color="#0E8C7C",
+        link_text_color_hover="#12A48E",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -200,12 +550,16 @@ _STATE_LABELS = {
     "stopped":    "已停止",
 }
 
-_STATE_COLORS: dict[str, tuple[str, str]] = {
-    "idle":       ("#6b7280", "#ffffff"),
-    "recording":  ("#dc2626", "#ffffff"),
-    "processing": ("#d97706", "#ffffff"),
-    "stopped":    ("#374151", "#ffffff"),
-}
+def _banner_html(state: str, label: str) -> str:
+    """Render the dashboard status banner as a styled pill (see .stt-banner CSS)."""
+    key = state if state in _STATE_LABELS else "stopped"
+    return (
+        f'<div class="stt-banner stt-banner--{key}">'
+        f'<span class="stt-banner__dot"></span>'
+        f'<span class="stt-banner__caption">系統狀態</span>'
+        f'<span class="stt-banner__value">{label}</span>'
+        f'</div>'
+    )
 
 _TRANSCRIBE_PAT = re.compile(
     r"\[stt\]\s+(zh|en|ja|ko|EDIT|voice-edit|empty|too short|silent)"
@@ -327,33 +681,17 @@ def _poll_dashboard():
     data = read_state()
     state = data["state"] if data else "stopped"
     label = _STATE_LABELS.get(state, state)
-    bg, fg = _STATE_COLORS.get(state, _STATE_COLORS["stopped"])
-
-    icon_map = {
-        "idle":       "⚫",
-        "recording":  "🔴",
-        "processing": "🟡",
-        "stopped":    "⬛",
-    }
-    icon = icon_map.get(state, "⬛")
-    banner_html = (
-        f'<div style="background:{bg};color:{fg};padding:14px 20px;'
-        f'border-radius:8px;font-size:1.15rem;font-weight:600;'
-        f'text-align:center;letter-spacing:.04em;">'
-        f'{icon}&nbsp; 系統狀態：{label}'
-        f'</div>'
-    )
+    banner_html = _banner_html(state, label)
 
     # Status markdown
     pid = _read_pid()
     lines: list[str] = []
-    state_emoji = {"idle": "🔵", "recording": "🔴", "processing": "🟡", "stopped": "⬛"}.get(state, "⚫")
-    lines.append(f"**狀態**　{state_emoji} {label}")
+    lines.append(f"**狀態**　{label}")
 
     if data and data.get("edit_mode"):
-        lines.append("**模式**　✏️ Voice-Edit")
+        lines.append("**模式**　Voice-Edit")
     elif state not in ("stopped",):
-        lines.append("**模式**　🎤 Dictate")
+        lines.append("**模式**　Dictate")
 
     if pid is not None:
         lines.append(f"**PID**　`{pid}`")
@@ -470,17 +808,15 @@ def _do_restart():
 def build_dashboard_tab():
     with gr.Tab("儀表板", id="dashboard"):
         banner = gr.HTML(
-            value='<div style="background:#374151;color:#fff;padding:14px 20px;'
-                  'border-radius:8px;font-size:1.15rem;font-weight:600;'
-                  'text-align:center;">⬛&nbsp; 系統狀態：載入中...</div>',
+            value=_banner_html("stopped", "載入中…"),
             label=None,
         )
 
         with gr.Row():
-            btn_start   = gr.Button("▶ 啟動 Daemon",  variant="primary",  scale=1)
-            btn_stop    = gr.Button("⏹ 停止 Daemon",  variant="stop",     scale=1)
-            btn_restart = gr.Button("🔄 重啟 Daemon",  variant="secondary", scale=1)
-            btn_refresh = gr.Button("⟳ 立即重新整理", variant="secondary", scale=1)
+            btn_start   = gr.Button("啟動 Daemon",  variant="primary",   scale=1, elem_classes=["btn-ico", "i-play"])
+            btn_stop    = gr.Button("停止 Daemon",  variant="stop",      scale=1, elem_classes=["btn-ico", "i-stop"])
+            btn_restart = gr.Button("重啟 Daemon",  variant="secondary", scale=1, elem_classes=["btn-ico", "i-restart"])
+            btn_refresh = gr.Button("立即重新整理", variant="secondary", scale=1, elem_classes=["btn-ico", "i-refresh"])
 
         ctrl_output = gr.Textbox(
             label="指令輸出",
@@ -494,15 +830,15 @@ def build_dashboard_tab():
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=1):
-                gr.Markdown("### 🔵 即時狀態")
+                gr.Markdown("### 即時狀態")
                 status_md = gr.Markdown("_載入中..._")
             with gr.Column(scale=1):
-                gr.Markdown("### 💻 系統資訊")
+                gr.Markdown("### 系統資訊")
                 sys_info_md = gr.Markdown("_載入中..._")
 
         gr.Markdown("---")
 
-        with gr.Accordion("📋 最近轉錄記錄（最多 10 筆）", open=True):
+        with gr.Accordion("最近轉錄記錄（最多 10 筆）", open=True):
             recent_md = gr.Markdown("_載入中..._")
 
         timer = gr.Timer(2)
@@ -813,7 +1149,7 @@ def build_playground_tab():
         gr.Markdown(f"> {_GPU_WARNING}")
 
         # Section 1 — Voice-to-Text
-        with gr.Accordion("🎙️ 語音轉文字 (STT)", open=True):
+        with gr.Accordion("語音轉文字 (STT)", open=True):
             gr.Markdown(
                 "錄製或上傳音訊，點擊「**轉錄**」即可得到原始 ASR 結果、後處理結果與 Polish 結果。"
             )
@@ -824,7 +1160,7 @@ def build_playground_tab():
                         type="numpy",
                         label="音訊輸入（錄音 / 上傳）",
                     )
-                    stt_transcribe_btn = gr.Button("🔍 轉錄", variant="primary", size="lg")
+                    stt_transcribe_btn = gr.Button("轉錄", variant="primary", size="lg", elem_classes=["btn-ico", "i-wave"])
 
                 with gr.Column(scale=2):
                     with gr.Row():
@@ -858,7 +1194,7 @@ def build_playground_tab():
             )
 
         # Section 2 — Voice-Edit
-        with gr.Accordion("✏️ 語音編輯 (Voice-Edit)", open=False):
+        with gr.Accordion("語音編輯 (Voice-Edit)", open=False):
             gr.Markdown(
                 "選取要編輯的文字，並用語音（或文字）說出編輯指令。"
                 "LLM 會依照指令修改選取文字。"
@@ -877,7 +1213,7 @@ def build_playground_tab():
                         label="文字指令（備用）", lines=2,
                         placeholder="如未錄音，可在此輸入指令，例如：改成更正式的書面語",
                     )
-                    edit_btn = gr.Button("✏️ 編輯", variant="primary", size="lg")
+                    edit_btn = gr.Button("編輯", variant="primary", size="lg", elem_classes=["btn-ico", "i-edit"])
 
                 with gr.Column(scale=1):
                     edit_result_out = gr.Textbox(
@@ -912,7 +1248,7 @@ def build_playground_tab():
                     )
 
         # Section 3 — Text Polish
-        with gr.Accordion("✨ 文字修飾 (Polish)", open=False):
+        with gr.Accordion("文字修飾 (Polish)", open=False):
             gr.Markdown(
                 "貼上口語逐字稿，點擊「**修飾**」去除贅詞、修正重複，同時保留原意。"
             )
@@ -922,7 +1258,7 @@ def build_playground_tab():
                         label="輸入文字（原始口語）", lines=6,
                         placeholder="貼上或輸入要修飾的文字...",
                     )
-                    polish_btn = gr.Button("✨ 修飾", variant="primary", size="lg")
+                    polish_btn = gr.Button("修飾", variant="primary", size="lg", elem_classes=["btn-ico", "i-polish"])
                     polish_status_out = gr.Textbox(
                         label="狀態", lines=1, interactive=False, placeholder="—",
                     )
@@ -957,7 +1293,7 @@ def build_playground_tab():
                     )
 
         # Section 4 — Model settings info
-        with gr.Accordion("ℹ️ 模型設定資訊", open=False):
+        with gr.Accordion("模型設定資訊", open=False):
             gr.Markdown("顯示目前從 config.toml 讀取的模型設定（不會啟動載入）。")
             gr.Markdown(_render_config_info())
 
@@ -1291,8 +1627,8 @@ def build_settings_tab() -> None:
         gr.Markdown("---")
 
         with gr.Row():
-            save_btn = gr.Button("💾 儲存設定", variant="primary", scale=2)
-            reset_btn = gr.Button("↩ 重設為預設值", variant="secondary", scale=1)
+            save_btn = gr.Button("儲存設定", variant="primary", scale=2, elem_classes=["btn-ico", "i-save"])
+            reset_btn = gr.Button("重設為預設值", variant="secondary", scale=1, elem_classes=["btn-ico", "i-reset"])
 
         with gr.Accordion("設定檔預覽 (Config Preview)", open=False):
             config_preview = gr.Textbox(
@@ -1741,7 +2077,7 @@ home-stt start
 _FEATURES_MD = """\
 ## 核心功能
 
-### 🎤 語音輸入（Dictate）
+### 語音輸入（Dictate）
 
 按住觸發鍵 > 對麥克風說話 > 放開 > 文字自動貼到當下焦點視窗
 
@@ -1752,7 +2088,7 @@ _FEATURES_MD = """\
 
 ---
 
-### ✏️ 語音編輯（Voice-Edit）
+### 語音編輯（Voice-Edit）
 
 選中文字 > 按住編輯觸發鍵 > 說編輯指令 > 放開 > LLM 改寫選取並貼回
 
@@ -1864,44 +2200,44 @@ def _quickstart_md() -> str:
 def build_guide_and_diagnostics_tabs():
     # Guide tab
     with gr.Tab("使用指南", id="guide"):
-        with gr.Accordion("🚀 快速開始", open=True):
+        with gr.Accordion("快速開始", open=True):
             gr.Markdown(_quickstart_md())
-        with gr.Accordion("🎯 核心功能", open=False):
+        with gr.Accordion("核心功能", open=False):
             gr.Markdown(_FEATURES_MD)
-        with gr.Accordion("⌨️ 快捷鍵參考", open=False):
+        with gr.Accordion("快捷鍵參考", open=False):
             if sys.platform == "darwin":
                 gr.Markdown(_HOTKEYS_MD_MAC)
             else:
                 gr.Markdown(_HOTKEYS_MD_WIN)
-        with gr.Accordion("❓ 常見問題 / 疑難排解", open=False):
+        with gr.Accordion("常見問題 / 疑難排解", open=False):
             gr.Markdown(_FAQ_MD)
-        with gr.Accordion("🖥️ 硬體 Preset 比較表", open=False):
+        with gr.Accordion("硬體 Preset 比較表", open=False):
             gr.Markdown(_PRESET_MD)
 
     # Diagnostics tab
     with gr.Tab("診斷", id="diagnostics"):
-        with gr.Accordion("🩺 環境健康檢查（Doctor）", open=True):
+        with gr.Accordion("環境健康檢查（Doctor）", open=True):
             doctor_output = gr.Textbox(
                 label="診斷結果",
                 value="（點擊「執行診斷」開始）",
                 lines=25, max_lines=40,
                 interactive=False,
             )
-            run_doctor_btn = gr.Button("▶ 執行診斷", variant="primary")
+            run_doctor_btn = gr.Button("執行診斷", variant="primary", elem_classes=["btn-ico", "i-play"])
 
             def _on_run_doctor():
                 return _run_doctor()
 
             run_doctor_btn.click(fn=_on_run_doctor, inputs=[], outputs=[doctor_output])
 
-        with gr.Accordion("📄 即時 Log 查看器", open=True):
+        with gr.Accordion("即時 Log 查看器", open=True):
             with gr.Row():
                 log_type = gr.Radio(
                     choices=["stdout log（stt-daemon.log）", "err.log（stt-daemon.err.log）"],
                     value="stdout log（stt-daemon.log）",
                     label="Log 來源",
                 )
-                refresh_log_btn = gr.Button("🔄 重新整理", variant="secondary")
+                refresh_log_btn = gr.Button("重新整理", variant="secondary", elem_classes=["btn-ico", "i-refresh"])
 
             log_output = gr.Textbox(
                 label="最後 50 行（最新在底部）",
@@ -1940,9 +2276,9 @@ def build_guide_and_diagnostics_tabs():
                 outputs=[log_output, log_path_display],
             )
 
-        with gr.Accordion("💻 系統資訊 & Config 內容", open=False):
+        with gr.Accordion("系統資訊 & Config 內容", open=False):
             sysinfo_output = gr.Markdown("（點擊「載入系統資訊」查看）")
-            load_sysinfo_btn = gr.Button("🔍 載入系統資訊", variant="secondary")
+            load_sysinfo_btn = gr.Button("載入系統資訊", variant="secondary", elem_classes=["btn-ico", "i-activity"])
 
             def _on_load_sysinfo():
                 return _get_system_info()
@@ -1969,10 +2305,15 @@ def create_app() -> gr.Blocks:
         # Header
         gr.HTML(
             '<div class="app-header">'
-            '<h1>🎙️ home-stt</h1>'
-            '<div class="subtitle">'
-            'Hold-to-Talk Speech-to-Text Daemon'
+            '<div class="app-badge">'
+            '<span class="bar"></span><span class="bar"></span>'
+            '<span class="bar"></span><span class="bar"></span>'
+            '<span class="bar"></span>'
             '</div>'
+            '<div class="app-eyebrow">本地 · 離線 · 隱私優先</div>'
+            '<h1 class="app-wordmark">home-stt</h1>'
+            '<div class="subtitle">Hold-to-Talk Speech-to-Text · 按住即說，放開成字</div>'
+            '<div class="rule"></div>'
             '</div>'
         )
 
@@ -1986,11 +2327,11 @@ def create_app() -> gr.Blocks:
         gr.HTML(
             f'<div class="app-footer">'
             f'home-stt v{version}'
-            f' &nbsp;|&nbsp; '
+            f'<span class="sep">/</span>'
             f'Gradio {gr.__version__}'
-            f' &nbsp;|&nbsp; '
-            f'{sys.platform} / {platform.machine()}'
-            f' &nbsp;|&nbsp; '
+            f'<span class="sep">/</span>'
+            f'{sys.platform} · {platform.machine()}'
+            f'<span class="sep">/</span>'
             f'Python {sys.version.split()[0]}'
             f'</div>'
         )
@@ -2005,8 +2346,9 @@ def main(port: int = 7860, share: bool = False) -> None:
         server_name="127.0.0.1",
         server_port=port,
         share=share,
-        theme=gr.themes.Soft(),
+        theme=_build_theme(),
         css=CUSTOM_CSS,
+        head=_FORCE_LIGHT_HEAD,
     )
 
 
