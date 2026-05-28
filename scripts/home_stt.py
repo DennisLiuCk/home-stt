@@ -631,6 +631,29 @@ def cmd_tray(_args) -> int:
     return 0
 
 
+def cmd_web(args) -> int:
+    """Launch the Gradio web UI."""
+    try:
+        import stt_web
+    except ImportError as e:
+        if "gradio" in str(e).lower():
+            print("home-stt: gradio not installed. Install with:\n"
+                  "  pip install home-stt[web]", file=sys.stderr)
+        else:
+            print(f"home-stt: web UI import failed: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"home-stt: web UI failed to load (DLL/library error): {e}",
+              file=sys.stderr)
+        return 1
+    try:
+        stt_web.main(port=args.port, share=args.share)
+    except OSError as e:
+        print(f"home-stt: web server failed: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_devices(_args) -> int:
     """List available audio input devices."""
     try:
@@ -713,6 +736,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("tray", help="Launch system tray icon (Windows: pystray, macOS: rumps).")
     sub.add_parser("devices", help="List available audio input (microphone) devices.")
 
+    p_web = sub.add_parser("web", help="Launch the web UI dashboard (Gradio).")
+    p_web.add_argument("--port", type=int, default=7860,
+                       help="Server port (default 7860).")
+    p_web.add_argument("--share", action="store_true",
+                       help="Create a public Gradio share link.")
+
     sub.add_parser("version", help="Print home-stt version (same as --version).")
 
     args = parser.parse_args(argv)
@@ -732,6 +761,7 @@ def main(argv: list[str] | None = None) -> int:
         "doctor":  cmd_doctor,
         "tray":    cmd_tray,
         "devices": cmd_devices,
+        "web":     cmd_web,
         "version": cmd_version,
     }
     return handlers[args.command](args)
