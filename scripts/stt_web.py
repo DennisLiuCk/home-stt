@@ -128,7 +128,9 @@ CUSTOM_CSS = """
    A bright, airy interface — warm paper canvas, jade accent, amber highlights,
    an elegant Fraunces wordmark over Manrope, floating cards, soft motion.
    ═══════════════════════════════════════════════════════════════════════ */
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap');
+/* Fonts (Fraunces / Manrope / JetBrains Mono / Noto Sans TC) are loaded via
+   <link> tags in the document <head> (see _HEAD_HTML) — more robust than an
+   @import here, which Gradio's stylesheet assembly can invalidate. */
 
 :root {
     --stt-bg:         #FBFAF7;
@@ -322,19 +324,18 @@ footer.svelte-1ax1toq, footer { display: none !important; }
     -webkit-mask: var(--btn-ico) center / contain no-repeat;
             mask: var(--btn-ico) center / contain no-repeat;
 }
-.gradio-container button.i-play     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M7 5l12 7-12 7z' fill='%23000'/></svg>"); }
-.gradio-container button.i-stop     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='6' y='6' width='12' height='12' rx='2.5' fill='%23000'/></svg>"); }
-.gradio-container button.i-restart  { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 12a9 9 0 1 1-2.6-6.4'/><path d='M21 4v5h-5'/></svg>"); }
-.gradio-container button.i-refresh  { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12a9 9 0 0 1 14.8-6.9L21 8'/><path d='M21 3v5h-5'/><path d='M21 12a9 9 0 0 1-14.8 6.9L3 16'/><path d='M3 21v-5h5'/></svg>"); }
-.gradio-container button.i-wave     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'><path d='M4 10v4'/><path d='M9 6v12'/><path d='M14 8v8'/><path d='M19 11v2'/></svg>"); }
-.gradio-container button.i-edit     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20h9'/><path d='M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z'/></svg>"); }
-.gradio-container button.i-polish   { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'><path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z'/></svg>"); }
-.gradio-container button.i-save     { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z'/><path d='M17 21v-8H7v8'/><path d='M7 3v5h7'/></svg>"); }
-.gradio-container button.i-reset    { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9 14L4 9l5-5'/><path d='M4 9h11a5 5 0 0 1 0 10h-3'/></svg>"); }
-.gradio-container button.i-activity { --btn-ico: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12h4l3 8 4-16 3 8h4'/></svg>"); }
+.gradio-container button.i-play     { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 5l12 7-12 7z' fill='%23000'/%3E%3C/svg%3E"); }
+.gradio-container button.i-stop     { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='6' y='6' width='12' height='12' rx='2.5' fill='%23000'/%3E%3C/svg%3E"); }
+.gradio-container button.i-restart  { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 12a9 9 0 1 1-2.6-6.4'/%3E%3Cpath d='M21 4v5h-5'/%3E%3C/svg%3E"); }
+.gradio-container button.i-refresh  { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 0 1 14.8-6.9L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3Cpath d='M21 12a9 9 0 0 1-14.8 6.9L3 16'/%3E%3Cpath d='M3 21v-5h5'/%3E%3C/svg%3E"); }
+.gradio-container button.i-wave     { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 10v4'/%3E%3Cpath d='M9 6v12'/%3E%3Cpath d='M14 8v8'/%3E%3Cpath d='M19 11v2'/%3E%3C/svg%3E"); }
+.gradio-container button.i-edit     { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 20h9'/%3E%3Cpath d='M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z'/%3E%3C/svg%3E"); }
+.gradio-container button.i-polish   { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z'/%3E%3C/svg%3E"); }
+.gradio-container button.i-save     { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z'/%3E%3Cpath d='M17 21v-8H7v8'/%3E%3Cpath d='M7 3v5h7'/%3E%3C/svg%3E"); }
+.gradio-container button.i-reset    { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 14L4 9l5-5'/%3E%3Cpath d='M4 9h11a5 5 0 0 1 0 10h-3'/%3E%3C/svg%3E"); }
+.gradio-container button.i-activity { --btn-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12h4l3 8 4-16 3 8h4'/%3E%3C/svg%3E"); }
 
 /* ── Fix: keep leading bold glyphs from clipping at the content edge ─────── */
-.gradio-container { overflow-x: visible !important; }
 .gradio-container .prose, .gradio-container .md { padding-left: 4px !important; overflow: visible !important; }
 .gradio-container .prose :is(p, li, strong, h1, h2, h3, h4),
 .gradio-container .md :is(p, li, strong, h1, h2, h3, h4) { overflow: visible; }
@@ -392,7 +393,6 @@ textarea:focus, input[type=text]:focus, input[type=number]:focus {
     border: 1px solid var(--stt-border);
     background: var(--stt-surface);
     box-shadow: 0 1px 2px rgba(34,48,44,.04), 0 16px 34px -24px rgba(34,48,44,.28);
-    animation: sttRise .5s cubic-bezier(.22,1,.36,1) both;
 }
 .stt-banner__dot {
     width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto;
@@ -458,10 +458,15 @@ textarea:focus, input[type=text]:focus, input[type=number]:focus {
 """
 
 
-# ── Force a bright (light) palette regardless of the OS dark-mode setting ──
-# Gradio reads the `__theme` query param at render time; redirect once to pin
-# it to "light" so the "明亮優雅" look is guaranteed.
-_FORCE_LIGHT_HEAD = """
+# ── Document <head>: load fonts up-front, then pin a bright (light) palette ──
+# Fonts load via <link> (not a CSS @import) so they resolve regardless of how
+# Gradio assembles the injected stylesheet. The script pins Gradio's `__theme`
+# query param to "light" (one redirect) so the "明亮優雅" look holds regardless
+# of the OS dark-mode setting.
+_HEAD_HTML = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap">
 <script>
 (function () {
     try {
@@ -2348,7 +2353,7 @@ def main(port: int = 7860, share: bool = False) -> None:
         share=share,
         theme=_build_theme(),
         css=CUSTOM_CSS,
-        head=_FORCE_LIGHT_HEAD,
+        head=_HEAD_HTML,
     )
 
 
