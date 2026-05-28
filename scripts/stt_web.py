@@ -128,9 +128,10 @@ CUSTOM_CSS = """
    A bright, airy interface — warm paper canvas, jade accent, amber highlights,
    an elegant Fraunces wordmark over Manrope, floating cards, soft motion.
    ═══════════════════════════════════════════════════════════════════════ */
-/* Fonts (Fraunces / Manrope / JetBrains Mono / Noto Sans TC) are loaded via
-   <link> tags in the document <head> (see _HEAD_HTML) — more robust than an
-   @import here, which Gradio's stylesheet assembly can invalidate. */
+/* Fonts (Fraunces / Manrope / JetBrains Mono / Noto Sans TC / Noto Serif TC —
+   the CJK serif for headings) are loaded via <link> tags in the document
+   <head> (see _HEAD_HTML) — more robust than an @import here, which Gradio's
+   stylesheet assembly can invalidate. */
 
 :root {
     --stt-bg:         #FBFAF7;
@@ -466,7 +467,7 @@ textarea:focus, input[type=text]:focus, input[type=number]:focus {
 _HEAD_HTML = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Serif+TC:wght@400;600;700&display=swap">
 <script>
 (function () {
     try {
