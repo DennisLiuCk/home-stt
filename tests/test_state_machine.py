@@ -232,6 +232,9 @@ def _install_inert_mocks(daemon_mod, streaming: bool = False,
     daemon_mod._pasteboard = MagicMock()
     daemon_mod._pasteboard.set_text.return_value = True
     daemon_mod._pasteboard.paste.return_value = True
+    # v0.8.0 voice-edit non-text guard: inert clipboard reports "no non-text
+    # content" so _capture_selection proceeds exactly as before this guard.
+    daemon_mod._pasteboard.has_nontext_content.return_value = False
     daemon_mod._polisher = MagicMock()
     daemon_mod._polisher.polish.return_value = ""
     # Enable the streaming framework irrespective of the module's shipped
@@ -347,6 +350,35 @@ def test_audio_callback_auto_stops_at_max_audio_sec(fresh_daemon, caplog):
         fresh_daemon._audio_callback(big, big.shape[0], None, None)
     assert fresh_daemon._st.recording is False
     assert "auto-stop" in caplog.text.lower()
+
+
+def test_audio_callback_auto_stop_routes_edit_mode(fresh_daemon, monkeypatch):
+    """v0.8.0: a stuck VOICE-EDIT trigger that hits MAX_AUDIO_SEC must route
+    to _transcribe_and_emit_edit with the snapshotted (selection, original)
+    — NOT the dictate path. Routing to dictate would transcribe the edit
+    instruction as text AND never restore the pre-capture clipboard that
+    _capture_selection clobbered (silent clipboard-loss bug)."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_edit_mocks(fresh_daemon, selection_text="the selection",
+                        original_clipboard="prev clip")
+    invocations = []
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit_edit",
+                        lambda sel, orig: invocations.append(("edit", sel, orig)))
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit",
+                        lambda: invocations.append(("dictate",)))
+
+    fresh_daemon._on_press(Key.f13)
+    assert fresh_daemon._st.edit_mode is True
+
+    sr = fresh_daemon.SAMPLE_RATE
+    big = np.zeros((sr * fresh_daemon.MAX_AUDIO_SEC, 1), dtype=np.float32)
+    fresh_daemon._audio_callback(big, big.shape[0], None, None)
+    time.sleep(0.3)  # let the spawned daemon thread invoke the fake
+
+    assert fresh_daemon._st.recording is False
+    assert invocations == [("edit", "the selection", "prev clip")], (
+        f"auto-stop must route to the edit path, got {invocations}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +798,31 @@ def test_edit_press_aborts_when_no_selection(fresh_daemon, caplog):
     assert fresh_daemon._st.edit_selection is None
     assert fresh_daemon._st.active_trigger is None
     assert "no selection" in caplog.text.lower()
+
+
+def test_capture_selection_aborts_on_nontext_clipboard(fresh_daemon):
+    """v0.8.0: when the clipboard holds non-text content (image/files) the
+    pre-capture get_text() returns None; _capture_selection must abort BEFORE
+    simulate_copy, so it never overwrites content it cannot restore."""
+    _install_inert_mocks(fresh_daemon)
+    pb = fresh_daemon._pasteboard
+    pb.get_text.return_value = None          # non-text (or empty) clipboard
+    pb.has_nontext_content.return_value = True   # ...and it IS non-text
+    assert fresh_daemon._capture_selection(pb) is None
+    pb.simulate_copy.assert_not_called()
+
+
+def test_capture_selection_proceeds_on_empty_clipboard(fresh_daemon):
+    """An EMPTY clipboard (get_text None, has_nontext_content False) must NOT
+    abort — voice-edit proceeds and the empty clipboard is safe to overwrite."""
+    _install_inert_mocks(fresh_daemon)
+    pb = fresh_daemon._pasteboard
+    pb.get_text.side_effect = [None, "the selection"]  # empty pre / selection post
+    pb.has_nontext_content.return_value = False
+    pb.clipboard_seqno.side_effect = [10, 11]          # seqno bumps → captured
+    pb.simulate_copy.return_value = True
+    assert fresh_daemon._capture_selection(pb) == ("the selection", None)
+    pb.simulate_copy.assert_called_once()
 
 
 def test_edit_press_routes_release_to_transcribe_and_emit_edit(fresh_daemon,

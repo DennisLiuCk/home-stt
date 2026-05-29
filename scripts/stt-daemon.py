@@ -340,6 +340,15 @@ def _audio_callback(indata, frames, time_info, status) -> None:
 
     auto_stop = False
     do_encoder = False
+    # v0.8.0: snapshot edit state under the lock the moment we auto-stop, so
+    # the MAX_AUDIO_SEC recovery routes EXACTLY like _on_release (dictate vs
+    # voice-edit). Without this, a stuck EDIT trigger held to the cap would be
+    # transcribed as dictation AND the user's pre-capture clipboard (held in
+    # edit_original_clipboard, already clobbered by _capture_selection's
+    # Ctrl/Cmd+C) would never be restored — silent clipboard data loss.
+    edit_mode_snap = False
+    edit_selection_snap: str | None = None
+    edit_original_snap: str | None = None
     with _st.lock:
         if not _st.recording:
             return
@@ -348,6 +357,9 @@ def _audio_callback(indata, frames, time_info, status) -> None:
         if _st.recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
             _st.recording = False
             auto_stop = True
+            edit_mode_snap = _st.edit_mode
+            edit_selection_snap = _st.edit_selection
+            edit_original_snap = _st.edit_original_clipboard
         if _encoder is not None:
             _encoder.track_silence(chunk, is_silent)
             do_encoder = True
@@ -357,7 +369,19 @@ def _audio_callback(indata, frames, time_info, status) -> None:
 
     if auto_stop:
         logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
-        threading.Thread(target=_transcribe_and_emit, daemon=True).start()
+        # Mirror _on_release: signal the encoder worker (if any) to drain and
+        # exit BEFORE spawning transcribe, else try_streaming's join blocks for
+        # ENCODER_FINALIZE_TIMEOUT. No-op when pipelining is disabled.
+        if _encoder is not None:
+            _encoder.signal_stop()
+        if edit_mode_snap:
+            threading.Thread(
+                target=_transcribe_and_emit_edit,
+                args=(edit_selection_snap, edit_original_snap),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +562,17 @@ def _capture_selection(pb) -> tuple[str, str | None] | None:
     the platform abstraction.
     """
     original = pb.get_text()
+    if original is None and pb.has_nontext_content():
+        # Clipboard holds non-text content (image / copied files / RTF-only)
+        # that get_text() can't save and we couldn't restore. simulate_copy()
+        # below would overwrite it with the selection, then the edit result,
+        # and _try_restore_clipboard(None) would no-op — silent data loss.
+        # Decline instead: _on_press treats a None return as "no selection"
+        # and fail-beeps, leaving the user's clipboard untouched.
+        logger.info("voice-edit: clipboard holds non-text content "
+                    "(image/files) — paste it elsewhere first; aborting "
+                    "to avoid clobbering it")
+        return None
     seqno_before = pb.clipboard_seqno()
     if not pb.simulate_copy():
         # SendInput / Quartz / osascript already logged the specific

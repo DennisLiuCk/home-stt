@@ -167,6 +167,29 @@ def _get_clipboard_via_nspasteboard() -> str | None:
     return out if out else None
 
 
+def _clipboard_has_nontext_via_nspasteboard() -> bool:
+    """v0.8.0: True iff the pasteboard holds a non-empty set of types but no
+    readable string type (image, file URLs, RTF-only) — i.e. get_text()
+    returns None while the pasteboard is not actually empty. Used by
+    voice-edit to avoid clobbering such content. Returns False when AppKit
+    is unavailable or on any error ('assume safe' — the pbpaste fallback
+    cannot introspect types, so we never block voice-edit on a probe miss)."""
+    if not _try_load_nspasteboard():
+        return False
+    try:
+        types = _NS_PASTEBOARD.types()
+        if types is None or len(types) == 0:
+            return False  # empty pasteboard — safe to overwrite
+        # A readable string is present → get_text() round-trips it; not
+        # "non-text" for our purposes.
+        if _NS_PASTEBOARD.stringForType_(_NS_PASTEBOARD_TYPE) is not None:
+            return False
+        return True
+    except Exception as e:
+        logger.warning("clipboard: NSPasteboard type probe failed (%s)", e)
+        return False
+
+
 class MacOSPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_r}
     # v0.7.5 voice-edit default — Right Command. Symmetric to Right
@@ -248,6 +271,13 @@ class MacOSPasteboard(Pasteboard):
     def get_text(self) -> str | None:
         """v0.7.5: read pasteboard for voice-edit selection capture."""
         return _get_clipboard_via_nspasteboard()
+
+    def has_nontext_content(self) -> bool:
+        """v0.8.0: True iff the pasteboard holds non-text content (image,
+        file URLs, RTF-only) so voice-edit can decline rather than destroy
+        it. False when AppKit is unavailable (the pbpaste fallback can't
+        introspect types — degrade to never-block)."""
+        return _clipboard_has_nontext_via_nspasteboard()
 
     def clipboard_seqno(self) -> int | None:
         """v0.7.5: NSPasteboard.changeCount monotonically increases on

@@ -90,6 +90,17 @@ class Pasteboard(ABC):
         captured' since we can't distinguish 'keystroke not delivered' from
         'app had no selection to copy' downstream."""
 
+    def has_nontext_content(self) -> bool:
+        """Return True iff the clipboard currently holds a non-empty format
+        that get_text() CANNOT round-trip (image, file/Explorer/Finder
+        selection, RTF-only) — i.e. get_text() returns None but the clipboard
+        is not actually empty. Voice-edit uses this to ABORT before its
+        Ctrl/Cmd+C selection round-trip would clobber such content (which it
+        then could not restore, since the saved original would be None).
+        Default False: platforms without detection never block voice-edit,
+        preserving pre-v0.8.0 behaviour."""
+        return False
+
     def register_native_libs(self) -> int:
         """Optional: register native libs needed by STT backends (NVIDIA
         cuDNN/cuBLAS DLLs on Windows). Returns the number of paths added.

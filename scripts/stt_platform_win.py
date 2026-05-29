@@ -131,6 +131,12 @@ _user32.GetClipboardData.restype           = ctypes.c_void_p
 _user32.GetClipboardData.argtypes          = [ctypes.c_uint]
 _user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 _user32.GetClipboardSequenceNumber.argtypes = []
+# v0.8.0: clipboard format inspection for the voice-edit non-text guard.
+_user32.IsClipboardFormatAvailable.restype  = ctypes.c_int
+_user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+_user32.CountClipboardFormats.restype       = ctypes.c_int
+_user32.CountClipboardFormats.argtypes      = []
+_CF_TEXT = 1  # ANSI text (CF_UNICODETEXT auto-synthesises from it and back)
 
 
 def _set_clipboard_text(text: str, *, retries: int = 5,
@@ -293,6 +299,34 @@ def _get_clipboard_text(*, retries: int = 5,
         _user32.CloseClipboard()
 
 
+def _clipboard_has_nontext(*, retries: int = 5,
+                           retry_delay_s: float = 0.01) -> bool:
+    """True iff the clipboard holds at least one format but NO text format
+    (CF_UNICODETEXT / CF_TEXT) — i.e. content get_text() returns None for
+    (image, file list, RTF-only). Used by voice-edit to avoid clobbering
+    such content during the Ctrl+C selection round-trip. On any inspection
+    failure (OpenClipboard contention) returns False — 'assume safe', so a
+    transient read error never blocks voice-edit."""
+    opened = False
+    for _ in range(retries):
+        if _user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(retry_delay_s)
+    if not opened:
+        return False
+    try:
+        # Text already present → get_text() can round-trip it; not "non-text".
+        if (_user32.IsClipboardFormatAvailable(_CF_UNICODETEXT)
+                or _user32.IsClipboardFormatAvailable(_CF_TEXT)):
+            return False
+        # No text format. Any other format present means non-text content
+        # the selection copy would destroy.
+        return _user32.CountClipboardFormats() > 0
+    finally:
+        _user32.CloseClipboard()
+
+
 class WindowsPasteboard(Pasteboard):
     default_trigger_keys = {Key.alt_gr, Key.ctrl_r}
     # v0.7.5 voice-edit default — F13 is almost universally present on
@@ -324,6 +358,15 @@ class WindowsPasteboard(Pasteboard):
     def get_text(self) -> str | None:
         """v0.7.5: read clipboard for voice-edit selection capture."""
         return _get_clipboard_text()
+
+    def has_nontext_content(self) -> bool:
+        """v0.8.0: True iff the clipboard holds a non-text format (image,
+        files, RTF-only) so voice-edit can decline rather than destroy it."""
+        try:
+            return _clipboard_has_nontext()
+        except Exception as e:
+            logger.warning("clipboard: has_nontext_content probe failed (%s)", e)
+            return False
 
     def clipboard_seqno(self) -> int | None:
         """v0.7.5: GetClipboardSequenceNumber bumps on every modification.
