@@ -42,7 +42,6 @@ class EncoderPipeline:
 
     def __init__(self, sample_rate: int) -> None:
         self._sample_rate = sample_rate
-        self._lock = threading.Lock()
 
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=ENCODER_QUEUE_MAX)
         self._thread: threading.Thread | None = None
@@ -61,7 +60,20 @@ class EncoderPipeline:
 
         consecutive_failures is intentionally NOT reset — it persists
         across utterances so N back-to-back failures suppress streaming.
+
+        If a worker from the previous utterance is still alive (reachable
+        via the busy-drop path — a release's signal_stop() set the stop
+        event but _transcribe_and_emit returned early without joining),
+        signal its OLD event object so it drains and exits. We then install
+        FRESH event + queue objects below; the worker captured the old ones
+        at spawn (see _worker), so it can neither consume the new recording's
+        stop signal nor drain/poison its queue. No join here: reset() runs
+        under _st.lock and a join could back-pressure the 50 ms audio
+        callback. A leaked worker's stale writes are blocked by the
+        `self._thread is me` guard in _worker.
         """
+        if self._thread is not None and self._thread.is_alive():
+            self._stop_event.set()
         self.active = False
         self.failed = False
         self.use_batch_fallback = False
@@ -69,12 +81,8 @@ class EncoderPipeline:
         self.residual_samples = None
         self._handle = None
         self._thread = None
-        self._stop_event.clear()
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except Exception:
-                break
+        self._stop_event = threading.Event()
+        self._queue = queue.Queue(maxsize=ENCODER_QUEUE_MAX)
 
     def track_silence(self, chunk: np.ndarray, is_silent: bool) -> None:
         """Update silence tracking counters. Called under _st.lock."""
@@ -105,7 +113,8 @@ class EncoderPipeline:
                 self._handle = backend.start_encoder()
                 self._stop_event.clear()
                 self._thread = threading.Thread(
-                    target=self._worker, args=(self._handle, backend),
+                    target=self._worker,
+                    args=(self._handle, backend, self._queue, self._stop_event),
                     daemon=True,
                 )
                 self._thread.start()
@@ -200,16 +209,26 @@ class EncoderPipeline:
             self.active = False
             return None
 
-    def _worker(self, handle: Any, backend: Any) -> None:
+    def _worker(self, handle: Any, backend: Any,
+                q: queue.Queue, stop_event: threading.Event) -> None:
         """Background thread: drain queue into chunk-sized slabs and push
-        through the backend encoder."""
+        through the backend encoder.
+
+        Captures its own queue + stop_event at spawn (instead of reading
+        self._queue / self._stop_event live each iteration) so a subsequent
+        reset() at the next press can install fresh objects without this
+        worker racing the new recording. Shared-state writes (residual_samples
+        / failed / consecutive_failures) are gated on still being the active
+        worker (self._thread is me), so a worker retired by a later reset()
+        can never overwrite the next recording's state."""
+        me = threading.current_thread()
         chunk_size = int(self._sample_rate * ENCODER_CHUNK_SEC)
         accumulator: list[np.ndarray] = []
         accumulated_n = 0
         try:
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 try:
-                    chunk = self._queue.get(timeout=0.1)
+                    chunk = q.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 accumulator.append(chunk)
@@ -227,7 +246,7 @@ class EncoderPipeline:
             # Drain remaining queue items
             while True:
                 try:
-                    chunk = self._queue.get_nowait()
+                    chunk = q.get_nowait()
                 except queue.Empty:
                     break
                 accumulator.append(chunk)
@@ -235,8 +254,12 @@ class EncoderPipeline:
                 residual = np.concatenate(accumulator, axis=0).flatten().astype(np.float32)
             else:
                 residual = np.zeros(0, dtype=np.float32)
-            self.residual_samples = residual
+            # Only publish if still the active worker — a worker retired by a
+            # later reset() must not clobber the new recording's residual.
+            if self._thread is me:
+                self.residual_samples = residual
         except Exception as e:
             logger.warning(f"encoder worker crashed: {type(e).__name__}: {e}")
-            self.failed = True
-            self.consecutive_failures += 1
+            if self._thread is me:
+                self.failed = True
+                self.consecutive_failures += 1

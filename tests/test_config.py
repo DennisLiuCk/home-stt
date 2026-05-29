@@ -211,6 +211,23 @@ class TestUpdateTriggerKeys:
             assert parsed["trigger_keys"] == ["alt_r"]
             assert parsed["edit_trigger_keys"] == ["f13"]
 
+    def test_empty_edit_trigger_disables(self, tmp_path, monkeypatch):
+        """v0.8.0: `home-stt config --disable-edit-trigger` passes
+        edit_trigger=[] (a NON-None empty list) so voice-edit can be turned
+        OFF — distinct from None ('leave unchanged'). Writes
+        `edit_trigger_keys = []`, which the daemon reads as disabled."""
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('edit_trigger_keys = ["f13"]\n', encoding="utf-8")
+        monkeypatch.setattr(stt_config, "config_path", lambda: cfg_file)
+        stt_config.update_trigger_keys(edit_trigger=[])
+        content = cfg_file.read_text(encoding="utf-8")
+        assert "edit_trigger_keys = []" in content
+        assert '"f13"' not in content
+        if stt_config.tomllib is not None:
+            with open(cfg_file, "rb") as f:
+                parsed = stt_config.tomllib.load(f)
+            assert parsed["edit_trigger_keys"] == []
+
 
 class TestMicDevice:
     def test_default_is_none(self, tmp_path, monkeypatch):

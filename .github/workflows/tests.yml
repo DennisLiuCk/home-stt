@@ -12,12 +12,14 @@ on:
     paths:
       - 'scripts/**'
       - 'tests/**'
+      - 'pyproject.toml'
       - '.github/workflows/tests.yml'
   pull_request:
     branches: [main]
     paths:
       - 'scripts/**'
       - 'tests/**'
+      - 'pyproject.toml'
       - '.github/workflows/tests.yml'
 
 jobs:

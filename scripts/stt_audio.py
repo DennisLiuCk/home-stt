@@ -24,14 +24,18 @@ logger = logging.getLogger("stt.audio")
 _s2twp = OpenCC("s2twp")
 _CJK   = r"[㐀-鿿]"
 _AW    = r"[A-Za-z0-9]"
+# Precompiled once at import (matches the codebase convention used for
+# log-parsing regexes elsewhere); post_process runs on every utterance.
+_RE_CJK_AW = re.compile(f"({_CJK})({_AW})")
+_RE_AW_CJK = re.compile(f"({_AW})({_CJK})")
 
 
 def post_process(text: str) -> str:
     """Simplified -> Taiwan-traditional (with TW phrase mapping via s2twp),
     then add spaces at CJK <-> ASCII edges. Idempotent."""
     text = _s2twp.convert(text)
-    text = re.sub(f"({_CJK})({_AW})", r"\1 \2", text)
-    text = re.sub(f"({_AW})({_CJK})", r"\1 \2", text)
+    text = _RE_CJK_AW.sub(r"\1 \2", text)
+    text = _RE_AW_CJK.sub(r"\1 \2", text)
     return text
 
 
@@ -114,7 +118,10 @@ def _trim_silence(samples: np.ndarray,
         return samples
     frames = samples[:n_frames * frame_size].reshape(n_frames, frame_size)
     # RMS per frame, vectorised.
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    # frames is already float32; np.square keeps the whole RMS computation in
+    # float32 (avoids a full float64 copy + a float64 square temporary) — the
+    # result only feeds a coarse fixed -50 dBFS gate, so float64 buys nothing.
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
     threshold = 10.0 ** (threshold_dbfs / 20.0)
     above = rms > threshold
     if not above.any():

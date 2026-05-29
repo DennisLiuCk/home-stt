@@ -50,3 +50,7 @@ tts-summary-now.txt
 # models). Per plan-v0.8.0 Day 1-2 gate, this should NEVER be committed —
 # production code goes in scripts/.
 tmp/
+# Botched atomic-write temp files: a malformed absolute path can flatten into
+# a single root-level filename like "...__temp_daemon.py". Catch that class so
+# a mis-write is never accidentally committed.
+*__temp_*.py

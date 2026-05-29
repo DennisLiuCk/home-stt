@@ -70,7 +70,6 @@ except Exception:
 import numpy as np
 import sounddevice as sd
 from pynput import keyboard
-from pynput.keyboard import Key
 
 from stt_audio import post_process, _play_beep, _trim_silence
 from stt_backends import STTBackend, build_backend, build_backend_with_fallback
@@ -304,7 +303,7 @@ BEEP_VOLUME      = 0.15                # 0.0–1.0; keep low to avoid mic bleed
 class DaemonState:
     __slots__ = ("lock", "buffer", "recording", "active_trigger",
                  "processing", "recording_samples", "edit_mode",
-                 "edit_selection", "edit_original_clipboard")
+                 "edit_selection", "edit_original_clipboard", "auto_stopped")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -316,6 +315,11 @@ class DaemonState:
         self.edit_mode: bool = False
         self.edit_selection: str | None = None
         self.edit_original_clipboard: str | None = None
+        # v0.8.0: set when a recording is force-stopped at MAX_AUDIO_SEC. The
+        # trigger key may still be physically held; this lets _on_release
+        # recognise the eventual real release and no-op instead of spawning a
+        # spurious second transcribe. Reset at each new press.
+        self.auto_stopped: bool = False
 
 
 _st = DaemonState()
@@ -336,11 +340,27 @@ def _audio_callback(indata, frames, time_info, status) -> None:
         logger.info("audio status: %s", status)
 
     chunk = indata.copy()
-    chunk_rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-    is_silent = chunk_rms < _ENCODER_SILENCE_THRESHOLD
+    # Per-callback silence RMS is only consumed by the encoder-pipelining path
+    # (track_silence / on_chunk). Skip the float64 reduction entirely while
+    # pipelining is disabled (the shipped default). Reads the live module
+    # global so stt_config.apply_to_module / tests can flip it at runtime.
+    pipelining = ENCODER_PIPELINING and _encoder is not None
+    is_silent = False
+    if pipelining:
+        chunk_rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+        is_silent = chunk_rms < _ENCODER_SILENCE_THRESHOLD
 
     auto_stop = False
     do_encoder = False
+    # v0.8.0: snapshot edit state under the lock the moment we auto-stop, so
+    # the MAX_AUDIO_SEC recovery routes EXACTLY like _on_release (dictate vs
+    # voice-edit). Without this, a stuck EDIT trigger held to the cap would be
+    # transcribed as dictation AND the user's pre-capture clipboard (held in
+    # edit_original_clipboard, already clobbered by _capture_selection's
+    # Ctrl/Cmd+C) would never be restored — silent clipboard data loss.
+    edit_mode_snap = False
+    edit_selection_snap: str | None = None
+    edit_original_snap: str | None = None
     with _st.lock:
         if not _st.recording:
             return
@@ -348,8 +368,16 @@ def _audio_callback(indata, frames, time_info, status) -> None:
         _st.recording_samples += chunk.shape[0]
         if _st.recording_samples >= SAMPLE_RATE * MAX_AUDIO_SEC:
             _st.recording = False
+            # Keep active_trigger SET so OS key-repeat on the still-held key
+            # stays suppressed; flag the auto-stop so the eventual real release
+            # no-ops in _on_release instead of spawning a spurious second
+            # transcribe / writing a phantom PROCESSING state.
+            _st.auto_stopped = True
             auto_stop = True
-        if _encoder is not None:
+            edit_mode_snap = _st.edit_mode
+            edit_selection_snap = _st.edit_selection
+            edit_original_snap = _st.edit_original_clipboard
+        if pipelining:
             _encoder.track_silence(chunk, is_silent)
             do_encoder = True
 
@@ -358,7 +386,19 @@ def _audio_callback(indata, frames, time_info, status) -> None:
 
     if auto_stop:
         logger.warning(f"auto-stop at {MAX_AUDIO_SEC}s — released stuck trigger")
-        threading.Thread(target=_transcribe_and_emit, daemon=True).start()
+        # Mirror _on_release: signal the encoder worker (if any) to drain and
+        # exit BEFORE spawning transcribe, else try_streaming's join blocks for
+        # ENCODER_FINALIZE_TIMEOUT. No-op when pipelining is disabled.
+        if _encoder is not None:
+            _encoder.signal_stop()
+        if edit_mode_snap:
+            threading.Thread(
+                target=_transcribe_and_emit_edit,
+                args=(edit_selection_snap, edit_original_snap),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(target=_transcribe_and_emit, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +491,12 @@ def _transcribe_and_emit() -> None:
             # deterministic μs-cost backstop — guarantees clipboard output
             # is always TW-traditional with consistent CJK/ASCII spacing,
             # regardless of which polish model is loaded or how strict it is.
-            text = post_process(polished)
+            # When polish was a no-op (polished == text), the backstop is
+            # post_process(post_process(raw)) which, by post_process's
+            # idempotence (stt_audio.py), equals the value `text` already
+            # holds — skip the redundant OpenCC + regex pass in that case.
+            if polish_edited:
+                text = post_process(polished)
 
         # Set clipboard, then paste — atomic, no per-char IME drama.
         # Tiny sleep lets the clipboard write settle before the keystroke
@@ -539,6 +584,17 @@ def _capture_selection(pb) -> tuple[str, str | None] | None:
     the platform abstraction.
     """
     original = pb.get_text()
+    if original is None and pb.has_nontext_content():
+        # Clipboard holds non-text content (image / copied files / RTF-only)
+        # that get_text() can't save and we couldn't restore. simulate_copy()
+        # below would overwrite it with the selection, then the edit result,
+        # and _try_restore_clipboard(None) would no-op — silent data loss.
+        # Decline instead: _on_press treats a None return as "no selection"
+        # and fail-beeps, leaving the user's clipboard untouched.
+        logger.info("voice-edit: clipboard holds non-text content "
+                    "(image/files) — paste it elsewhere first; aborting "
+                    "to avoid clobbering it")
+        return None
     seqno_before = pb.clipboard_seqno()
     if not pb.simulate_copy():
         # SendInput / Quartz / osascript already logged the specific
@@ -740,6 +796,7 @@ def _on_press(key) -> None:
         # this, a previous transcribe that left a stale count + a new press
         # could falsely trip the cap and auto-stop the new recording early.
         _st.recording_samples = 0
+        _st.auto_stopped = False
         _st.edit_mode = False
         _st.edit_selection = None
         _st.edit_original_clipboard = None
@@ -764,6 +821,13 @@ def _on_release(key) -> None:
         if _st.active_trigger != key:
             return  # releasing a non-active trigger (e.g. tap of the other one)
         _st.active_trigger = None
+        if _st.auto_stopped:
+            # This recording already hit the MAX_AUDIO_SEC cap; the audio
+            # callback flipped _recording=False and spawned the transcribe.
+            # Just consume the physical release — no drain, no second
+            # transcribe, no phantom PROCESSING state write.
+            _st.auto_stopped = False
+            return
         # v0.7.2: do NOT flip _recording=False here yet. PortAudio fires
         # the callback every 50 ms; if we stop capture immediately, the
         # in-flight 0-50 ms audio block that arrives between user release
@@ -792,13 +856,20 @@ def _on_release(key) -> None:
         # the new press will spawn its own when it eventually releases.
         if _st.active_trigger is not None:
             abort = True
+        elif _st.auto_stopped:
+            # The MAX_AUDIO_SEC cap was hit DURING the 80 ms drain (the first
+            # lock block above ran before the cap tripped). The callback
+            # already spawned the transcribe; consume this release silently
+            # instead of double-spawning + writing a phantom PROCESSING state.
+            _st.auto_stopped = False
+            abort = True
         else:
             _st.recording = False
             edit_mode_snap = _st.edit_mode
             edit_selection_snap = _st.edit_selection
             edit_original_snap = _st.edit_original_clipboard
     if abort:
-        logger.info("release aborted by new press during drain")
+        logger.info("release aborted (new press during drain, or auto-stop)")
         return
     _write_state(PROCESSING, edit_mode=edit_mode_snap)
     # v0.8.0: signal the encoder worker (if any) to drain remaining queue

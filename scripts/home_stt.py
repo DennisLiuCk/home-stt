@@ -67,21 +67,71 @@ def _daemon_version() -> str:
     return "?"
 
 
+def _process_cmdline(pid: int) -> str | None:
+    """Best-effort command line of `pid`, or None if it can't be determined.
+
+    Used by _process_alive to confirm a PID is actually the STT daemon
+    rather than an unrelated process that recycled the number. Any failure
+    (timeout, tool missing, non-zero exit) returns None so the caller can
+    fall back to a bare existence check instead of a false negative."""
+    try:
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter "
+                 f"'ProcessId={pid}').CommandLine"],
+                capture_output=True, text=True, errors="replace", timeout=4,
+            )
+        else:
+            # -ww: emit the FULL command line. BSD/macOS ps truncates the
+            # args column without it, which would drop the trailing
+            # stt-daemon.py token for daemons installed under a long path
+            # and cause a false 'stopped'. Matches pgrep -f's full-cmdline
+            # view used by stt-start/stop.sh.
+            r = subprocess.run(
+                ["ps", "-ww", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, errors="replace", timeout=3,
+            )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
 def _process_alive(pid: int) -> bool:
+    """True iff `pid` is a live process that is (best-effort) the STT daemon.
+
+    Existence alone is insufficient: stt-start.ps1/.sh leave the PID file
+    behind on a hard crash (only the stop scripts remove it), and the OS
+    eventually recycles that number for an unrelated process — `status`
+    would then report a bogus 'running' with that process's RSS/uptime. So
+    after confirming the PID exists we verify its command line references
+    stt-daemon.py, mirroring the start/stop scripts' own command-line scan.
+    If the identity query can't run or returns nothing (CIM unavailable, a
+    launcher whose command line hides the script path), we FALL BACK to the
+    bare existence check rather than risk a false 'stopped'."""
     if sys.platform == "win32":
         try:
             r = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
                 capture_output=True, text=True, timeout=3,
             )
-            return str(pid) in r.stdout
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
-    try:
-        os.kill(pid, 0)
+        if str(pid) not in r.stdout:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except (OSError, PermissionError):
+            return False
+    # PID exists. Confirm identity when we can; otherwise assume alive so a
+    # query hiccup never makes a genuinely-running daemon look stopped.
+    cmdline = _process_cmdline(pid)
+    if not cmdline or not cmdline.strip():
         return True
-    except (OSError, PermissionError):
-        return False
+    return "stt-daemon.py" in cmdline
 
 
 def _read_pid() -> int | None:
@@ -438,6 +488,13 @@ def cmd_config(args) -> int:
     if args.set_trigger:
         return cmd_set_trigger(args)
 
+    if getattr(args, "disable_edit_trigger", False):
+        from stt_config import update_trigger_keys
+        path = update_trigger_keys(edit_trigger=[])
+        print(f"Voice-edit trigger disabled (edit_trigger_keys = []) in {path}.")
+        print("Restart the daemon to apply: home-stt restart")
+        return 0
+
     if args.init:
         path = config_path()
         existed = path.exists()
@@ -731,6 +788,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="Print the config file path and exit.")
     p_cfg.add_argument("--set-trigger", action="store_true",
                        help="Interactive key detection — press a key to set triggers.")
+    p_cfg.add_argument("--disable-edit-trigger", action="store_true",
+                       help="Disable voice-edit by writing edit_trigger_keys = [] "
+                            "(--set-trigger's Esc only keeps the default, can't clear).")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
     sub.add_parser("tray", help="Launch system tray icon (Windows: pystray, macOS: rumps).")

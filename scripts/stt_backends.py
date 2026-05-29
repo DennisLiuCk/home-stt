@@ -287,8 +287,7 @@ class Qwen3AsrBackend(STTBackend):
     def device_label(self) -> str:
         return self._impl.device_label
 
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.transcribe(samples)
+    def _normalise_result(self, result: dict) -> tuple[str, str]:
         text = (result.get("text") or "").strip()
         raw_lang = (result.get("language") or "").strip().lower()
         # Normalise "Chinese" → "zh", "English" → "en", etc. Falls back to
@@ -296,6 +295,9 @@ class Qwen3AsrBackend(STTBackend):
         # languages still produce something sensible in the log line.
         language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
         return text, language
+
+    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
+        return self._normalise_result(self._impl.transcribe(samples))
 
     def warmup(self) -> None:
         self._impl.warmup()
@@ -316,11 +318,7 @@ class Qwen3AsrBackend(STTBackend):
         self._impl.push_chunk(handle, samples)
 
     def finalize(self, handle: Any, tail_samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.finalize(handle, tail_samples)
-        text = (result.get("text") or "").strip()
-        raw_lang = (result.get("language") or "").strip().lower()
-        language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
-        return text, language
+        return self._normalise_result(self._impl.finalize(handle, tail_samples))
 
     def abort(self, handle: Any) -> None:
         self._impl.abort(handle)
@@ -502,21 +500,8 @@ def build_backend_with_fallback(backend_name: str, model_name: str,
         #   - CUDA OOM: hint to free polish VRAM or pick smaller STT model
         #   - DLL load failure: hint to install NVIDIA cuDNN/cuBLAS wheels
         #   - Other: surface raw exception
-        msg = str(e)
-        # isinstance check beats string-typed class name compare — future
-        # torch renames/wraps won't silently break OOM detection.
-        try:
-            import torch as _torch
-            oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
-        except Exception:
-            oom_cls = None
-        is_oom = (
-            (oom_cls is not None and isinstance(e, oom_cls))
-            or "out of memory" in msg.lower()
-        )
-        is_dll = isinstance(e, OSError) and any(
-            s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
-        )
+        from stt_cuda_errors import classify_cuda_init_error
+        is_oom, is_dll, _ = classify_cuda_init_error(e)
         if is_oom:
             hint = (
                 " (CUDA OOM — try POLISH_ENABLED = False to free ~3-8 GB, "
@@ -534,6 +519,16 @@ def build_backend_with_fallback(backend_name: str, model_name: str,
             f"Falling back to faster-whisper."
         )
 
+    # Last-resort faster-whisper large-v3-turbo. If the user's configured
+    # backend was faster-whisper with a DIFFERENT model, that model already
+    # failed in the attempt above — make the substitution VISIBLE rather than
+    # silently swapping it (otherwise the user believes they are still running
+    # their chosen model). Retrying the just-failed model would be pointless.
+    if backend_name == "faster-whisper" and model_name != "large-v3-turbo":
+        logger.warning(
+            f"configured faster-whisper model '{model_name}' could not be "
+            f"loaded; substituting 'large-v3-turbo'."
+        )
     try:
         return build_backend("faster-whisper", "large-v3-turbo", sample_rate)
     except Exception as e:

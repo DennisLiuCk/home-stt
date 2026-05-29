@@ -130,18 +130,38 @@ def load_config() -> dict[str, Any]:
         try:
             with open(path, "rb") as f:
                 file_cfg = tomllib.load(f)
-            for section_vals in file_cfg.values():
-                if isinstance(section_vals, dict):
-                    for k, v in section_vals.items():
-                        norm = k.lower()
-                        if norm in cfg:
-                            cfg[norm] = v
-                else:
-                    pass
+            # Precedence: [section] tables applied first, then top-level keys
+            # override (unchanged). Now also WARN on unknown keys and on a key
+            # set in both places, so a typo'd / misplaced key isn't silently
+            # swallowed — matching the env-var path which already warns.
+            applied: dict[str, str] = {}  # norm key -> origin label
+            for section_name, section_vals in file_cfg.items():
+                if not isinstance(section_vals, dict):
+                    continue
+                for k, v in section_vals.items():
+                    norm = k.lower()
+                    if norm in cfg:
+                        cfg[norm] = v
+                        applied[norm] = f"[{section_name}]"
+                    else:
+                        logger.warning(
+                            "unknown config key %r in [%s] ignored",
+                            k, section_name,
+                        )
             for k, v in file_cfg.items():
+                if isinstance(v, dict):
+                    continue  # a [section] table, handled above
                 norm = k.lower()
-                if norm in cfg and not isinstance(v, dict):
+                if norm in cfg:
+                    if norm in applied:
+                        logger.warning(
+                            "config key %r set both in %s and at top level; "
+                            "using top-level value", k, applied[norm],
+                        )
                     cfg[norm] = v
+                    applied[norm] = "top-level"
+                else:
+                    logger.warning("unknown config key %r ignored", k)
         except Exception as e:
             logger.warning("failed to load %s: %s", path, e)
     elif path.exists() and tomllib is None:
