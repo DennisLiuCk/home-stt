@@ -488,6 +488,13 @@ def cmd_config(args) -> int:
     if args.set_trigger:
         return cmd_set_trigger(args)
 
+    if getattr(args, "disable_edit_trigger", False):
+        from stt_config import update_trigger_keys
+        path = update_trigger_keys(edit_trigger=[])
+        print(f"Voice-edit trigger disabled (edit_trigger_keys = []) in {path}.")
+        print("Restart the daemon to apply: home-stt restart")
+        return 0
+
     if args.init:
         path = config_path()
         existed = path.exists()
@@ -781,6 +788,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="Print the config file path and exit.")
     p_cfg.add_argument("--set-trigger", action="store_true",
                        help="Interactive key detection — press a key to set triggers.")
+    p_cfg.add_argument("--disable-edit-trigger", action="store_true",
+                       help="Disable voice-edit by writing edit_trigger_keys = [] "
+                            "(--set-trigger's Esc only keeps the default, can't clear).")
 
     sub.add_parser("doctor", help="Run environment health checks (Python, deps, mic, permissions).")
     sub.add_parser("tray", help="Launch system tray icon (Windows: pystray, macOS: rumps).")

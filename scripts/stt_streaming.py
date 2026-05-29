@@ -42,7 +42,6 @@ class EncoderPipeline:
 
     def __init__(self, sample_rate: int) -> None:
         self._sample_rate = sample_rate
-        self._lock = threading.Lock()
 
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=ENCODER_QUEUE_MAX)
         self._thread: threading.Thread | None = None

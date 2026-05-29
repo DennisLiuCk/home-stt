@@ -100,6 +100,17 @@ def _format_edit_user_msg(selection: str, instruction: str) -> str:
     )
 
 
+def _strip_wrapping_quotes(s: str) -> str:
+    """Best-effort guard: some models occasionally wrap output in quotes
+    despite the prompt. Strip a single matched pair. Shared across polish +
+    edit (both system prompts forbid quoting) and across the MLX + Torch
+    backends."""
+    if (s.startswith('"') and s.endswith('"')) or \
+       (s.startswith("「") and s.endswith("」")):
+        return s[1:-1].strip() or s
+    return s
+
+
 class TextPostProcessor(ABC):
     """Polish raw ASR text. Implementations may transform, leave unchanged,
     or fail-safely return the input. Must NEVER raise — failure modes are
@@ -201,13 +212,7 @@ class MlxLocalLlmPolisher(TextPostProcessor):
             self._model, self._tokenizer, prompt=prompt,
             max_tokens=max_tokens, verbose=False,
         )
-        out = (response or "").strip()
-        # Best-effort guard: some models occasionally wrap output in quotes
-        # despite the prompt. Strip a single matched pair. Shared across
-        # polish + edit because both system prompts forbid quoting.
-        if (out.startswith('"') and out.endswith('"')) or \
-           (out.startswith("「") and out.endswith("」")):
-            out = out[1:-1].strip() or out
+        out = _strip_wrapping_quotes((response or "").strip())
         return out
 
     def polish(self, text: str) -> str:
@@ -510,15 +515,9 @@ class TorchLocalLlmPolisher(TextPostProcessor):
         new_tokens = outputs[0][input_len:]
         n_new = int(new_tokens.shape[-1])
         last_token = int(new_tokens[-1].item()) if n_new > 0 else -1
-        text = self._tokenizer.decode(
+        text = _strip_wrapping_quotes(self._tokenizer.decode(
             new_tokens, skip_special_tokens=True,
-        ).strip()
-        # Best-effort guard: some models occasionally wrap output in
-        # quotes despite the prompt. Strip a single matched pair. Shared
-        # across polish + edit because both system prompts forbid quoting.
-        if (text.startswith('"') and text.endswith('"')) or \
-           (text.startswith("「") and text.endswith("」")):
-            text = text[1:-1].strip() or text
+        ).strip())
         return text, input_len, n_new, last_token
 
     def polish(self, text: str) -> str:
@@ -635,24 +634,8 @@ def build_polisher(
         #     that aren't installed or are on a wrong CUDA version. Hint:
         #     install the missing NVIDIA wheels / reinstall torch.
         #   - Other: surface raw exception.
-        msg = str(e)
-        # torch is importable here — if it weren't, we'd be in the
-        # ImportError branch above. Use isinstance over string-typed class
-        # name compare so future torch renames/wraps don't silently break
-        # OOM detection.
-        try:
-            import torch as _torch
-            oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
-        except Exception:
-            _torch = None
-            oom_cls = None
-        is_oom = (
-            (oom_cls is not None and isinstance(e, oom_cls))
-            or "out of memory" in msg.lower()
-        )
-        is_dll = isinstance(e, OSError) and any(
-            s in msg.lower() for s in ("dll", "cudart", "cudnn", "cublas")
-        )
+        from stt_cuda_errors import classify_cuda_init_error
+        is_oom, is_dll, _torch = classify_cuda_init_error(e)
         if is_oom:
             # Free any partial allocation before the next from_pretrained
             # (e.g. ASR backend init) tries to allocate. Without this, the

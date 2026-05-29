@@ -102,6 +102,7 @@ def _reset_daemon_state():
     daemon._st.edit_mode = False
     daemon._st.edit_selection = None
     daemon._st.edit_original_clipboard = None
+    daemon._st.auto_stopped = False
     daemon.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING
     import stt_streaming as _stt_streaming
     _stt_streaming.ENCODER_PIPELINING = _ORIGINAL_ENCODER_PIPELINING

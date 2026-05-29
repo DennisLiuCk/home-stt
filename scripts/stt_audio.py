@@ -118,7 +118,10 @@ def _trim_silence(samples: np.ndarray,
         return samples
     frames = samples[:n_frames * frame_size].reshape(n_frames, frame_size)
     # RMS per frame, vectorised.
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    # frames is already float32; np.square keeps the whole RMS computation in
+    # float32 (avoids a full float64 copy + a float64 square temporary) — the
+    # result only feeds a coarse fixed -50 dBFS gate, so float64 buys nothing.
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
     threshold = 10.0 ** (threshold_dbfs / 20.0)
     above = rms > threshold
     if not above.any():

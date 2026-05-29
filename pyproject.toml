@@ -47,4 +47,4 @@ home-stt = "home_stt:main"
 
 [tool.setuptools]
 package-dir = {"" = "scripts"}
-py-modules = ["home_stt", "stt_config", "stt_audio", "stt_backends", "stt_platform", "stt_platform_mac", "stt_platform_win", "text_polisher", "stt_web", "stt_state", "stt_streaming", "stt_tray", "qwen3_asr_streaming"]
+py-modules = ["home_stt", "stt_config", "stt_audio", "stt_backends", "stt_platform", "stt_platform_mac", "stt_platform_win", "text_polisher", "stt_web", "stt_state", "stt_streaming", "stt_tray", "qwen3_asr_streaming", "stt_cuda_errors"]

@@ -381,6 +381,35 @@ def test_audio_callback_auto_stop_routes_edit_mode(fresh_daemon, monkeypatch):
     )
 
 
+def test_release_after_autostop_is_noop(fresh_daemon, monkeypatch):
+    """v0.8.0: after a MAX_AUDIO_SEC auto-stop, the eventual physical release
+    of the still-held trigger must NOT spawn a second transcribe (the callback
+    already handled it). auto_stopped flags it; _on_release consumes the
+    release and no-ops. active_trigger stays SET until release so OS key-repeat
+    can't start a phantom new recording in between."""
+    fresh_daemon.TRIGGER_KEYS = {Key.alt_r}
+    _install_inert_mocks(fresh_daemon)
+    spawns = []
+    monkeypatch.setattr(fresh_daemon, "_transcribe_and_emit",
+                        lambda: spawns.append("dictate"))
+
+    fresh_daemon._on_press(Key.alt_r)
+    sr = fresh_daemon.SAMPLE_RATE
+    big = np.zeros((sr * fresh_daemon.MAX_AUDIO_SEC, 1), dtype=np.float32)
+    fresh_daemon._audio_callback(big, big.shape[0], None, None)
+    time.sleep(0.15)
+    assert fresh_daemon._st.auto_stopped is True
+    # active_trigger remains set across the auto-stop (suppresses key-repeat).
+    assert fresh_daemon._st.active_trigger == Key.alt_r
+    spawns.clear()  # ignore the auto-stop's own (legitimate) spawn
+
+    fresh_daemon._on_release(Key.alt_r)
+    time.sleep(0.2)
+    assert spawns == [], "release after auto-stop must not spawn a 2nd transcribe"
+    assert fresh_daemon._st.auto_stopped is False
+    assert fresh_daemon._st.active_trigger is None
+
+
 # ---------------------------------------------------------------------------
 # _transcribe_and_emit — busy path (C2 regression)
 # ---------------------------------------------------------------------------
