@@ -26,6 +26,7 @@ import os
 import site
 import subprocess
 import sys
+import time
 from ctypes import wintypes
 
 from pynput.keyboard import Key
@@ -167,13 +168,12 @@ def _set_clipboard_text(text: str, *, retries: int = 5,
     # OpenClipboard can transiently fail when another process holds the
     # clipboard (clipboard managers, paste tools). Brief retry — the
     # contention window is typically <10 ms.
-    import time as _time
     opened = False
     for attempt in range(retries):
         if _user32.OpenClipboard(None):
             opened = True
             break
-        _time.sleep(retry_delay_s)
+        time.sleep(retry_delay_s)
     if not opened:
         err = ctypes.get_last_error()
         _kernel32.GlobalFree(h_mem)
@@ -263,13 +263,12 @@ def _get_clipboard_text(*, retries: int = 5,
     Caller (voice-edit selection capture) treats None as 'no readable
     selection' — same as 'app had no selection to copy'.
     """
-    import time as _time
     opened = False
     for _ in range(retries):
         if _user32.OpenClipboard(None):
             opened = True
             break
-        _time.sleep(retry_delay_s)
+        time.sleep(retry_delay_s)
     if not opened:
         return None
 

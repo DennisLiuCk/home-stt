@@ -918,10 +918,8 @@ def _effective_config() -> dict:
         "polish_enabled": cfg.get("polish_enabled") if cfg.get("polish_enabled") is not None else True,
         "polish_model": cfg.get("polish_model") or "Qwen/Qwen3-4B-Instruct-2507",
         "sample_rate": cfg.get("sample_rate") or 16000,
+        "polish_prompt": cfg.get("polish_prompt") or None,
     }
-
-
-_LOAD_FAILED = "LOAD_FAILED"
 
 
 def _ensure_models(model_state: dict) -> tuple[dict, str]:
@@ -1321,7 +1319,7 @@ _PRESETS: dict[str, dict[str, Any]] = {
         "stt_model": "Qwen/Qwen3-ASR-0.6B",
         "polish_enabled": True,
         "polish_model": "Qwen/Qwen2.5-1.5B-Instruct",
-        "desc": "高品質 STT + 輕量 Polish 模型（~3 GB VRAM）。",
+        "desc": "高品質 STT + 輕量 Polish 模型（~5 GB VRAM）。",
     },
     "Light（輕量）": {
         "stt_backend": "qwen3-asr",

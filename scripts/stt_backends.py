@@ -287,8 +287,7 @@ class Qwen3AsrBackend(STTBackend):
     def device_label(self) -> str:
         return self._impl.device_label
 
-    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.transcribe(samples)
+    def _normalise_result(self, result: dict) -> tuple[str, str]:
         text = (result.get("text") or "").strip()
         raw_lang = (result.get("language") or "").strip().lower()
         # Normalise "Chinese" → "zh", "English" → "en", etc. Falls back to
@@ -296,6 +295,9 @@ class Qwen3AsrBackend(STTBackend):
         # languages still produce something sensible in the log line.
         language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
         return text, language
+
+    def transcribe(self, samples: np.ndarray) -> tuple[str, str]:
+        return self._normalise_result(self._impl.transcribe(samples))
 
     def warmup(self) -> None:
         self._impl.warmup()
@@ -316,11 +318,7 @@ class Qwen3AsrBackend(STTBackend):
         self._impl.push_chunk(handle, samples)
 
     def finalize(self, handle: Any, tail_samples: np.ndarray) -> tuple[str, str]:
-        result = self._impl.finalize(handle, tail_samples)
-        text = (result.get("text") or "").strip()
-        raw_lang = (result.get("language") or "").strip().lower()
-        language = self._LANG_NORM.get(raw_lang, raw_lang[:2] if raw_lang else "")
-        return text, language
+        return self._normalise_result(self._impl.finalize(handle, tail_samples))
 
     def abort(self, handle: Any) -> None:
         self._impl.abort(handle)

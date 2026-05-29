@@ -70,7 +70,6 @@ except Exception:
 import numpy as np
 import sounddevice as sd
 from pynput import keyboard
-from pynput.keyboard import Key
 
 from stt_audio import post_process, _play_beep, _trim_silence
 from stt_backends import STTBackend, build_backend, build_backend_with_fallback
