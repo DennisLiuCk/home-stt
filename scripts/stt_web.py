@@ -2345,6 +2345,8 @@ def create_app() -> gr.Blocks:
 
 def main(port: int = 7860, share: bool = False) -> None:
     """Launch the web UI server."""
+    from stt_winasyncio import silence_proactor_connection_reset
+    silence_proactor_connection_reset()
     app = create_app()
     app.launch(
         server_name="127.0.0.1",
